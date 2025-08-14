@@ -9,6 +9,7 @@ from core.state import AppState
 from core.validate import print_startup_summary
 from core.version import git_sha
 from integrations.sheets import get_sheet
+from integrations import ping as uptime_ping
 from housekeeping.schedulers import start_schedulers
 from analytics.oc_refresh import oc_refresh_tick
 
@@ -18,6 +19,7 @@ from agents import shift_snapshot, auto_heal
 from integrations import telegram
 from ops import teleops
 from risk import circuit_breaker as cb
+from storage import sheet_persistence  # NEW
 
 def today_str():
     return datetime.now(get_localzone()).strftime("%Y-%m-%d")
@@ -34,13 +36,24 @@ def main():
     print_startup_summary()
 
     cfg = load_settings()
+
+    # Get sheet FIRST, sync overrides from Sheet, THEN load params
+    sheet = get_sheet()
+    try:
+        if sheet_persistence.sync_params_override_from_sheet(sheet):
+            print("[boot] params_override: loaded from Sheet")
+    except Exception as e:
+        print("[boot] params_override sync error:", e)
+
     params = load_strategy_params()
-    bus = Bus(); state = AppState(); sheet = get_sheet()
+
+    bus = Bus(); state = AppState()
     worker_id = os.getenv("WORKER_ID","DAY_A"); shift_mode = os.getenv("SHIFT_MODE","DAY").upper()
 
     oc_secs_env = int(os.getenv("OC_REFRESH_SECS", str(cfg.oc_refresh_secs_day if shift_mode=='DAY' else cfg.oc_refresh_secs_night)))
     oc_secs = max(oc_secs_env, 3)
     cfg.symbol = pick_primary_symbol(cfg)
+
     logger.ensure_all_headers(sheet, cfg)
 
     # Startup ping
@@ -55,7 +68,6 @@ def main():
         if blocked:
             logger.log_status(sheet, {"worker_id": worker_id, "shift_mode": shift_mode, "state":"HOLD", "message": f"events: {reason}"})
             return
-        # Circuit pause?
         paused, why = cb.is_paused()
         if paused:
             logger.log_status(sheet, {"worker_id": worker_id, "shift_mode": shift_mode, "state":"HOLD", "message": why})
@@ -82,13 +94,16 @@ def main():
     def _on_trade_close(evt: dict):
         tr = evt.get("trade", {})
         telegram.send(f"CLOSE {tr.get('symbol')} {tr.get('side')} exit={evt.get('exit_ltp')} reason={evt.get('reason')} PnL={evt.get('pnl'):.2f}")
-        # feed circuit breaker
         try: cb.on_trade_close(evt, sheet, cfg)
         except Exception: pass
     bus.on("trade_open", _on_trade_open)
     bus.on("trade_close", _on_trade_close)
 
-    def heartbeat(): logger.log_status(sheet, {"worker_id": worker_id, "shift_mode": shift_mode, "state":"OK", "message": f"hb {cfg.symbol}"})
+    def heartbeat():
+        logger.log_status(sheet, {"worker_id": worker_id, "shift_mode": shift_mode, "state":"OK", "message": f"hb {cfg.symbol}"})
+        try: uptime_ping.ping()
+        except Exception: pass
+
     def paper_tick(): paper_trader.tick(state, sheet, cfg, params)
     def pre_eod_flatten(): paper_trader.flatten_all(state, sheet)
     def eod():
@@ -105,8 +120,7 @@ def main():
         try:
             logger.log_status(sheet, {"state":"ERR", "message": msg})
             telegram.send(msg)
-        except Exception:
-            pass
+        except Exception: pass
 
     app = {
         "oc_secs": oc_secs,
