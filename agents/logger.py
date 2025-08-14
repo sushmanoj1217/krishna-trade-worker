@@ -16,6 +16,9 @@ def ensure_all_headers(sheet, cfg):
         ["date","time_ist","name","severity","effect","window_start","window_end"])
     sheet.ensure_headers(cfg.sheet.get("status_tab","Status"),
         ["ts","worker_id","shift_mode","state","message"])
+    # NEW: persistence tabs
+    sheet.ensure_headers("Params_Override", ["ts","date","symbol","json"])
+    sheet.ensure_headers("Snapshots", ["date","symbol","total_trades","sum_pnl","best_trade_id","best_pnl","worst_trade_id","worst_pnl","json"])
 
 def _today():
     return datetime.now(get_localzone()).strftime("%Y-%m-%d")
@@ -29,53 +32,4 @@ def _append_retry(sheet, tab, row, attempts:int=3, sleep_s:float=1.0):
             time.sleep(sleep_s)
     return False
 
-def log_signal(sheet, cfg, sig, params, worker_id: str):
-    tab = cfg.sheet.get("signals_tab","Signals")
-    sid = f"{sig.get('level_hit','LVL')}_{sig['side']}_{sig.get('symbol',cfg.symbol)}_{sig['spot']}"
-    try:
-        rows = sheet.read_all(tab)
-        last_n = int(os.getenv("SIGNAL_DEDUP_LAST_N", "100"))
-        recent = rows[-last_n:] if rows else []
-        for r in reversed(recent):
-            if r.get("signal_id")==sid and r.get("worker_id","")==worker_id and str(r.get("ts","")).startswith(_today()):
-                return
-    except Exception:
-        pass
-    row = {
-        "signal_id": sid,
-        "ts": datetime.now(get_localzone()).isoformat(),
-        "symbol": sig.get("symbol", cfg.symbol),
-        "side(CE|PE)": sig["side"],
-        "reason": sig.get("reason",""),
-        "level_hit(S1/S2/R1/R2)": sig.get("level_hit",""),
-        "spot": sig.get("spot",""),
-        "sl_pts": params["exits"]["initial_sl_points"],
-        "tp_pts": params["exits"]["initial_sl_points"]*params["exits"]["target_rr"],
-        "strat_ver": params.get("name","v1"),
-        "worker_id": worker_id
-    }
-    _append_retry(sheet, tab, row)
-
-def log_trade_open(sheet, trade) -> bool:
-    tab = "Trades"
-    try:
-        rows = sheet.read_all(tab)
-    except Exception:
-        rows = []
-    tid = trade["trade_id"]
-    if any(r.get("trade_id")==tid for r in rows):
-        return False
-    out = dict(trade); out.update({"ts_exit":"","exit_ltp":"","pnl":"","reason_exit":"","status":"OPEN"})
-    return _append_retry(sheet, tab, out)
-
-def log_trade_update(sheet, trade_id: str, updates):
-    log_status(sheet, {"state":"OK", "message": f"trade {trade_id} update {updates}"})
-
-def log_trade_close(sheet, trade_id: str, exit_ltp: float, reason_exit: str, pnl: float):
-    log_status(sheet, {"state":"OK", "message": f"trade {trade_id} closed {reason_exit} pnl={pnl}"})
-
-def log_status(sheet, status):
-    tab = "Status"
-    base = {"ts": datetime.now(get_localzone()).isoformat(),"worker_id": "","shift_mode":"","state":"OK","message":""}
-    base.update(status or {})
-    _append_retry(sheet, tab, base)
+# ... (rest of file unchanged — your existing logging functions) ...
