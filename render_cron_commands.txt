@@ -1,0 +1,12 @@
+# ===== Render Cron — commands to run =====
+# Night job defaults (set shift=night, OC from Sheet, no live trading).
+# You can also set these envs in the Cron job UI instead of prefixing.
+
+# Mon–Thu (5h = 300 min)
+SHIFT_MODE=NIGHT WORKER_ID=NIGHT_A AUTO_TRADE=off OC_MODE=sheet MAX_RUNTIME_MINS=300 CRON_CMD="python -u krishna_main.py" python -u scripts/cron_wrapper.py
+
+# Friday (7h = 420 min)
+SHIFT_MODE=NIGHT WORKER_ID=NIGHT_A AUTO_TRADE=off OC_MODE=sheet MAX_RUNTIME_MINS=420 CRON_CMD="python -u krishna_main.py" python -u scripts/cron_wrapper.py
+
+# Tip: If your entry script needs args, include inside CRON_CMD, e.g.:
+# CRON_CMD="python -u krishna_main.py --night --backtests on --discovery on"
