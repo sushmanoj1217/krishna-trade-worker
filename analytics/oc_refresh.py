@@ -1,10 +1,14 @@
-# analytics/oc_refresh.py
-import os, json
+# path: analytics/oc_refresh.py
+import os, json, time, random
 from datetime import datetime
 from tzlocal import get_localzone
 from integrations.dhan import DhanClient, _sym_norm
 
 LEVELS_PATH = "data/levels.json"
+
+# Per-symbol throttle + cache
+_LAST_CALL_TS: dict[str, float] = {}
+_EXPIRY_CACHE: dict[str, dict] = {}  # {sym: {"ts": float, "list": [str]}}
 
 def _now_iso():
     return datetime.now(get_localzone()).isoformat()
@@ -26,8 +30,7 @@ def _compute_levels_from_oc(oc_json: dict) -> dict:
     d = oc_json.get("data") or {}
     spot = d.get("last_price")
     chain = d.get("oc") or {}
-    supports = []
-    resists  = []
+    supports = []; resists = []
     if spot is None or not chain:
         return {"spot": spot, "s1": None, "s2": None, "r1": None, "r2": None}
     for k, v in chain.items():
@@ -43,7 +46,6 @@ def _compute_levels_from_oc(oc_json: dict) -> dict:
             supports.append((strike, pe_oi))
         if strike >= spot:
             resists.append((strike, ce_oi))
-    # rank by OI, tie-break by proximity
     supports.sort(key=lambda x: (x[1], x[0]), reverse=True)
     resists.sort(key=lambda x: (x[1], -x[0]), reverse=True)
     s1 = supports[0][0] if len(supports) > 0 else None
@@ -52,27 +54,51 @@ def _compute_levels_from_oc(oc_json: dict) -> dict:
     r2 = resists[1][0]  if len(resists)  > 1 else None
     return {"spot": spot, "s1": s1, "s2": s2, "r1": r1, "r2": r2}
 
+def _expiry_list(client: DhanClient, sym: str, usid: int) -> list[str]:
+    """Cache expiries for EXPIRY_TTL_SECS to avoid hammering."""
+    ttl = int(os.getenv("EXPIRY_TTL_SECS", "300") or "300")
+    ent = _EXPIRY_CACHE.get(sym)
+    now = time.time()
+    if ent and (now - ent.get("ts", 0)) < ttl and ent.get("list"):
+        return ent["list"]
+    lst = client.get_expiries(usid)
+    _EXPIRY_CACHE[sym] = {"ts": now, "list": lst}
+    return lst
+
 def update_levels_from_dhan(bus):
     client   = DhanClient()
     symbols  = _parse_symbols()
     primary  = _choose_primary(symbols)
 
-    # memory-safe: default = only primary
     fetch_all = os.getenv("OC_FETCH_ALL", "off").lower() == "on"
     if not fetch_all:
         symbols = [primary]
 
+    min_interval = int(os.getenv("OC_MIN_INTERVAL_SECS", "15") or "15")
+    jitter_lo, jitter_hi = 0, int(os.getenv("OC_JITTER_SECS", "3") or "3")
+
     levels_all = {}
+    now_ts = time.time()
+
     for sym in symbols:
+        last = _LAST_CALL_TS.get(sym, 0.0)
+        wait_left = min_interval - (now_ts - last)
+        if wait_left > 0:
+            # Throttled; skip this tick
+            print(f"[oc] throttle {sym}: wait {wait_left:.1f}s")
+            continue
+
         try:
             usid = client.resolve_underlying_scrip(sym)
             if not usid:
                 print(f"[oc] resolve fail: {sym}")
                 continue
-            exps = client.get_expiries(usid)
+
+            exps = _expiry_list(client, sym, usid)
             if not exps:
                 print(f"[oc] no expiries: {sym}")
                 continue
+
             expiry = exps[0]  # nearest
             oc = client.get_option_chain(usid, expiry)
             lv = _compute_levels_from_oc(oc)
@@ -80,6 +106,9 @@ def update_levels_from_dhan(bus):
             levels_all[sym] = lv
             bus.emit("levels", lv)
             print(f"[oc] {sym} spot={lv.get('spot')} s1={lv.get('s1')} r1={lv.get('r1')}")
+
+            # mark call time with jitter to de-sync buckets
+            _LAST_CALL_TS[sym] = time.time() + random.randint(jitter_lo, jitter_hi)
         except Exception as e:
             print(f"[oc] error {sym}: {e}")
 
@@ -90,12 +119,10 @@ def update_levels_from_dhan(bus):
         print("[oc] levels.json write error:", e)
 
 def oc_refresh_tick(bus):
-    """Entry point used by krishna_main.py"""
     mode = os.getenv("OC_MODE", "dhan").lower()
     if mode == "dhan":
         update_levels_from_dhan(bus)
     else:
-        # optional sheet fallback
         try:
             from analytics.oc_refresh_sheet import update_levels_from_sheet
             update_levels_from_sheet(bus)
