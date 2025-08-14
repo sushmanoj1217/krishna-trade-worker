@@ -3,6 +3,7 @@ import json, pathlib
 from datetime import datetime
 from tzlocal import get_localzone
 from agents import logger
+from storage.sheet_persistence import write_snapshot_to_sheet
 
 SNAP_DIR = pathlib.Path("data/snapshots")
 SNAP_DIR.mkdir(parents=True, exist_ok=True)
@@ -12,7 +13,6 @@ def _today() -> str:
 
 def day_end_snapshot(sheet, cfg):
     day = _today()
-    # summarize from Trades
     best = {"pnl": -1e18, "trade_id": ""}
     worst = {"pnl": 1e18, "trade_id": ""}
     total = 0.0; n = 0
@@ -32,3 +32,9 @@ def day_end_snapshot(sheet, cfg):
     path = SNAP_DIR / f"{day}.json"
     path.write_text(json.dumps(snap, indent=2))
     logger.log_status(sheet, {"state":"OK", "message": f"snapshot saved {path}"})
+
+    # Also persist to Sheet
+    try:
+        write_snapshot_to_sheet(sheet, snap)
+    except Exception:
+        pass
