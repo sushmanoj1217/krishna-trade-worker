@@ -1,1 +1,4 @@
-Krishna Trade Worker v2 - see env in .env.example
+Krishna Trade Worker v3 — Dhan OC + Multi-Symbol
+See .env.example for envs.
+
+
