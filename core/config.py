@@ -1,16 +1,7 @@
-import os, json, yaml
+
+import json, yaml
 from dataclasses import dataclass
-from typing import Any, Optional
-
-def getenv_str(name: str, default: Optional[str]=None) -> Optional[str]:
-    v = os.getenv(name)
-    return v if v is not None and v != "" else default
-
-def getenv_int(name: str, default: int) -> int:
-    try:
-        return int(os.getenv(name, default))
-    except:
-        return default
+from typing import Any
 
 @dataclass
 class Settings:
@@ -25,7 +16,7 @@ class Settings:
     daily_loss_limit: int
     max_trades_per_day: int
 
-def load_settings(path: str = "config/settings.yaml") -> Settings:
+def load_settings(path: str = "config/settings.yaml") -> 'Settings':
     with open(path, "r", encoding="utf-8") as f:
         y = yaml.safe_load(f)
     return Settings(
