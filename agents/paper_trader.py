@@ -1,4 +1,5 @@
-import time, os
+
+import os
 from datetime import datetime
 from tzlocal import get_localzone
 from core.state import AppState
@@ -17,9 +18,11 @@ def current_ltp(levels):
     return levels.get("spot")
 
 def on_signal(sig, params, state: AppState, bus, sheet, cfg):
-    symbol = cfg.symbol
+    symbol = sig.get("symbol", cfg.symbol)
     side = sig["side"]
     levels = state.last_levels or {}
+    if levels.get("symbol") != symbol:
+        return
     ltp = current_ltp(levels)
     if not risk_manager.can_take_trade(side, ltp, cfg, params, state):
         return
@@ -31,61 +34,38 @@ def on_signal(sig, params, state: AppState, bus, sheet, cfg):
     tsb = now_ts_iso()
     tid = trade_id(tsb, symbol, side, ltp)
     if side == "CE":
-        sl = ltp - sl_pts
-        tp = ltp + tp_pts
+        sl = ltp - sl_pts; tp = ltp + tp_pts
     else:
-        sl = ltp + sl_pts
-        tp = ltp - tp_pts
-    trade = {
-        "trade_id": tid,
-        "ts_buy": tsb,
-        "symbol": symbol,
-        "side": side,
-        "buy_ltp": ltp,
-        "qty": qty,
-        "sl": sl,
-        "tp": tp,
-        "status": "OPEN",
-        "reason_buy": sig.get("reason",""),
-        "strat_ver": params.get("name","v1"),
-        "worker_id": os.getenv("WORKER_ID","DAY_A")
-    }
+        sl = ltp + sl_pts; tp = ltp - tp_pts
+    trade = {"trade_id": tid,"ts_buy": tsb,"symbol": symbol,"side": side,"buy_ltp": ltp,"qty": qty,"sl": sl,"tp": tp,
+             "status": "OPEN","reason_buy": sig.get("reason",""),"strat_ver": params.get("name","v1"),
+             "worker_id": os.getenv("WORKER_ID","DAY_A")}
     if logger.log_trade_open(sheet, trade):
         state.open_trades[tid] = trade
-        print(f"[trade] OPEN {tid} {side} qty={qty} ltp={ltp} sl={sl} tp={tp}")
+        print(f"[trade] OPEN {tid} {side} {symbol} qty={qty} ltp={ltp} sl={sl} tp={tp}")
     else:
         print(f"[trade] duplicate-skip {tid}")
 
 def tick(state: AppState, sheet, cfg, params):
-    if not state.open_trades:
-        return
-    levels = state.last_levels or {}
-    spot = levels.get("spot")
-    if spot is None:
-        return
+    if not state.open_trades: return
+    levels = state.last_levels or {}; spot = levels.get("spot"); sym = levels.get("symbol", cfg.symbol)
+    if spot is None: return
     closed = []
     for tid, tr in list(state.open_trades.items()):
-        side = tr["side"]
-        buy = tr["buy_ltp"]
-        qty = tr["qty"]
-        sl = tr["sl"]
-        tp = tr["tp"]
+        if tr.get("symbol") != sym:
+            continue
+        side, buy, qty, sl, tp = tr["side"], tr["buy_ltp"], tr["qty"], tr["sl"], tr["tp"]
         cur = spot
         new_sl = sl_manager.maybe_trail(side, buy, sl, cur, params)
         if new_sl != sl:
-            tr["sl"] = new_sl
-            logger.log_trade_update(sheet, tid, {"sl": new_sl})
+            tr["sl"] = new_sl; logger.log_trade_update(sheet, tid, {"sl": new_sl})
         exit_reason = None
         if side == "CE":
-            if cur <= tr["sl"]:
-                exit_reason = "SL"
-            elif cur >= tr["tp"]:
-                exit_reason = "TP"
+            if cur <= tr["sl"]: exit_reason = "SL"
+            elif cur >= tr["tp"]: exit_reason = "TP"
         else:
-            if cur >= tr["sl"]:
-                exit_reason = "SL"
-            elif cur <= tr["tp"]:
-                exit_reason = "TP"
+            if cur >= tr["sl"]: exit_reason = "SL"
+            elif cur <= tr["tp"]: exit_reason = "TP"
         if exit_reason:
             pnl_points = (cur - buy) if side=="CE" else (buy - cur)
             pnl = pnl_points * qty * POINT_VALUE
@@ -96,14 +76,12 @@ def tick(state: AppState, sheet, cfg, params):
         risk_manager.bump_daily(state, pnl)
 
 def flatten_all(state: AppState, sheet):
-    levels = state.last_levels or {}
-    spot = levels.get("spot")
-    if spot is None:
-        return
+    levels = state.last_levels or {}; spot = levels.get("spot"); sym = levels.get("symbol")
+    if spot is None: return
     for tid, tr in list(state.open_trades.items()):
-        side = tr["side"]
-        buy = tr["buy_ltp"]
-        qty = tr["qty"]
+        if tr.get("symbol") != sym:
+            continue
+        side, buy, qty = tr["side"], tr["buy_ltp"], tr["qty"]
         pnl_points = (spot - buy) if side=="CE" else (buy - spot)
         pnl = pnl_points * qty * POINT_VALUE
         logger.log_trade_close(sheet, tid, spot, "EOD_FLAT", pnl)
