@@ -1,3 +1,4 @@
+
 import os, json
 from typing import List, Dict, Any
 
@@ -35,6 +36,7 @@ class ConsoleSheet:
 class GSheet:
     def __init__(self, sh):
         self.sh = sh
+
     def ensure_headers(self, tab: str, headers: List[str]):
         try:
             ws = self.sh.worksheet(tab)
@@ -45,11 +47,13 @@ class GSheet:
             if existing:
                 ws.delete_rows(1)
             ws.insert_row(headers, index=1)
+
     def append(self, tab: str, row: Dict[str, Any]):
         ws = self.sh.worksheet(tab)
         headers = ws.row_values(1)
         vals = [row.get(h, "") for h in headers]
         ws.append_row(vals, value_input_option="RAW")
+
     def read_all(self, tab: str) -> List[Dict[str, Any]]:
         try:
             ws = self.sh.worksheet(tab)
