@@ -3,10 +3,11 @@
   "entry_rules": {
     "buy_ce_on_support": true,
     "buy_pe_on_resistance": true,
-    "require_trend_bias": true,
+    "require_trend_bias": false,
     "trend_bias_window": 3,
+    "entry_band_points": 5,
     "min_gap_points": 20,
-    "oi_confirm": true,
+    "oi_confirm": false,
     "oi_change_threshold": 0.0
   },
   "exits": {
