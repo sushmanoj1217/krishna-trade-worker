@@ -4,23 +4,23 @@ from datetime import datetime
 from tzlocal import get_localzone
 from integrations.dhan import DhanClient, _sym_norm
 
+try:
+    from integrations import telegram
+except Exception:
+    telegram = None  # optional
+
 LEVELS_PATH = "data/levels.json"
 
-# Per-symbol throttle + cache
 _LAST_CALL_TS: dict[str, float] = {}
-_EXPIRY_CACHE: dict[str, dict] = {}  # {sym: {"ts": float, "list": [str]}}
+_EXPIRY_CACHE: dict[str, dict] = {}
+_LAST_429_ALERT_TS: float = 0.0
 
-def _now_iso():
-    return datetime.now(get_localzone()).isoformat()
+def _now_iso(): return datetime.now(get_localzone()).isoformat()
 
 def _parse_symbols() -> list[str]:
     raw = os.getenv("OC_SYMBOL", os.getenv("OC_SYMBOL_PRIMARY", "NIFTY"))
-    if not raw:
-        return ["NIFTY"]
-    parts = [p.strip() for p in raw.split(",") if p.strip()]
-    if not parts:
-        return ["NIFTY"]
-    return [_sym_norm(p) for p in parts]
+    parts = [p.strip() for p in (raw or "").split(",") if p.strip()]
+    return [_sym_norm(p) for p in parts] or ["NIFTY"]
 
 def _choose_primary(symbols: list[str]) -> str:
     prim = os.getenv("OC_SYMBOL_PRIMARY", "").strip()
@@ -30,7 +30,7 @@ def _compute_levels_from_oc(oc_json: dict) -> dict:
     d = oc_json.get("data") or {}
     spot = d.get("last_price")
     chain = d.get("oc") or {}
-    supports = []; resists = []
+    supports, resists = [], []
     if spot is None or not chain:
         return {"spot": spot, "s1": None, "s2": None, "r1": None, "r2": None}
     for k, v in chain.items():
@@ -40,12 +40,9 @@ def _compute_levels_from_oc(oc_json: dict) -> dict:
             continue
         ce = (v or {}).get("ce") or {}
         pe = (v or {}).get("pe") or {}
-        ce_oi = float(ce.get("oi") or 0)
-        pe_oi = float(pe.get("oi") or 0)
-        if strike <= spot:
-            supports.append((strike, pe_oi))
-        if strike >= spot:
-            resists.append((strike, ce_oi))
+        ce_oi = float(ce.get("oi") or 0); pe_oi = float(pe.get("oi") or 0)
+        if strike <= spot: supports.append((strike, pe_oi))
+        if strike >= spot: resists.append((strike, ce_oi))
     supports.sort(key=lambda x: (x[1], x[0]), reverse=True)
     resists.sort(key=lambda x: (x[1], -x[0]), reverse=True)
     s1 = supports[0][0] if len(supports) > 0 else None
@@ -55,10 +52,8 @@ def _compute_levels_from_oc(oc_json: dict) -> dict:
     return {"spot": spot, "s1": s1, "s2": s2, "r1": r1, "r2": r2}
 
 def _expiry_list(client: DhanClient, sym: str, usid: int) -> list[str]:
-    """Cache expiries for EXPIRY_TTL_SECS to avoid hammering."""
     ttl = int(os.getenv("EXPIRY_TTL_SECS", "300") or "300")
-    ent = _EXPIRY_CACHE.get(sym)
-    now = time.time()
+    ent = _EXPIRY_CACHE.get(sym); now = time.time()
     if ent and (now - ent.get("ts", 0)) < ttl and ent.get("list"):
         return ent["list"]
     lst = client.get_expiries(usid)
@@ -66,6 +61,7 @@ def _expiry_list(client: DhanClient, sym: str, usid: int) -> list[str]:
     return lst
 
 def update_levels_from_dhan(bus):
+    global _LAST_429_ALERT_TS
     client   = DhanClient()
     symbols  = _parse_symbols()
     primary  = _choose_primary(symbols)
@@ -75,7 +71,7 @@ def update_levels_from_dhan(bus):
         symbols = [primary]
 
     min_interval = int(os.getenv("OC_MIN_INTERVAL_SECS", "15") or "15")
-    jitter_lo, jitter_hi = 0, int(os.getenv("OC_JITTER_SECS", "3") or "3")
+    jitter_hi = int(os.getenv("OC_JITTER_SECS", "3") or "3")
 
     levels_all = {}
     now_ts = time.time()
@@ -84,7 +80,6 @@ def update_levels_from_dhan(bus):
         last = _LAST_CALL_TS.get(sym, 0.0)
         wait_left = min_interval - (now_ts - last)
         if wait_left > 0:
-            # Throttled; skip this tick
             print(f"[oc] throttle {sym}: wait {wait_left:.1f}s")
             continue
 
@@ -99,18 +94,24 @@ def update_levels_from_dhan(bus):
                 print(f"[oc] no expiries: {sym}")
                 continue
 
-            expiry = exps[0]  # nearest
+            expiry = exps[0]
             oc = client.get_option_chain(usid, expiry)
             lv = _compute_levels_from_oc(oc)
             lv.update({"ts": _now_iso(), "expiry": expiry, "symbol": sym})
             levels_all[sym] = lv
             bus.emit("levels", lv)
             print(f"[oc] {sym} spot={lv.get('spot')} s1={lv.get('s1')} r1={lv.get('r1')}")
+            _LAST_CALL_TS[sym] = time.time() + random.randint(0, jitter_hi)
 
-            # mark call time with jitter to de-sync buckets
-            _LAST_CALL_TS[sym] = time.time() + random.randint(jitter_lo, jitter_hi)
         except Exception as e:
-            print(f"[oc] error {sym}: {e}")
+            emsg = str(e)
+            print(f"[oc] error {sym}: {emsg}")
+            # Telegram alert for 429 (once in 5m)
+            if "429" in emsg and os.getenv("ALERT_429", "on").lower() == "on" and telegram:
+                now = time.time()
+                if now - _LAST_429_ALERT_TS > 300:
+                    telegram.send(f"⚠️ 429 on OC for {sym}. Auto-throttle active.")
+                    _LAST_429_ALERT_TS = now
 
     try:
         with open(LEVELS_PATH, "w", encoding="utf-8") as f:
