@@ -1,6 +1,7 @@
-
+# path: agents/logger.py
 from datetime import datetime
 from tzlocal import get_localzone
+import os
 
 def ensure_all_headers(sheet, cfg):
     sheet.ensure_headers(cfg.sheet.get("levels_tab","OC_Live"),
@@ -16,10 +17,25 @@ def ensure_all_headers(sheet, cfg):
     sheet.ensure_headers(cfg.sheet.get("status_tab","Status"),
         ["ts","worker_id","shift_mode","state","message"])
 
+def _today():
+    return datetime.now(get_localzone()).strftime("%Y-%m-%d")
+
 def log_signal(sheet, cfg, sig, params, worker_id: str):
     tab = cfg.sheet.get("signals_tab","Signals")
+    sid = f"{sig.get('level_hit','LVL')}_{sig['side']}_{sig.get('symbol',cfg.symbol)}_{sig['spot']}"
+    # de-dup: skip if already logged today with same id & worker
+    try:
+        rows = sheet.read_all(tab)
+        last_n = int(os.getenv("SIGNAL_DEDUP_LAST_N", "100"))
+        recent = rows[-last_n:] if rows else []
+        for r in reversed(recent):
+            if r.get("signal_id")==sid and r.get("worker_id","")==worker_id and str(r.get("ts","")).startswith(_today()):
+                return  # skip duplicate
+    except Exception:
+        pass
+
     row = {
-        "signal_id": f"{sig.get('level_hit','LVL')}_{sig['side']}_{sig.get('symbol',cfg.symbol)}_{sig['spot']}",
+        "signal_id": sid,
         "ts": datetime.now(get_localzone()).isoformat(),
         "symbol": sig.get("symbol", cfg.symbol),
         "side(CE|PE)": sig["side"],
