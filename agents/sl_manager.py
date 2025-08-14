@@ -1,3 +1,4 @@
+
 def maybe_trail(side, buy_ltp, sl, cur, params):
     ta = params["exits"]["trail_after_points"]
     step = params["exits"]["trail_step_points"]
