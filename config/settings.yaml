@@ -1,3 +1,4 @@
+
 symbol: NIFTY
 max_exposure_per_trade: 3000
 daily_loss_limit: 6000
@@ -17,3 +18,4 @@ sheet:
   levels_tab: "OC_Live"
   perf_tab: "Performance"
   events_tab: "Events"
+  status_tab: "Status"
