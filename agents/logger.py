@@ -1,35 +1,56 @@
-# path: agents/logger.py
+# --- add this in agents/logger.py ---
 from datetime import datetime
-from tzlocal import get_localzone
-import os, time
+import time
 
-def ensure_all_headers(sheet, cfg):
-    sheet.ensure_headers(cfg.sheet.get("levels_tab","OC_Live"),
-        ["spot","s1","s2","r1","r2","expiry","signal","ts","symbol"])
-    sheet.ensure_headers(cfg.sheet.get("signals_tab","Signals"),
-        ["signal_id","ts","symbol","side(CE|PE)","reason","level_hit(S1/S2/R1/R2)","spot","sl_pts","tp_pts","strat_ver","worker_id"])
-    sheet.ensure_headers(cfg.sheet.get("trades_tab","Trades"),
-        ["trade_id","ts_buy","symbol","side","buy_ltp","qty","sl","tp","ts_exit","exit_ltp","pnl","reason_buy","reason_exit","strat_ver","status","worker_id"])
-    sheet.ensure_headers(cfg.sheet.get("perf_tab","Performance"),
-        ["date","strat_ver","win_rate","avg_pnl","total_trades","max_dd","daily_pnl","notes","worker_id"])
-    sheet.ensure_headers(cfg.sheet.get("events_tab","Events"),
-        ["date","time_ist","name","severity","effect","window_start","window_end"])
-    sheet.ensure_headers(cfg.sheet.get("status_tab","Status"),
-        ["ts","worker_id","shift_mode","state","message"])
-    # NEW: persistence tabs
-    sheet.ensure_headers("Params_Override", ["ts","date","symbol","json"])
-    sheet.ensure_headers("Snapshots", ["date","symbol","total_trades","sum_pnl","best_trade_id","best_pnl","worst_trade_id","worst_pnl","json"])
+STATUS_TAB = "Status"
+STATUS_HEADERS = ["ts", "worker_id", "shift_mode", "state", "message"]
 
-def _today():
-    return datetime.now(get_localzone()).strftime("%Y-%m-%d")
+def _now_iso():
+    # IST tz system TZ=Asia/Kolkata pe set hai; seconds precision enough
+    return datetime.now().replace(microsecond=0).isoformat(sep=" ")
 
-def _append_retry(sheet, tab, row, attempts:int=3, sleep_s:float=1.0):
-    for i in range(attempts):
-        try:
-            sheet.append(tab, row); return True
-        except Exception as e:
-            if i == attempts-1: print(f"[sheet] append fail {tab}: {e}"); return False
-            time.sleep(sleep_s)
-    return False
+def log_status(sheet, data: dict):
+    """
+    Write heartbeat/status to Google Sheet 'Status' tab.
+    `sheet` can be either:
+      1) our Sheets wrapper with ensure_tab(name, headers) + append_row(name, row), OR
+      2) a gspread Spreadsheet object.
+    """
+    row = [
+        _now_iso(),
+        str(data.get("worker_id", "")),
+        str(data.get("shift_mode", "")),
+        str(data.get("state", "")),
+        str(data.get("message", "")),
+    ]
 
-# ... (rest of file unchanged — your existing logging functions) ...
+    # Preferred: our wrapper
+    try:
+        if hasattr(sheet, "ensure_tab") and hasattr(sheet, "append_row"):
+            sheet.ensure_tab(STATUS_TAB, headers=STATUS_HEADERS)
+            sheet.append_row(STATUS_TAB, row)
+            return
+    except Exception as e:
+        print(f"[logger.log_status] wrapper path failed: {e}", flush=True)
+
+    # Fallback: raw gspread
+    try:
+        ws = None
+        if hasattr(sheet, "worksheet"):
+            try:
+                ws = sheet.worksheet(STATUS_TAB)
+            except Exception:
+                if hasattr(sheet, "add_worksheet"):
+                    ws = sheet.add_worksheet(title=STATUS_TAB, rows=2, cols=len(STATUS_HEADERS))
+                    try:
+                        ws.append_row(STATUS_HEADERS)
+                    except Exception as _:
+                        pass
+        if ws is not None:
+            ws.append_row(row)
+            return
+    except Exception as e:
+        print(f"[logger.log_status] gspread path failed: {e}", flush=True)
+
+    # Last resort: no-op but avoid crashing heartbeat
+    print(f"[logger.log_status] could not write status row={row}", flush=True)
