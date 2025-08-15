@@ -4,7 +4,8 @@
 # - OC snapshot via plugin (analytics.oc_refresh) or fallback: Sheet OC_Live
 # - Signal generation via agents/signal_generator (oc_rules)
 # - One-trade-per-level-per-day dedup using Signals.signal_id == dedup_key
-# - Heartbeat + basic schedulers (APS scheduler)
+# - Heartbeat + schedulers (APScheduler)
+# - Telegram long-polling router (/status, /oc_now)
 
 import os, json, time, sys, traceback
 from dataclasses import dataclass
@@ -42,6 +43,12 @@ try:
     OC_PLUGIN = _oc_get_snapshot
 except Exception:
     OC_PLUGIN = None
+
+# Optional Telegram router
+try:
+    from ops import tele_router
+except Exception:
+    tele_router = None
 
 # ------------- Config -------------
 @dataclass
@@ -200,9 +207,6 @@ def get_oc_snapshot(cfg: Config, sheet: SheetsWrapper) -> Optional[Dict[str, Any
     return oc_from_sheet_latest(sheet, cfg.symbol)
 
 # ------------- Dedup helpers -------------
-def _today_str() -> str:
-    return datetime.now().date().isoformat()
-
 def dedup_exists(sheet: SheetsWrapper, dedup_key: str) -> bool:
     """
     Look into Signals tab, last ~500 rows for today's signal_id == dedup_key.
@@ -247,10 +251,18 @@ def main():
     # Ensure all tabs/headers
     logger.ensure_all_headers(sheet, cfg)
 
+    # Start Telegram router (daemon thread)
+    if tele_router is not None:
+        try:
+            tele_router.start(sheet, cfg)
+        except Exception as e:
+            print(f"[boot] tele_router start failed: {e}", flush=True)
+    else:
+        print("[boot] tele_router missing; TG commands disabled", flush=True)
+
     # ---- Schedulers ----
     if BackgroundScheduler is None:
         raise RuntimeError("apscheduler not available")
-
     sched = BackgroundScheduler(timezone=cfg.tz)
 
     # Heartbeat: every 60s
@@ -305,6 +317,7 @@ def main():
                 print(f"[oc] log_oc_live failed: {e}", flush=True)
 
             # Evaluate OC strategy → signal
+            from agents.signal_generator import generate_signal_from_oc
             sig = generate_signal_from_oc({
                 "symbol": oc.get("symbol") or cfg.symbol,
                 "spot": spot,
