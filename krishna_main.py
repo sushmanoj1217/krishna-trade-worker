@@ -4,7 +4,7 @@
 # - OC snapshot via plugin (analytics.oc_refresh) or fallback: Sheet OC_Live
 # - Signal generation via agents/signal_generator (oc_rules)
 # - One-trade-per-level-per-day dedup using Signals.signal_id == dedup_key
-# - Heartbeat + basic schedulers (APS cheduler)
+# - Heartbeat + basic schedulers (APS scheduler)
 
 import os, json, time, sys, traceback
 from dataclasses import dataclass
@@ -146,27 +146,42 @@ def _to_float(v, default=None):
 
 def oc_from_sheet_latest(sheet: SheetsWrapper, symbol: str) -> Optional[Dict[str, Any]]:
     """
-    Expect OC_Live headers:
+    Expect OC_Live headers (minimum):
       ts, symbol, spot, s1, s2, r1, r2, expiry, signal
+    Optional extra columns (if present):
+      ce_oi_pct, pe_oi_pct, volume_low
     """
     try:
         last = sheet.read_last_row("OC_Live")
         if not last or len(last) < 8:
             return None
-        # tolerate missing symbol col (older headers)
-        # heuristic mapping by header order we enforced in logger
-        # index map per logger.OC_LIVE_HEADERS
-        # ["ts","symbol","spot","s1","s2","r1","r2","expiry","signal"]
-        ts = last[0] if len(last) > 0 else ""
-        sym = last[1] if len(last) > 1 and last[1] else symbol
-        spot = _to_float(last[2], 0.0)
-        s1   = _to_float(last[3], 0.0)
-        s2   = _to_float(last[4], 0.0)
-        r1   = _to_float(last[5], 0.0)
-        r2   = _to_float(last[6], 0.0)
-        expiry = last[7] if len(last) > 7 else ""
-        return {"ts": ts, "symbol": sym, "spot": spot, "s1": s1, "s2": s2,
-                "r1": r1, "r2": r2, "expiry": expiry}
+
+        # Indices per enforced header order:
+        # 0 ts | 1 symbol | 2 spot | 3 s1 | 4 s2 | 5 r1 | 6 r2 | 7 expiry | 8 signal | 9 ce_oi_pct? | 10 pe_oi_pct? | 11 volume_low?
+        ts      = last[0] if len(last) > 0 else ""
+        sym     = last[1] if len(last) > 1 and last[1] else symbol
+        spot    = _to_float(last[2], 0.0)
+        s1      = _to_float(last[3], 0.0)
+        s2      = _to_float(last[4], 0.0)
+        r1      = _to_float(last[5], 0.0)
+        r2      = _to_float(last[6], 0.0)
+        expiry  = last[7] if len(last) > 7 else ""
+        signal  = last[8] if len(last) > 8 else ""
+
+        ce_oi_pct = _to_float(last[9])  if len(last) > 9  and last[9]  != "" else None
+        pe_oi_pct = _to_float(last[10]) if len(last) > 10 and last[10] != "" else None
+        # Accept "true/false/1/0"
+        volume_low = None
+        if len(last) > 11 and last[11] != "":
+            v = str(last[11]).strip().lower()
+            volume_low = (v in ("1", "true", "yes", "y"))
+
+        return {
+            "ts": ts, "symbol": sym,
+            "spot": spot, "s1": s1, "s2": s2, "r1": r1, "r2": r2,
+            "expiry": expiry, "signal": signal,
+            "ce_oi_pct": ce_oi_pct, "pe_oi_pct": pe_oi_pct, "volume_low": volume_low,
+        }
     except Exception as e:
         print(f"[oc] sheet read failed: {e}", flush=True)
         return None
@@ -203,7 +218,7 @@ def dedup_exists(sheet: SheetsWrapper, dedup_key: str) -> bool:
             idx = headers.index("signal_id")
         except ValueError:
             return False
-        # Scan last limited rows for today's date (first col 'ts' has date)
+        # Scan last limited rows
         for r in reversed(rows[-500:]):
             if len(r) <= idx:
                 continue
@@ -335,7 +350,13 @@ def main():
             traceback.print_exc()
 
     # OC tick interval
-    sched.add_job(oc_tick, "interval", seconds=max(5, cfg.oc_refresh_secs), id="oc_tick", next_run_time=datetime.now()+timedelta(seconds=1))
+    sched.add_job(
+        oc_tick,
+        "interval",
+        seconds=max(5, cfg.oc_refresh_secs),
+        id="oc_tick",
+        next_run_time=datetime.now() + timedelta(seconds=1),
+    )
 
     # Start
     sched.start()
