@@ -1,146 +1,356 @@
-# path: krishna_main.py
-import os, time
-from datetime import datetime
-from tzlocal import get_localzone
+# krishna_main.py
+# Krishna Trade Worker v3 — Main entry
+# - Env-driven config (Day/Night)
+# - OC snapshot via plugin (analytics.oc_refresh) or fallback: Sheet OC_Live
+# - Signal generation via agents/signal_generator (oc_rules)
+# - One-trade-per-level-per-day dedup using Signals.signal_id == dedup_key
+# - Heartbeat + basic schedulers (APS cheduler)
 
-from core.bus import Bus
-from core.config import load_settings, load_strategy_params
-from core.state import AppState
-from core.validate import print_startup_summary
-from core.version import git_sha
-from integrations.sheets import get_sheet
-from integrations import ping as uptime_ping
-from housekeeping.schedulers import start_schedulers
-from analytics.oc_refresh import oc_refresh_tick
+import os, json, time, sys, traceback
+from dataclasses import dataclass
+from typing import Optional, Dict, Any, List
+from datetime import datetime, timedelta
 
-from agents import market_scanner, signal_generator, paper_trader, performance_tracker, backtester, logger, event_filter
-from agents import daily_summary as daily_summary_agent
-from agents import shift_snapshot, auto_heal
-from integrations import telegram
-from ops import teleops
-from risk import circuit_breaker as cb
-from storage import sheet_persistence  # NEW
+# ---- Third-party ----
+try:
+    import gspread
+except Exception as e:
+    print(f"[boot] gspread import failed: {e}", flush=True)
+    gspread = None
 
-def today_str():
-    return datetime.now(get_localzone()).strftime("%Y-%m-%d")
+try:
+    from apscheduler.schedulers.background import BackgroundScheduler
+except Exception as e:
+    print(f"[boot] apscheduler import failed: {e}", flush=True)
+    BackgroundScheduler = None
 
-def pick_primary_symbol(cfg) -> str:
-    raw = os.getenv("OC_SYMBOL","") or cfg.symbol
-    prim = os.getenv("OC_SYMBOL_PRIMARY","").strip() or None
-    if prim: return prim.strip().upper()
-    if "," in raw: return raw.split(",")[0].strip().upper()
-    return (raw or cfg.symbol).strip().upper()
+# ---- Our modules ----
+from agents import logger
+from agents.signal_generator import generate_signal_from_oc
 
-def main():
-    print("== Krishna Trade Worker v3 (Dhan OC) ==")
-    print_startup_summary()
+# Optional executor (paper trading)
+try:
+    from agents.trade_executor import open_trade as open_paper_trade  # signature: open_trade(sheet, signal_dict)
+except Exception:
+    open_paper_trade = None
 
-    cfg = load_settings()
+# Optional OC plugin (preferred)
+OC_PLUGIN = None
+try:
+    # Expect a callable get_snapshot(cfg) -> dict with spot,s1,s2,r1,r2,ce_oi_pct,pe_oi_pct,expiry, symbol
+    from analytics.oc_refresh import get_snapshot as _oc_get_snapshot
+    OC_PLUGIN = _oc_get_snapshot
+except Exception:
+    OC_PLUGIN = None
 
-    # Get sheet FIRST, sync overrides from Sheet, THEN load params
-    sheet = get_sheet()
+# ------------- Config -------------
+@dataclass
+class Config:
+    tz: str
+    sheet_id: str
+    google_sa_json: str
+    shift_mode: str
+    worker_id: str
+    auto_trade: str
+    oc_mode: str
+    symbol: str
+    oc_min_interval_secs: int
+    oc_refresh_secs: int
+    oc_jitter_secs: int
+    git_sha: str
+
+def _getenv(name: str, default: Optional[str] = None) -> str:
+    v = os.getenv(name, default)
+    if v is None:
+        return ""
+    return v
+
+def load_config() -> Config:
+    return Config(
+        tz=_getenv("TZ", "Asia/Kolkata"),
+        sheet_id=_getenv("GSHEET_SPREADSHEET_ID", ""),
+        google_sa_json=_getenv("GOOGLE_SA_JSON", ""),
+        shift_mode=_getenv("SHIFT_MODE", "DAY"),
+        worker_id=_getenv("WORKER_ID", "DAY_A"),
+        auto_trade=_getenv("AUTO_TRADE", "on"),
+        oc_mode=_getenv("OC_MODE", "dhan"),
+        symbol=_getenv("OC_SYMBOL_PRIMARY", "NIFTY"),
+        oc_min_interval_secs=int(_getenv("OC_MIN_INTERVAL_SECS", "18")),
+        oc_refresh_secs=int(_getenv("OC_REFRESH_SECS", "15")),
+        oc_jitter_secs=int(_getenv("OC_JITTER_SECS", "4")),
+        git_sha=_getenv("GIT_SHA", _getenv("RENDER_GIT_COMMIT", ""))[:10],
+    )
+
+# ------------- Sheets wrapper -------------
+class SheetsWrapper:
+    def __init__(self, cfg: Config):
+        if gspread is None:
+            raise RuntimeError("gspread not available")
+        try:
+            info = json.loads(cfg.google_sa_json)
+        except Exception:
+            raise RuntimeError("Invalid GOOGLE_SA_JSON (must be one-line JSON)")
+        gc = gspread.service_account_from_dict(info)
+        self.ss = gc.open_by_key(cfg.sheet_id)
+
+    # Our logger uses these two if present
+    def ensure_tab(self, title: str, headers: List[str]):
+        try:
+            ws = self.ss.worksheet(title)
+        except Exception:
+            ws = self.ss.add_worksheet(title=title, rows=10, cols=max(10, len(headers)))
+            try:
+                ws.append_row(headers)
+            except Exception:
+                pass
+            return
+        # ensure headers
+        try:
+            first = ws.row_values(1)
+        except Exception:
+            first = []
+        if [h.strip() for h in first] != headers:
+            try:
+                ws.clear()
+            except Exception:
+                pass
+            try:
+                ws.append_row(headers)
+            except Exception:
+                end_col = chr(64 + len(headers))
+                ws.update(f"A1:{end_col}1", [headers])
+
+    def append_row(self, title: str, row: List[str]):
+        ws = self.ss.worksheet(title)
+        ws.append_row(row)
+
+    # helpers
+    def read_last_row(self, title: str) -> Optional[List[str]]:
+        ws = self.ss.worksheet(title)
+        rows = ws.get_all_values()
+        return rows[-1] if rows and len(rows) >= 2 else None
+
+    def read_col(self, title: str, col_index: int) -> List[str]:
+        ws = self.ss.worksheet(title)
+        col = ws.col_values(col_index)
+        return col
+
+# ------------- OC snapshot acquisition -------------
+def _to_float(v, default=None):
     try:
-        if sheet_persistence.sync_params_override_from_sheet(sheet):
-            print("[boot] params_override: loaded from Sheet")
+        if v is None:
+            return default
+        return float(v)
+    except Exception:
+        return default
+
+def oc_from_sheet_latest(sheet: SheetsWrapper, symbol: str) -> Optional[Dict[str, Any]]:
+    """
+    Expect OC_Live headers:
+      ts, symbol, spot, s1, s2, r1, r2, expiry, signal
+    """
+    try:
+        last = sheet.read_last_row("OC_Live")
+        if not last or len(last) < 8:
+            return None
+        # tolerate missing symbol col (older headers)
+        # heuristic mapping by header order we enforced in logger
+        # index map per logger.OC_LIVE_HEADERS
+        # ["ts","symbol","spot","s1","s2","r1","r2","expiry","signal"]
+        ts = last[0] if len(last) > 0 else ""
+        sym = last[1] if len(last) > 1 and last[1] else symbol
+        spot = _to_float(last[2], 0.0)
+        s1   = _to_float(last[3], 0.0)
+        s2   = _to_float(last[4], 0.0)
+        r1   = _to_float(last[5], 0.0)
+        r2   = _to_float(last[6], 0.0)
+        expiry = last[7] if len(last) > 7 else ""
+        return {"ts": ts, "symbol": sym, "spot": spot, "s1": s1, "s2": s2,
+                "r1": r1, "r2": r2, "expiry": expiry}
     except Exception as e:
-        print("[boot] params_override sync error:", e)
+        print(f"[oc] sheet read failed: {e}", flush=True)
+        return None
 
-    params = load_strategy_params()
+def get_oc_snapshot(cfg: Config, sheet: SheetsWrapper) -> Optional[Dict[str, Any]]:
+    # Preferred plugin (if provided by your repo)
+    if OC_PLUGIN is not None:
+        try:
+            oc = OC_PLUGIN(cfg)  # must return dict
+            if oc:
+                return oc
+        except Exception as e:
+            print(f"[oc] plugin error: {e}", flush=True)
+            traceback.print_exc()
+    # Fallback to Sheet (works for Night mode or if plugin absent)
+    return oc_from_sheet_latest(sheet, cfg.symbol)
 
-    bus = Bus(); state = AppState()
-    worker_id = os.getenv("WORKER_ID","DAY_A"); shift_mode = os.getenv("SHIFT_MODE","DAY").upper()
+# ------------- Dedup helpers -------------
+def _today_str() -> str:
+    return datetime.now().date().isoformat()
 
-    oc_secs_env = int(os.getenv("OC_REFRESH_SECS", str(cfg.oc_refresh_secs_day if shift_mode=='DAY' else cfg.oc_refresh_secs_night)))
-    oc_secs = max(oc_secs_env, 3)
-    cfg.symbol = pick_primary_symbol(cfg)
+def dedup_exists(sheet: SheetsWrapper, dedup_key: str) -> bool:
+    """
+    Look into Signals tab, last ~500 rows for today's signal_id == dedup_key.
+    """
+    try:
+        ws = sheet.ss.worksheet("Signals")
+        rows = ws.get_all_values()
+        if not rows or len(rows) < 2:
+            return False
+        # Find header index for signal_id
+        headers = rows[0]
+        try:
+            idx = headers.index("signal_id")
+        except ValueError:
+            return False
+        # Scan last limited rows for today's date (first col 'ts' has date)
+        for r in reversed(rows[-500:]):
+            if len(r) <= idx:
+                continue
+            if dedup_key and r[idx] == dedup_key:
+                return True
+        return False
+    except Exception as e:
+        print(f"[dedup] check failed: {e}", flush=True)
+        return False
 
+# ------------- Main logic -------------
+def main():
+    cfg = load_config()
+
+    print("== Krishna Trade Worker v3 (OC Rules) ==")
+    print(f"[boot] OC_MODE={cfg.oc_mode}")
+    print(f"[boot] GSHEET_SPREADSHEET_ID={'set' if cfg.sheet_id else 'missing'}")
+    print(f"[boot] TELEGRAM={'ready' if _getenv('TELEGRAM_BOT_TOKEN') else 'off'}")
+    if _getenv("DHAN_CLIENT_ID"): print("[boot] DHAN_CLIENT_ID=set")
+    if _getenv("DHAN_ACCESS_TOKEN"): print("[boot] DHAN_ACCESS_TOKEN=set")
+    if _getenv("DHAN_USID_MAP"): print(f"[boot] DHAN_USID_MAP={_getenv('DHAN_USID_MAP')}")
+    if cfg.git_sha: print(f"[boot] GIT_SHA={cfg.git_sha}")
+
+    # Sheets
+    sheet = SheetsWrapper(cfg)
+    # Ensure all tabs/headers
     logger.ensure_all_headers(sheet, cfg)
 
-    # Startup ping
-    try: telegram.send(f"🚀 Worker UP [{cfg.symbol}] {git_sha()[:10]}")
-    except Exception: pass
+    # ---- Schedulers ----
+    if BackgroundScheduler is None:
+        raise RuntimeError("apscheduler not available")
 
-    def _levels_handler(levels: dict):
-        if levels.get("symbol") and levels["symbol"].upper() != cfg.symbol.upper(): return
-        state.last_levels = levels
-        if state.day_date != today_str(): state.reset_if_new_day(today_str())
-        blocked, reason = event_filter.is_blocked_now(sheet, cfg)
-        if blocked:
-            logger.log_status(sheet, {"worker_id": worker_id, "shift_mode": shift_mode, "state":"HOLD", "message": f"events: {reason}"})
-            return
-        paused, why = cb.is_paused()
-        if paused:
-            logger.log_status(sheet, {"worker_id": worker_id, "shift_mode": shift_mode, "state":"HOLD", "message": why})
-            return
-        market_scanner.on_levels(levels)
-        signal_generator.on_levels(levels, params, state, bus, sheet, cfg)
-    bus.on("levels", _levels_handler)
+    sched = BackgroundScheduler(timezone=cfg.tz)
 
-    def _signal_handler(sig: dict):
-        if sig.get("symbol","").upper() != cfg.symbol.upper(): return
-        blocked, _ = event_filter.is_blocked_now(sheet, cfg)
-        if blocked: return
-        paused, _ = cb.is_paused()
-        if paused: return
-        logger.log_signal(sheet, cfg, sig, params, worker_id)
-        telegram.send(f"Signal {sig['side']} {sig.get('level_hit','')} {cfg.symbol} @ {sig.get('spot')}")
-        if os.getenv("AUTO_TRADE","on").lower()=="on" and shift_mode=="DAY":
-            paper_trader.on_signal(sig, params, state, bus, sheet, cfg)
-    bus.on("signal", _signal_handler)
-
-    def _on_trade_open(evt: dict):
-        tr = evt.get("trade", {})
-        telegram.send(f"OPEN {tr.get('symbol')} {tr.get('side')} qty={tr.get('qty')} @ {tr.get('buy_ltp')} SL={tr.get('sl')} TP={tr.get('tp')}")
-    def _on_trade_close(evt: dict):
-        tr = evt.get("trade", {})
-        telegram.send(f"CLOSE {tr.get('symbol')} {tr.get('side')} exit={evt.get('exit_ltp')} reason={evt.get('reason')} PnL={evt.get('pnl'):.2f}")
-        try: cb.on_trade_close(evt, sheet, cfg)
-        except Exception: pass
-    bus.on("trade_open", _on_trade_open)
-    bus.on("trade_close", _on_trade_close)
-
+    # Heartbeat: every 60s
     def heartbeat():
-        logger.log_status(sheet, {"worker_id": worker_id, "shift_mode": shift_mode, "state":"OK", "message": f"hb {cfg.symbol}"})
-        try: uptime_ping.ping()
-        except Exception: pass
-
-    def paper_tick(): paper_trader.tick(state, sheet, cfg, params)
-    def pre_eod_flatten(): paper_trader.flatten_all(state, sheet)
-    def eod():
-        performance_tracker.eod(sheet, cfg, worker_id, today_str())
-        shift_snapshot.day_end_snapshot(sheet, cfg)
-        auto_heal.generate_suggestions(sheet, cfg)
-    def nightly(): backtester.nightly(sheet, cfg, worker_id)
-    def send_daily_summary(): daily_summary_agent.push_telegram(sheet, cfg)
-    def tele_ops(): teleops.tick(sheet, cfg, state)
-
-    def on_job_error(job_id, exc):
-        msg = f"❌ Job error [{job_id}] {exc}"
-        print(msg)
         try:
-            logger.log_status(sheet, {"state":"ERR", "message": msg})
-            telegram.send(msg)
-        except Exception: pass
+            logger.log_status(sheet, {
+                "worker_id": cfg.worker_id,
+                "shift_mode": cfg.shift_mode,
+                "state": "OK",
+                "message": f"hb {cfg.symbol}"
+            })
+        except Exception as e:
+            print(f"❌ Job error [heartbeat] {e}", flush=True)
 
-    app = {
-        "oc_secs": oc_secs,
-        "oc_refresh": lambda: oc_refresh_tick(bus),
-        "paper_tick": paper_tick,
-        "pre_eod_flatten": pre_eod_flatten,
-        "eod": eod,
-        "nightly": nightly,
-        "heartbeat": heartbeat,
-        "daily_summary": send_daily_summary,
-        "tele_ops": tele_ops,
-        "on_job_error": on_job_error,
-    }
+    sched.add_job(heartbeat, "interval", seconds=60, id="heartbeat")
 
-    start_schedulers(app, shift_mode)
+    # OC tick: refresh snapshot + evaluate signal
+    _last_oc_at = {"ts": 0.0}  # throttle
 
+    def oc_tick():
+        try:
+            # Simple throttle (min interval)
+            now_ts = time.time()
+            if now_ts - _last_oc_at["ts"] < cfg.oc_min_interval_secs:
+                remain = round(cfg.oc_min_interval_secs - (now_ts - _last_oc_at["ts"]), 1)
+                print(f"[oc] throttle {cfg.symbol}: wait {remain}s", flush=True)
+                return
+
+            oc = get_oc_snapshot(cfg, sheet)
+            if not oc:
+                print("[oc] no snapshot available", flush=True)
+                return
+
+            _last_oc_at["ts"] = now_ts
+
+            # Print summary
+            spot = oc.get("spot")
+            s1, r1 = oc.get("s1"), oc.get("r1")
+            print(f"[oc] {cfg.symbol} spot={spot} s1={s1} r1={r1}", flush=True)
+
+            # Log OC live to sheet (optional)
+            try:
+                logger.log_oc_live(sheet, {
+                    "ts": oc.get("ts") or "",
+                    "symbol": oc.get("symbol") or cfg.symbol,
+                    "spot": spot, "s1": s1, "s2": oc.get("s2"),
+                    "r1": r1, "r2": oc.get("r2"),
+                    "expiry": oc.get("expiry") or "",
+                    "signal": oc.get("signal") or "",
+                })
+            except Exception as e:
+                print(f"[oc] log_oc_live failed: {e}", flush=True)
+
+            # Evaluate OC strategy → signal
+            sig = generate_signal_from_oc({
+                "symbol": oc.get("symbol") or cfg.symbol,
+                "spot": spot,
+                "s1": s1, "s2": oc.get("s2"),
+                "r1": r1, "r2": oc.get("r2"),
+                "ce_oi_pct": oc.get("ce_oi_pct"),
+                "pe_oi_pct": oc.get("pe_oi_pct"),
+                "volume_low": oc.get("volume_low"),
+            })
+            if not sig:
+                return
+
+            # Dedup per-level-per-day
+            dkey = sig.get("dedup_key")
+            if dkey and dedup_exists(sheet, dkey):
+                print(f"[signal] skip duplicate for {dkey}", flush=True)
+                return
+
+            # Log to Signals (append)
+            logger.log_signal(sheet, {
+                "ts": "",  # auto fill
+                "symbol": sig.get("symbol"),
+                "side": sig.get("side"),
+                "price": "",          # executor fills on open
+                "reason": sig.get("reason"),
+                "level": sig.get("level"),
+                "sl": "",             # executor computes from sl_pct if needed
+                "tp": "",             # executor computes from target_pct if needed
+                "rr": "",             # optional
+                "signal_id": dkey or "",
+            })
+            print(f"[signal] {sig.get('side')} {cfg.symbol} @ {sig.get('level_tag')} ({sig.get('reason')})", flush=True)
+
+            # Try open paper trade
+            if open_paper_trade and cfg.auto_trade.lower() == "on":
+                try:
+                    open_paper_trade(sheet, sig)
+                except Exception as e:
+                    print(f"[trade] open_paper_trade failed: {e}", flush=True)
+
+        except Exception as e:
+            print(f"❌ Job error [oc_tick] {e}", flush=True)
+            traceback.print_exc()
+
+    # OC tick interval
+    sched.add_job(oc_tick, "interval", seconds=max(5, cfg.oc_refresh_secs), id="oc_tick", next_run_time=datetime.now()+timedelta(seconds=1))
+
+    # Start
+    sched.start()
+
+    # Main loop keepalive
     try:
-        while True: time.sleep(1)
+        while True:
+            time.sleep(1)
     except KeyboardInterrupt:
-        print("shutting down...")
+        print("[main] KeyboardInterrupt, exiting...", flush=True)
+    finally:
+        try:
+            sched.shutdown(wait=False)
+        except Exception:
+            pass
 
 if __name__ == "__main__":
     main()
