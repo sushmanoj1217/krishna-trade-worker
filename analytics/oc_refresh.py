@@ -1,84 +1,119 @@
 # analytics/oc_refresh.py
-# Dhan OC plugin that returns a normalized snapshot for krishna_main.get_oc_snapshot(cfg)
-# Output dict keys expected by main:
+# Dhan Option Chain plugin (v2 API)
+# Returns a normalized snapshot for krishna_main.get_oc_snapshot(cfg)
+# Output keys:
 #   symbol, spot, s1, s2, r1, r2, expiry, ce_oi_pct, pe_oi_pct, volume_low
 #
-# It tries Dhan API first; on any error it falls back to reading OC_Live via Sheets wrapper
-# that main already handles (so returning None here will let main use its sheet fallback).
+# Strategy:
+# - POST /v2/optionchain/expirylist  (headers: access-token, client-id)
+# - POST /v2/optionchain              (headers: access-token, client-id)
+# - Parse v2 shape: data.last_price + data.oc{ "<strike>": {ce:{oi:...}, pe:{oi:...}} }
+# - Compute S1/S2 (PE OI top-2) and R1/R2 (CE OI top-2)
+# - Aggregate near-ATM CE/PE OI to compute intraday % change (module memory)
+# - On any error: raise -> main will fallback to Sheets OC_Live (returns None here)
 
-import os, time, json, math
-from typing import Any, Dict, List, Optional, Tuple
+from __future__ import annotations
+import os
+import json
 import requests
+from typing import Any, Dict, List, Optional, Tuple
 
-# ---- Dhan API endpoints (adjust if your account uses different paths) ----
 BASE_URL = "https://api.dhan.co"
-EXPIRY_LIST_PATH = "/v2/optionchain/expirylist"   # ?symbol=NIFTY
-CHAIN_PATH       = "/v2/optionchain/chain"        # ?symbol=NIFTY&expiry=YYYY-MM-DD
 
-# Module-level memory for OI deltas (so we can compute % change intraday)
+# Module-level memory for near-ATM OI to compute % change across ticks
 _prev_oi = {"ce": None, "pe": None}
 
+
+# ---------------- HTTP helpers ----------------
 def _headers() -> Dict[str, str]:
-    token = os.getenv("DHAN_ACCESS_TOKEN", "")
-    cid   = os.getenv("DHAN_CLIENT_ID", "")
-    return {
-        "Authorization": f"Bearer {token}",
-        "x-client-id": cid,
-        "accept": "application/json",
+    """Dhan v2 expects access-token + client-id. Keep accept/json."""
+    h = {
+        "access-token": os.getenv("DHAN_ACCESS_TOKEN", ""),
+        "client-id": os.getenv("DHAN_CLIENT_ID", ""),
         "content-type": "application/json",
+        "accept": "application/json",
     }
+    # Backward-compat (some setups still keep Bearer); harmless to include:
+    auth = os.getenv("DHAN_ACCESS_TOKEN")
+    if auth:
+        h.setdefault("Authorization", f"Bearer {auth}")
+    return h
 
-def _get_json(url: str, params: Dict[str, Any]) -> Any:
-    r = requests.get(url, params=params, headers=_headers(), timeout=10)
+
+def _post_json(path: str, payload: Dict[str, Any]) -> Any:
+    url = BASE_URL + path
+    r = requests.post(url, json=payload, headers=_headers(), timeout=12)
     if r.status_code != 200:
+        # surface concise error; main handles fallback
         raise RuntimeError(f"HTTP {r.status_code} {url} {r.text[:200]}")
-    return r.json()
+    try:
+        return r.json()
+    except Exception:
+        raise RuntimeError("Non-JSON response from Dhan")
 
-def _pick_nearest_expiry(expiries: List[str]) -> str:
-    # expiries like ["2025-08-21", "2025-08-28", ...] — pick the earliest future
-    if not expiries:
-        raise RuntimeError("no expiries")
-    return sorted(expiries)[0]
+
+# ---------------- Parsing helpers ----------------
+def _rows_from_v2_oc_map(oc_map: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """
+    Flatten v2 oc map into rows like:
+      {"optionType":"CE"/"PE","strikePrice":float,"openInterest":float}
+    """
+    rows: List[Dict[str, Any]] = []
+    if not isinstance(oc_map, dict):
+        return rows
+    for k_str, legs in oc_map.items():
+        try:
+            k = float(k_str)
+        except Exception:
+            continue
+        if not isinstance(legs, dict):
+            continue
+        ce = legs.get("ce") or {}
+        pe = legs.get("pe") or {}
+        if isinstance(ce, dict):
+            oi_ce = _to_float(ce.get("oi"), 0.0)
+            rows.append({"optionType": "CE", "strikePrice": k, "openInterest": oi_ce})
+        if isinstance(pe, dict):
+            oi_pe = _to_float(pe.get("oi"), 0.0)
+            rows.append({"optionType": "PE", "strikePrice": k, "openInterest": oi_pe})
+    return rows
+
 
 def _extract_fields(row: Dict[str, Any]) -> Tuple[str, float, float]:
-    """
-    Try to read a single leg row in multiple possible shapes:
-      returns (opt_type 'CE'/'PE', strike, oi)
-    """
-    # option type
-    t = row.get("optionType") or row.get("type") or row.get("side") or row.get("optType") or ""
-    t = str(t).upper()
-    if t not in ("CE", "CALL") and t not in ("PE", "PUT"):
-        # handle flags like 'CALL'/'PUT'
-        if "CALL" in t:
-            t = "CE"
-        elif "PUT" in t:
-            t = "PE"
-    t = "CE" if ("CE" in t or "CALL" in t) else ("PE" if ("PE" in t or "PUT" in t) else "")
-
-    # strike
-    strike = row.get("strikePrice") or row.get("strike") or row.get("sp") or 0
-    try:
-        strike = float(strike)
-    except Exception:
-        strike = 0.0
-
-    # open interest
-    oi = row.get("openInterest") or row.get("oi") or row.get("oiQty") or 0
-    try:
-        oi = float(oi)
-    except Exception:
-        oi = 0.0
-
+    """Return (type 'CE'/'PE', strike, oi) from a row (robust to field names)."""
+    t = str(row.get("optionType", "")).upper()
+    if "CALL" in t:
+        t = "CE"
+    elif "PUT" in t:
+        t = "PE"
+    elif t not in ("CE", "PE"):
+        t = "CE" if "C" in t else ("PE" if "P" in t else t)
+    strike = _to_float(row.get("strikePrice") or row.get("strike"), 0.0)
+    oi = _to_float(row.get("openInterest") or row.get("oi"), 0.0)
     return t, strike, oi
 
-def _compute_levels(chain_rows: List[Dict[str, Any]]) -> Tuple[float, float, float, float, Dict[float, float], Dict[float, float]]:
-    """Return (s1, s2, r1, r2, pe_oi_by_strike, ce_oi_by_strike) from a flat list of option rows."""
+
+def _to_float(v: Any, default: Optional[float] = None) -> Optional[float]:
+    try:
+        if v is None:
+            return default
+        return float(v)
+    except Exception:
+        return default
+
+
+def _compute_levels(rows: List[Dict[str, Any]]) -> Tuple[float, float, float, float, Dict[float, float], Dict[float, float]]:
+    """
+    Compute:
+      - s1/s2 = top-2 PE OI strikes  (supports)
+      - r1/r2 = top-2 CE OI strikes  (resistances)
+      also return per-strike OI maps for CE/PE
+    """
     pe_oi: Dict[float, float] = {}
     ce_oi: Dict[float, float] = {}
-    for row in chain_rows:
+    for row in rows:
         t, k, oi = _extract_fields(row)
-        if k <= 0: 
+        if not k or not oi:
             continue
         if t == "PE":
             pe_oi[k] = pe_oi.get(k, 0.0) + oi
@@ -88,54 +123,15 @@ def _compute_levels(chain_rows: List[Dict[str, Any]]) -> Tuple[float, float, flo
     def _top2(d: Dict[float, float]) -> Tuple[float, float]:
         if not d:
             return 0.0, 0.0
-        # sort by OI desc
-        sorted_k = sorted(d.items(), key=lambda kv: kv[1], reverse=True)
-        first = sorted_k[0][0] if len(sorted_k) > 0 else 0.0
-        second = sorted_k[1][0] if len(sorted_k) > 1 else 0.0
-        return first, second
+        top = sorted(d.items(), key=lambda kv: kv[1], reverse=True)
+        a = top[0][0] if len(top) > 0 else 0.0
+        b = top[1][0] if len(top) > 1 else 0.0
+        return a, b
 
-    s1, s2 = _top2(pe_oi)  # PE side highs -> supports
-    r1, r2 = _top2(ce_oi)  # CE side highs -> resistances
+    s1, s2 = _top2(pe_oi)
+    r1, r2 = _top2(ce_oi)
     return s1, s2, r1, r2, pe_oi, ce_oi
 
-def _infer_spot(chain_rows: List[Dict[str, Any]]) -> float:
-    # Try underlying fields if present
-    for row in chain_rows[:10]:
-        for key in ("underlying", "underlyingValue", "underlyingPrice", "underlying_price", "ltpUnderlying"):
-            if key in row:
-                try:
-                    return float(row[key])
-                except Exception:
-                    pass
-    # Else approximate by weighted mid of CE/PE ATM band if strikes exist
-    strikes = []
-    for row in chain_rows:
-        _, k, oi = _extract_fields(row)
-        if k > 0 and oi > 0:
-            strikes.append(k)
-    if not strikes:
-        return 0.0
-    # naive mid
-    return float(sorted(strikes)[len(strikes)//2])
-
-def _agg_oi_near_atm(oi_by_strike: Dict[float, float], spot: float, band: int = 1) -> float:
-    # Sum OI of nearest +/- band strikes (band=1 means ATM ±1)
-    if spot <= 0 or not oi_by_strike:
-        return 0.0
-    nearest = min(oi_by_strike.keys(), key=lambda k: abs(k - spot))
-    strikes = sorted(oi_by_strike.keys())
-    # get neighbors
-    try:
-        idx = strikes.index(nearest)
-    except ValueError:
-        # fallback to min diff
-        diffs = [(abs(k - spot), i) for i, k in enumerate(strikes)]
-        idx = min(diffs)[1]
-    total = 0.0
-    for j in range(idx - band, idx + band + 1):
-        if 0 <= j < len(strikes):
-            total += oi_by_strike[strikes[j]]
-    return total
 
 def _pct_change(curr: float, prev: Optional[float]) -> Optional[float]:
     if prev is None or prev == 0:
@@ -145,65 +141,97 @@ def _pct_change(curr: float, prev: Optional[float]) -> Optional[float]:
     except Exception:
         return None
 
-def _expiries(symbol: str) -> List[str]:
-    data = _get_json(BASE_URL + EXPIRY_LIST_PATH, {"symbol": symbol})
-    # try common shapes
-    if isinstance(data, dict):
-        arr = data.get("data") or data.get("expiries") or data.get("expiryList") or data.get("result")
-        if isinstance(arr, list):
-            # ensure strings
-            return [str(x) for x in arr]
-    if isinstance(data, list):
-        return [str(x) for x in data]
-    raise RuntimeError(f"unexpected expiry list shape: {type(data)}")
 
-def _chain(symbol: str, expiry: str) -> List[Dict[str, Any]]:
-    data = _get_json(BASE_URL + CHAIN_PATH, {"symbol": symbol, "expiry": expiry})
-    # normalize to flat list of rows
-    if isinstance(data, dict):
-        rows = data.get("data") or data.get("result") or data.get("records") or []
-        if isinstance(rows, dict):
-            # sometimes {CE: [...], PE: [...]}
-            flat: List[Dict[str, Any]] = []
-            for k, v in rows.items():
-                if isinstance(v, list):
-                    for row in v:
-                        if isinstance(row, dict):
-                            row.setdefault("optionType", "CE" if k.upper().startswith("C") else "PE")
-                            flat.append(row)
-            return flat
-        if isinstance(rows, list):
-            return [r for r in rows if isinstance(r, dict)]
-    if isinstance(data, list):
-        return [r for r in data if isinstance(r, dict)]
-    raise RuntimeError("unexpected chain shape")
+def _agg_oi_near_atm(oi_by_strike: Dict[float, float], spot: float, band: int = 1) -> float:
+    """
+    Sum OI around the nearest strike to spot across ±band indices.
+    """
+    if spot <= 0 or not oi_by_strike:
+        return 0.0
+    strikes = sorted(oi_by_strike.keys())
+    nearest = min(strikes, key=lambda k: abs(k - spot))
+    try:
+        idx = strikes.index(nearest)
+    except ValueError:
+        idx = 0
+    total = 0.0
+    for j in range(idx - band, idx + band + 1):
+        if 0 <= j < len(strikes):
+            total += oi_by_strike[strikes[j]]
+    return total
 
+
+# ---------------- Public: get_snapshot ----------------
 def get_snapshot(cfg) -> Optional[Dict[str, Any]]:
     """
-    Return dict:
-      symbol, spot, s1, s2, r1, r2, expiry, ce_oi_pct, pe_oi_pct, volume_low
-    On error, return None -> main will fallback to Sheets OC_Live.
+    Returns:
+      {
+        "symbol": str,
+        "spot": float, "s1": float, "s2": float, "r1": float, "r2": float,
+        "expiry": "YYYY-MM-DD",
+        "ce_oi_pct": float|None,
+        "pe_oi_pct": float|None,
+        "volume_low": bool
+      }
+    On any error: prints and returns None (main will fallback to Sheets).
     """
     symbol = os.getenv("OC_SYMBOL_PRIMARY", getattr(cfg, "symbol", "NIFTY"))
+    # DHAN_USID_MAP like: "NIFTY=13,BANKNIFTY=12"
+    us_map_str = os.getenv("DHAN_USID_MAP", "NIFTY=13")
+    us_map: Dict[str, str] = {}
     try:
-        expiries = _expiries(symbol)
-        expiry = _pick_nearest_expiry(expiries)
-        rows = _chain(symbol, expiry)
+        for item in us_map_str.split(","):
+            if not item.strip():
+                continue
+            k, v = item.strip().split("=")
+            us_map[k.strip()] = v.strip()
+    except Exception:
+        pass
+    try:
+        us_id = int(us_map.get(symbol, "13"))
+    except Exception:
+        us_id = 13
 
-        s1, s2, r1, r2, pe_oi_by_k, ce_oi_by_k = _compute_levels(rows)
-        spot = _infer_spot(rows)
+    seg = "IDX_I"  # index options segment
 
-        # Aggregate OI near ATM ±1 strikes
-        ce_oi_now = _agg_oi_near_atm(ce_oi_by_k, spot, band=1)
-        pe_oi_now = _agg_oi_near_atm(pe_oi_by_k, spot, band=1)
+    try:
+        # 1) Expiries
+        exp_resp = _post_json("/v2/optionchain/expirylist", {
+            "UnderlyingScrip": us_id,
+            "UnderlyingSeg": seg,
+        })
+        expiries = exp_resp.get("data")
+        if not isinstance(expiries, list) or not expiries:
+            raise RuntimeError("bad expirylist shape")
+        expiries = [str(x) for x in expiries]
+        expiry = sorted(expiries)[0]
 
-        ce_pct = _pct_change(ce_oi_now, _prev_oi["ce"])
-        pe_pct = _pct_change(pe_oi_now, _prev_oi["pe"])
-        _prev_oi["ce"] = ce_oi_now
-        _prev_oi["pe"] = pe_oi_now
+        # 2) Chain
+        chain_resp = _post_json("/v2/optionchain", {
+            "UnderlyingScrip": us_id,
+            "UnderlyingSeg": seg,
+            "Expiry": expiry,
+        })
+        if not isinstance(chain_resp, dict) or "data" not in chain_resp:
+            raise RuntimeError("unexpected chain shape")
 
-        # volume_low heuristic (optional): if both OI tiny near ATM
-        volume_low = bool(ce_oi_now < 1e4 and pe_oi_now < 1e4)
+        data = chain_resp["data"]
+        spot = _to_float(data.get("last_price"), 0.0) or 0.0
+        oc_map = data.get("oc") or {}
+
+        rows = _rows_from_v2_oc_map(oc_map)
+        s1, s2, r1, r2, pe_by_k, ce_by_k = _compute_levels(rows)
+
+        # 3) Near-ATM OI aggregates and % changes
+        ce_now = _agg_oi_near_atm(ce_by_k, spot, band=1)
+        pe_now = _agg_oi_near_atm(pe_by_k, spot, band=1)
+
+        ce_pct = _pct_change(ce_now, _prev_oi["ce"])
+        pe_pct = _pct_change(pe_now, _prev_oi["pe"])
+        _prev_oi["ce"] = ce_now
+        _prev_oi["pe"] = pe_now
+
+        volume_low = bool(ce_now < 1e4 and pe_now < 1e4)
 
         return {
             "symbol": symbol,
