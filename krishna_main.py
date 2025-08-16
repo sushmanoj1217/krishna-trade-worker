@@ -3,9 +3,10 @@
 # - Env-driven config (Day/Night)
 # - OC snapshot via plugin (analytics.oc_refresh) or fallback: Sheet OC_Live
 # - Signal generation via agents/signal_generator (oc_rules)
-# - One-trade-per-level-per-day dedup using Signals.signal_id == dedup_key
-# - Heartbeat + schedulers (APScheduler)
+# - Per-level-per-day dedup (Signals.signal_id)
+# - Heartbeat + OC tick schedulers (APScheduler)
 # - Telegram long-polling router (/status, /oc_now)
+# - EOD Performance row @ 15:31 IST + TG summary @ 15:35 IST (Mon–Fri)
 
 import os, json, time, sys, traceback
 from dataclasses import dataclass
@@ -49,6 +50,12 @@ try:
     from ops import tele_router
 except Exception:
     tele_router = None
+
+# Optional EOD writer
+try:
+    from ops import eod_perf
+except Exception:
+    eod_perf = None
 
 # ------------- Config -------------
 @dataclass
@@ -317,7 +324,6 @@ def main():
                 print(f"[oc] log_oc_live failed: {e}", flush=True)
 
             # Evaluate OC strategy → signal
-            from agents.signal_generator import generate_signal_from_oc
             sig = generate_signal_from_oc({
                 "symbol": oc.get("symbol") or cfg.symbol,
                 "spot": spot,
@@ -369,6 +375,68 @@ def main():
         seconds=max(5, cfg.oc_refresh_secs),
         id="oc_tick",
         next_run_time=datetime.now() + timedelta(seconds=1),
+    )
+
+    # ---- EOD jobs (Mon–Fri) ----
+    def eod_write():
+        if eod_perf is None:
+            print("[eod] eod_perf module missing", flush=True)
+            return
+        try:
+            perf = eod_perf.write_eod(sheet, cfg, cfg.symbol)
+            print(f"[eod] performance row written: {perf}", flush=True)
+        except Exception as e:
+            print(f"❌ Job error [eod_write] {e}", flush=True)
+
+    sched.add_job(
+        eod_write,
+        "cron",
+        day_of_week="mon-fri",
+        hour=15, minute=31,
+        id="eod_write",
+    )
+
+    def eod_summary():
+        if eod_perf is None:
+            return
+        try:
+            # Read last Performance row; if not for today, compute once (append) then send
+            ws = sheet.ss.worksheet("Performance")
+            rows = ws.get_all_values()
+            perf = None
+            if rows and len(rows) >= 2:
+                last = rows[-1]
+                if last and len(last) >= 10:
+                    today = datetime.now().date().isoformat()
+                    if str(last[0]).strip() == today:
+                        # headers: date,symbol,trades,wins,losses,win_rate,avg_pnl,gross_pnl,net_pnl,max_dd,version,notes
+                        def _f(x): 
+                            try: return float(x)
+                            except: return 0.0
+                        perf = {
+                            "trades": _f(last[2]),
+                            "wins": _f(last[3]),
+                            "losses": _f(last[4]),
+                            "win_rate": _f(last[5]),
+                            "avg_pnl": _f(last[6]),
+                            "gross_pnl": _f(last[7]),
+                            "net_pnl": _f(last[8]),
+                            "max_dd": _f(last[9]),
+                        }
+            if perf is None:
+                # no row yet -> write now (single append) then use that
+                perf = eod_perf.write_eod(sheet, cfg, cfg.symbol)
+            eod_perf.send_daily_summary(perf, cfg)
+            print("[eod] daily summary sent", flush=True)
+        except Exception as e:
+            print(f"❌ Job error [eod_summary] {e}", flush=True)
+
+    sched.add_job(
+        eod_summary,
+        "cron",
+        day_of_week="mon-fri",
+        hour=15, minute=35,
+        id="eod_summary",
     )
 
     # Start
