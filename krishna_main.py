@@ -2,15 +2,16 @@
 # Krishna Trade Worker v3 — Main entry
 # - Env-driven config (Day/Night)
 # - OC snapshot via plugin (analytics.oc_refresh) or fallback: Sheet OC_Live
-# - Signal generation via agents/signal_generator (oc_rules)
+# - Signal generation via agents/signal_generator (OC rules)
 # - Per-level-per-day dedup (Signals.signal_id)
 # - Heartbeat + OC tick schedulers (APScheduler)
 # - Telegram long-polling router (/status, /oc_now, etc.)
 # - Params Override loader (Sheet + optional Firestore)
+# - Events HOLD gate (skip signals during active window in Events tab)
 # - Circuit breaker gate before issuing signals
 # - Time-Exit @ 15:15 IST + EOD Performance @ 15:31 + TG summary @ 15:35 (Mon–Fri)
 
-import os, json, time, sys, traceback
+import os, json, time, traceback
 from dataclasses import dataclass
 from typing import Optional, Dict, Any, List
 from datetime import datetime, timedelta
@@ -41,7 +42,7 @@ except Exception:
 # Optional OC plugin (preferred)
 OC_PLUGIN = None
 try:
-    # Expect a callable get_snapshot(cfg) -> dict with spot,s1,s2,r1,r2,ce_oi_pct,pe_oi_pct,expiry, symbol
+    # Expect get_snapshot(cfg) -> dict with spot,s1,s2,r1,r2,ce_oi_pct,pe_oi_pct,expiry,symbol[,volume_low]
     from analytics.oc_refresh import get_snapshot as _oc_get_snapshot
     OC_PLUGIN = _oc_get_snapshot
 except Exception:
@@ -76,6 +77,12 @@ try:
     from agents import circuit
 except Exception:
     circuit = None
+
+# Optional events HOLD gate
+try:
+    from ops import events_gate
+except Exception:
+    events_gate = None
 
 # ------------- Config -------------
 @dataclass
@@ -127,7 +134,6 @@ class SheetsWrapper:
         gc = gspread.service_account_from_dict(info)
         self.ss = gc.open_by_key(cfg.sheet_id)
 
-    # Our logger uses these two if present
     def ensure_tab(self, title: str, headers: List[str]):
         try:
             ws = self.ss.worksheet(title)
@@ -138,18 +144,14 @@ class SheetsWrapper:
             except Exception:
                 pass
             return
-        # ensure headers
         try:
             first = ws.row_values(1)
         except Exception:
             first = []
         if [h.strip() for h in first] != headers:
-            try:
-                ws.clear()
-            except Exception:
-                pass
-            try:
-                ws.append_row(headers)
+            try: ws.clear()
+            except Exception: pass
+            try: ws.append_row(headers)
             except Exception:
                 end_col = chr(64 + len(headers))
                 ws.update(f"A1:{end_col}1", [headers])
@@ -158,7 +160,6 @@ class SheetsWrapper:
         ws = self.ss.worksheet(title)
         ws.append_row(row)
 
-    # helpers
     def read_last_row(self, title: str) -> Optional[List[str]]:
         ws = self.ss.worksheet(title)
         rows = ws.get_all_values()
@@ -182,16 +183,13 @@ def oc_from_sheet_latest(sheet: SheetsWrapper, symbol: str) -> Optional[Dict[str
     """
     Expect OC_Live headers (minimum):
       ts, symbol, spot, s1, s2, r1, r2, expiry, signal
-    Optional extra columns (if present):
+    Optional:
       ce_oi_pct, pe_oi_pct, volume_low
     """
     try:
         last = sheet.read_last_row("OC_Live")
         if not last or len(last) < 8:
             return None
-
-        # Indices per enforced header order:
-        # 0 ts | 1 symbol | 2 spot | 3 s1 | 4 s2 | 5 r1 | 6 r2 | 7 expiry | 8 signal | 9 ce_oi_pct? | 10 pe_oi_pct? | 11 volume_low?
         ts      = last[0] if len(last) > 0 else ""
         sym     = last[1] if len(last) > 1 and last[1] else symbol
         spot    = _to_float(last[2], 0.0)
@@ -201,15 +199,12 @@ def oc_from_sheet_latest(sheet: SheetsWrapper, symbol: str) -> Optional[Dict[str
         r2      = _to_float(last[6], 0.0)
         expiry  = last[7] if len(last) > 7 else ""
         signal  = last[8] if len(last) > 8 else ""
-
         ce_oi_pct = _to_float(last[9])  if len(last) > 9  and last[9]  != "" else None
         pe_oi_pct = _to_float(last[10]) if len(last) > 10 and last[10] != "" else None
-        # Accept "true/false/1/0"
         volume_low = None
         if len(last) > 11 and last[11] != "":
             v = str(last[11]).strip().lower()
-            volume_low = (v in ("1", "true", "yes", "y"))
-
+            volume_low = (v in ("1","true","yes","y"))
         return {
             "ts": ts, "symbol": sym,
             "spot": spot, "s1": s1, "s2": s2, "r1": r1, "r2": r2,
@@ -221,38 +216,30 @@ def oc_from_sheet_latest(sheet: SheetsWrapper, symbol: str) -> Optional[Dict[str
         return None
 
 def get_oc_snapshot(cfg: Config, sheet: SheetsWrapper) -> Optional[Dict[str, Any]]:
-    # Preferred plugin (if provided by your repo)
     if OC_PLUGIN is not None:
         try:
-            oc = OC_PLUGIN(cfg)  # must return dict
-            if oc:
-                return oc
+            oc = OC_PLUGIN(cfg)
+            if oc: return oc
         except Exception as e:
             print(f"[oc] plugin error: {e}", flush=True)
             traceback.print_exc()
-    # Fallback to Sheet (works for Night mode or if plugin absent)
     return oc_from_sheet_latest(sheet, cfg.symbol)
 
 # ------------- Dedup helpers -------------
 def dedup_exists(sheet: SheetsWrapper, dedup_key: str) -> bool:
-    """
-    Look into Signals tab, last ~500 rows for today's signal_id == dedup_key.
-    """
+    """Look into Signals tab, last ~500 rows for today's signal_id == dedup_key."""
     try:
         ws = sheet.ss.worksheet("Signals")
         rows = ws.get_all_values()
         if not rows or len(rows) < 2:
             return False
-        # Find header index for signal_id
         headers = rows[0]
         try:
             idx = headers.index("signal_id")
         except ValueError:
             return False
-        # Scan last limited rows
         for r in reversed(rows[-500:]):
-            if len(r) <= idx:
-                continue
+            if len(r) <= idx: continue
             if dedup_key and r[idx] == dedup_key:
                 return True
         return False
@@ -361,6 +348,25 @@ def main():
             except Exception as e:
                 print(f"[oc] log_oc_live failed: {e}", flush=True)
 
+            # HOLD gate via Events tab
+            if events_gate is not None:
+                try:
+                    hold, why = events_gate.is_hold_now(sheet)
+                except Exception:
+                    hold, why = (False, "")
+                if hold:
+                    print(f"[hold] active event window — skip signals ({why})", flush=True)
+                    try:
+                        logger.log_status(sheet, {
+                            "worker_id": cfg.worker_id,
+                            "shift_mode": cfg.shift_mode,
+                            "state": "HOLD",
+                            "message": f"events_hold {why[:80]}"
+                        })
+                    except Exception:
+                        pass
+                    return
+
             # Circuit breaker gate
             if circuit is not None and circuit.should_pause():
                 try:
@@ -394,12 +400,12 @@ def main():
                 "ts": "",  # auto fill
                 "symbol": sig.get("symbol"),
                 "side": sig.get("side"),
-                "price": "",          # executor fills on open (if price capture added later)
+                "price": "",
                 "reason": sig.get("reason"),
                 "level": sig.get("level"),
-                "sl": "",             # executor computes from sl_pct if needed
-                "tp": "",             # executor computes from target_pct if needed
-                "rr": "",             # optional
+                "sl": "",
+                "tp": "",
+                "rr": "",
                 "signal_id": dkey or "",
             })
             print(f"[signal] {sig.get('side')} {cfg.symbol} @ {sig.get('level_tag')} ({sig.get('reason')})", flush=True)
@@ -464,7 +470,6 @@ def main():
         if eod_perf is None:
             return
         try:
-            # Read last Performance row; if not for today, compute once (append) then send
             ws = sheet.ss.worksheet("Performance")
             rows = ws.get_all_values()
             perf = None
@@ -473,7 +478,6 @@ def main():
                 if last and len(last) >= 10:
                     today = datetime.now().date().isoformat()
                     if str(last[0]).strip() == today:
-                        # headers: date,symbol,trades,wins,losses,win_rate,avg_pnl,gross_pnl,net_pnl,max_dd,version,notes
                         def _f(x):
                             try: return float(x)
                             except: return 0.0
@@ -488,7 +492,6 @@ def main():
                             "max_dd": _f(last[9]),
                         }
             if perf is None:
-                # no row yet -> write now (single append) then use that
                 perf = eod_perf.write_eod(sheet, cfg, cfg.symbol)
             eod_perf.send_daily_summary(perf, cfg)
             print("[eod] daily summary sent", flush=True)
