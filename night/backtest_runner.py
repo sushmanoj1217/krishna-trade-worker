@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 # ensure repo root on sys.path (so 'stores', 'agents', etc. resolve)
 import sys, os
 from pathlib import Path
@@ -12,8 +14,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 # Run example:
 #   python -u night/backtest_runner.py
 
-from __future__ import annotations
-import os, json, uuid, random
+import json, uuid, random
 from datetime import datetime
 from typing import Dict, Any, Optional
 
@@ -106,5 +107,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
-      
