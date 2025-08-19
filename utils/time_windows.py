@@ -1,25 +1,26 @@
-from datetime import datetime, time
+# utils/time_windows.py
+from __future__ import annotations
+from datetime import datetime, time as dtime
 from zoneinfo import ZoneInfo
 
 IST = ZoneInfo("Asia/Kolkata")
 
-NO_TRADE_WINDOWS = [
-    (time(9, 15), time(9, 30)),
-    (time(14, 45), time(15, 15)),
-]
+NO_TRADE_1_START = dtime(9, 15)
+NO_TRADE_1_END   = dtime(9, 30)
+NO_TRADE_2_START = dtime(14, 45)
+NO_TRADE_2_END   = dtime(15, 15)
 
-MARKET_CLOSE = time(15, 15)
+def ist_now() -> datetime:
+    return datetime.now(tz=IST)
 
-def now_ist() -> datetime:
-    return datetime.now(IST)
-
-def in_window(t: time, start: time, end: time) -> bool:
-    return start <= t <= end
+def is_market_open_now() -> bool:
+    t = ist_now().time()
+    return t >= dtime(9, 15) and t < dtime(15, 15)
 
 def is_no_trade_now() -> bool:
-    t = now_ist().time()
-    return any(in_window(t, a, b) for a, b in NO_TRADE_WINDOWS)
-
-def is_market_close_now() -> bool:
-    t = now_ist().time()
-    return t >= MARKET_CLOSE
+    t = ist_now().time()
+    if NO_TRADE_1_START <= t < NO_TRADE_1_END:
+        return True
+    if NO_TRADE_2_START <= t < NO_TRADE_2_END:
+        return True
+    return False
