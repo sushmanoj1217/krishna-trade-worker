@@ -1,9 +1,10 @@
+# analytics/oc_refresh.py
 import os
 from utils.logger import log
 from utils.params import Params
 from utils.cache import OCSnapshot, set_snapshot
 from integrations import sheets as sh
-from integrations.option_chain_dhan import get_option_chain, compute_levels_from_oc
+from integrations.option_chain_dhan import fetch_levels  # NEW
 
 SYMBOL = os.getenv("OC_SYMBOL", "NIFTY").upper()
 MODE = os.getenv("OC_MODE", "sheet").lower()
@@ -11,15 +12,13 @@ MODE = os.getenv("OC_MODE", "sheet").lower()
 BUFFERS = {"NIFTY": 12, "BANKNIFTY": 30, "FINNIFTY": 15}
 
 def _buffer_for_symbol(sym: str, params: Params) -> int:
-    """Prefer explicit param.buffer_points; else default per symbol."""
     return params.buffer_points or BUFFERS.get(sym.upper(), 12)
 
 def refresh_once() -> OCSnapshot | None:
     params = Params()
     try:
         if MODE == "dhan":
-            oc_json = get_option_chain(SYMBOL)
-            data = compute_levels_from_oc(oc_json)
+            data = fetch_levels()  # uses env to talk to Dhan v2
         else:
             row = sh.last_row("OC_Live")
             if not row:
