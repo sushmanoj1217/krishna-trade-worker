@@ -2,6 +2,7 @@ import os
 import re
 import csv
 import io
+import time
 import requests
 from datetime import date
 from tenacity import retry, stop_after_attempt, wait_fixed
@@ -9,10 +10,7 @@ from utils.logger import log
 
 # =============================================================================
 # Dhan v2 Option Chain integration (POST JSON) + Instrument resolver (CSV)
-# - Uses /v2/optionchain and /v2/optionchain/expirylist (JSON, POST)
-# - Resolves SecurityID via /v2/instrument/{exchangeSegment} (CSV, GET)
-# - Env mapping supported: DHAN_UNDERLYING_SCRIP="NIFTY=13,BANKNIFTY=25,FINNIFTY=27"
-# - Quiet logging: only logs SecurityID when it changes
+# Rate-limit safe: expiry/OC caching + 429 cooldown
 # =============================================================================
 
 # --- ENV ---
@@ -23,7 +21,19 @@ DHAN_EXPIRY_ENV = os.getenv("DHAN_EXPIRY", "").strip()                   # optio
 OC_SYMBOL = os.getenv("OC_SYMBOL", "NIFTY").strip().upper()
 MATCH_HINT = os.getenv("DHAN_MATCH_STRING", "").strip()                  # optional, e.g. "NIFTY 50"
 
-_last_sid_logged = None  # module-level cache to avoid noisy logs
+# Caching / rate-limit knobs
+EXPIRY_TTL_SECS = int(os.getenv("EXPIRY_TTL_SECS", "300"))               # cache expiry list for 5 min
+_MIN_INTERVAL = os.getenv("DHAN_MIN_INTERVAL_SECS", os.getenv("OC_REFRESH_SECS", "10"))
+try:
+    MIN_INTERVAL_SECS = max(3, int(_MIN_INTERVAL))                       # at least 3s between OC calls
+except Exception:
+    MIN_INTERVAL_SECS = 10
+COOLDOWN_429_SECS = int(os.getenv("DHAN_429_COOLDOWN_SECS", "30"))       # back off on 429 for 30s
+
+_last_sid_logged = None
+_expiry_cache = {"value": None, "ts": 0.0}
+_oc_cache = {"data": None, "ts": 0.0, "expiry": None}
+_cooldown_until = 0.0  # epoch seconds
 
 
 # ---------- HTTP helpers ----------
@@ -66,10 +76,22 @@ def _pick_nearest_expiry(expiries: list[str]) -> str | None:
     future = sorted([d for d in expiries if d >= today])
     return future[0] if future else sorted(expiries)[0]
 
-@retry(stop=stop_after_attempt(3), wait=wait_fixed(1))
-def get_option_chain_v2(underlying_scrip: int, underlying_seg: str, expiry: str) -> dict:
+def _get_option_chain_once(underlying_scrip: int, underlying_seg: str, expiry: str) -> dict:
+    """Single attempt; we handle 429 cooldown ourselves (no tenacity here)."""
     url = f"{DHAN_BASE}/v2/optionchain"
-    return _post_json(url, {"UnderlyingScrip": underlying_scrip, "UnderlyingSeg": underlying_seg, "Expiry": expiry})
+    r = requests.post(url, headers=_headers(),
+                      json={"UnderlyingScrip": underlying_scrip, "UnderlyingSeg": underlying_seg, "Expiry": expiry},
+                      timeout=12)
+    if r.status_code == 429:
+        # Too many requests — set cooldown and return cached if available
+        global _cooldown_until
+        _cooldown_until = time.time() + COOLDOWN_429_SECS
+        log.warning(f"Dhan 429: {r.text[:200]} @ {url} → cooldown {COOLDOWN_429_SECS}s")
+        r.raise_for_status()
+    if r.status_code >= 400:
+        log.warning(f"Dhan {r.status_code}: {r.text[:300]} @ {url}")
+    r.raise_for_status()
+    return r.json()
 
 
 # ---------- Security ID resolver (CSV via v2 instrument endpoint) ----------
@@ -300,17 +322,52 @@ def compute_levels_from_oc_v2(oc_json: dict, used_expiry: str) -> dict:
     }
 
 
-# ---------- Public API ----------
+# ---------- Public API (rate-limit aware) ----------
 def fetch_levels() -> dict:
     """
     High-level helper used by analytics.oc_refresh.refresh_once()
+    Caches expiry for EXPIRY_TTL_SECS and OC for MIN_INTERVAL_SECS (same expiry).
+    On HTTP 429, respects cooldown and returns cached data if available.
     """
+    global _expiry_cache, _oc_cache, _cooldown_until
+
     u_scrip, u_seg, expiry_override = ensure_inputs()
-    expiry = expiry_override
-    if not expiry:
-        expiries = get_expiry_list(u_scrip, u_seg)
-        expiry = _pick_nearest_expiry(expiries)
-        if not expiry:
-            raise RuntimeError("No expiry available from Dhan")
-    oc = get_option_chain_v2(u_scrip, u_seg, expiry)
+
+    # Expiry cache
+    now = time.time()
+    if expiry_override:
+        expiry = expiry_override
+    else:
+        if (_expiry_cache["value"] is None) or (now - _expiry_cache["ts"] > EXPIRY_TTL_SECS):
+            expiries = get_expiry_list(u_scrip, u_seg)
+            picked = _pick_nearest_expiry(expiries)
+            if not picked:
+                raise RuntimeError("No expiry available from Dhan")
+            _expiry_cache = {"value": picked, "ts": now}
+            log.info(f"Picked expiry {picked} (cache {EXPIRY_TTL_SECS}s)")
+        expiry = _expiry_cache["value"]
+
+    # Respect cooldown after 429
+    if now < _cooldown_until:
+        if _oc_cache["data"] is not None and _oc_cache["expiry"] == expiry:
+            log.warning(f"In cooldown ({int(_cooldown_until - now)}s left) → serving OC from cache")
+            return compute_levels_from_oc_v2(_oc_cache["data"], expiry)
+        raise RuntimeError("In 429 cooldown and no OC cache available")
+
+    # If same-expiry and called within min interval → serve cache
+    if _oc_cache["data"] is not None and _oc_cache["expiry"] == expiry:
+        if (now - _oc_cache["ts"]) < MIN_INTERVAL_SECS:
+            return compute_levels_from_oc_v2(_oc_cache["data"], expiry)
+
+    # Fresh call
+    try:
+        oc = _get_option_chain_once(u_scrip, u_seg, expiry)
+    except requests.HTTPError as e:
+        # If 429 handled above, try cache
+        if _oc_cache["data"] is not None and _oc_cache["expiry"] == expiry:
+            log.warning("HTTP error on OC fetch → serving cache")
+            return compute_levels_from_oc_v2(_oc_cache["data"], expiry)
+        raise
+
+    _oc_cache = {"data": oc, "ts": now, "expiry": expiry}
     return compute_levels_from_oc_v2(oc, expiry)
