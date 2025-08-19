@@ -35,7 +35,7 @@ async def run_signal_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not s:
         await update.message.reply_text("No eligible signal")
         return
-    await update.message.reply_text(f"Signal {s.id} {s.side} {s.trigger} eligible={s.eligible}\n{ s.reason }")
+    await update.message.reply_text(f"Signal {s.id} {s.side} {s.trigger} eligible={s.eligible}\n{s.reason}")
 
 async def place(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await _owner_only(update):
@@ -60,7 +60,12 @@ async def init():
     if not token:
         log.warning("TELEGRAM_BOT_TOKEN missing; bot disabled")
         return None
-    app = Application.builder().token(token).build()
+    try:
+        app = Application.builder().token(token).build()
+    except Exception as e:
+        # Fail-safe: don't crash the worker if PTB/runtime mismatch
+        log.error(f"Telegram Application init failed: {e}")
+        return None
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("health", health))
     app.add_handler(CommandHandler("oc_now", oc_now))
