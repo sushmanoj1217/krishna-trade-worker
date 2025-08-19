@@ -1,15 +1,16 @@
-# DR RUNBOOK
+# Disaster Recovery Runbook — KRISHNA
 
-## 1) Freeze
-- Pause Render Background Worker & Cron jobs.
-- Export env from Render dashboard.
+## Triggers
+- Broken deploy / bad params / repo wipe / corrupted cache.
+- Symptoms: worker crash-looping, no trades, OC stale, Telegram offline.
 
-## 2) Rescue
-- `git clone` backup remote to fresh worker.
-- Set `.env` / Render env.
-- `pip install -r requirements.txt`
+## Freeze
+1. On Render **turn OFF Auto-Deploy** (Service → Settings).
+2. Stop traffic to broken version: **Manual Deploy** previous good commit if needed.
+3. Snapshot current ENV: Render → Environment → **Download .env** (or copy).
 
-## 3) Restore
-- Run `python krishna_main.py` locally for smoke.
-- Redeploy worker on Render.
-- Verify Sheets writes: OC_Live, Signals, Trades.
+## Rescue (Render Shell)
+1. Open a **Shell** on current instance.
+2. Export environment:
+   ```bash
+   printenv | sort > /opt/render/project/.env.backup
