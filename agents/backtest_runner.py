@@ -1,37 +1,77 @@
+# agents/backtest_runner.py
 """
-2-month batch backtest (placeholder):
-- Reads historical OC_Live (last ~2 months rows)
-- Simulates trigger crosses & MV/OC gates using recorded fields
-- Writes summary row to Performance tab (version from ENV).
+Backtest v2 (lightweight):
+- Use OC_Live history (last ~60 days)
+- When PCR>=bull_hi or MP Δ beyond threshold => assume directional long/short opportunity
+- Apply simple RR & 1:2 trail model to simulate P&L
+- Write summary to Performance tab
 """
 import os, statistics
 from utils.logger import log
+from utils.params import Params
 from integrations import sheets as sh
 
 def run():
+    p = Params()
     rows = sh.get_oc_live_history(days=60)
     if not rows:
         log.info("Backtest: no OC_Live history")
         return
-    # naive sim: count NEAR/CROSS vs PCR/MP bands to estimate opportunities
+
     wins = 0; losses = 0; pnls = []
+    bull_hi = p.pcr_bull_high()
+    bear_lo = p.pcr_bear_low()
+    mpd_need = p.mp_support_dist()
+    tgt = p.min_target_points()
+
+    last_spot = None
     for r in rows:
-        pcr = float(r.get("pcr") or 0)
-        mpd = float(r.get("max_pain_dist") or 0)
-        # toy rule
-        if pcr >= 1.1 or mpd >= 25:
-            wins += 1; pnls.append(15)
-        elif pcr <= 0.9 or mpd <= -25:
-            wins += 1; pnls.append(15)
-        else:
-            losses += 1; pnls.append(-10)
-    wr = wins / max(1, (wins+losses))
-    avg = statistics.mean(pnls) if pnls else 0.0
-    dd = min(0, min([sum(pnls[:i]) for i in range(1, len(pnls)+1)])) if pnls else 0.0
-    sh.update_performance({
-        "win_rate": round(wr*100, 2),
-        "avg_pl": round(avg, 2),
-        "drawdown": round(dd, 2),
-        "version": os.getenv("APP_VERSION", "dev"),
-    })
-    log.info(f"Backtest: WR={wr*100:.1f}% avg={avg} dd={dd}")
+        try:
+            spot = float(r.get("spot") or 0.0)
+            pcr = float(r.get("pcr") or 0.0)
+            mpd = float(r.get("max_pain_dist") or 0.0)
+        except Exception:
+            continue
+        if not spot: 
+            continue
+
+        go_long = (pcr >= bull_hi) or (mpd >= mpd_need)
+        go_short = (pcr <= bear_lo) or (mpd <= -mpd_need)
+
+        if go_long and not go_short:
+            # CE sim: entry at spot, SL at (spot - buffer), TP at spot + tgt
+            sl = spot - max(5, tgt/2)
+            tp = spot + tgt
+            # naive outcome: if next spot (or drift) crosses tp first
+            if last_spot is not None and last_spot <= tp:
+                wins += 1; pnls.append(tgt)
+            else:
+                losses += 1; pnls.append(-(tgt/2))
+        elif go_short and not go_long:
+            sl = spot + max(5, tgt/2)
+            tp = spot - tgt
+            if last_spot is not None and last_spot >= tp:
+                wins += 1; pnls.append(tgt)
+            else:
+                losses += 1; pnls.append(-(tgt/2))
+
+        last_spot = spot
+
+    if pnls:
+        wr = wins / max(1, wins + losses) * 100.0
+        avg = statistics.mean(pnls)
+        # max drawdown (running sum based)
+        run_sum = 0.0; peak = 0.0; max_dd = 0.0
+        for x in pnls:
+            run_sum += x
+            peak = max(peak, run_sum)
+            max_dd = min(max_dd, run_sum - peak)
+        sh.update_performance({
+            "win_rate": round(wr, 2),
+            "avg_pl": round(avg, 2),
+            "drawdown": round(max_dd, 2),
+            "version": os.getenv("APP_VERSION", "dev"),
+        })
+        log.info(f"Backtest v2: WR={wr:.1f}% avg={avg:.2f} dd={max_dd:.2f} (n={len(pnls)})")
+    else:
+        log.info("Backtest v2: no signals formed")
