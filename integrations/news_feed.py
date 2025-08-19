@@ -1,21 +1,24 @@
-"""
-Events/HOLD gate source.
-- HOLD can be driven by ENV NEWS_HOLD=on/off, or latest 'Events' sheet row with status='HOLD'
-"""
+# integrations/news_feed.py
+from __future__ import annotations
 import os
 from integrations import sheets as sh
 
-def hold_active() -> bool:
-    env = os.getenv("NEWS_HOLD", "").strip().lower()
+def hold_active() -> tuple[bool, str]:
+    """
+    Returns (is_hold, reason)
+    Priority:
+      1) ENV NEWS_HOLD=on/off
+      2) Last Events row containing 'HOLD'
+    """
+    env = (os.getenv("NEWS_HOLD", "") or "").strip().lower()
     if env in ("1","true","yes","on","hold"):
-        return True
+        return True, "ENV:NEWS_HOLD"
     if env in ("0","false","no","off",""):
         pass
-    # check last Events row
-    rows = sh._DB.get("Events") or []
-    if rows:
-        last = rows[-1]
-        status = (last[1] if len(last)>1 else "") or (last[2] if len(last)>2 else "")
-        if str(status).strip().upper() == "HOLD":
-            return True
-    return False
+    rows = sh.get_last_event_rows(n=5)
+    for r in reversed(rows):
+        # [ts, event, status]
+        status = (str(r[2]) if len(r) > 2 else "").upper()
+        if "HOLD" in status:
+            return True, "EVENT:HOLD"
+    return False, ""
