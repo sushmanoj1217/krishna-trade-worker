@@ -18,20 +18,17 @@ OC_REFRESH_SECS = int(os.getenv("OC_REFRESH_SECS", "10"))
 MARKET_CUTOFF = dtime(15, 15)
 
 async def _refresh_once_bg():
-    # blocking I/O (requests/gspread) → offload to thread
     return await asyncio.to_thread(refresh_once)
 
 async def _signal_once_bg():
-    # sheets I/O and CPU → offload to thread
     return await asyncio.to_thread(signal_generator.run_once)
 
 async def _force_flat_bg(reason: str):
-    # wraps async into thread-safe call if needed
     await force_flat_all(reason)
 
 async def day_loop():
     log.info("Day loop started")
-    iter_no = 0
+    beats = 0
     while True:
         nowt = datetime.now(tz=IST).time()
         if nowt >= MARKET_CUTOFF:
@@ -42,20 +39,16 @@ async def day_loop():
             await asyncio.sleep(30)
             continue
 
-        # 1) Refresh OC in background thread (non-blocking for event-loop)
         try:
             await _refresh_once_bg()
         except Exception as e:
             log.error(f"refresh_once err: {e}")
 
-        # 2) Strategy pipes
         if is_oc_auto():
             try:
                 await _signal_once_bg()
             except Exception as e:
                 log.error(f"signal gen err: {e}")
-
-            # trade & watcher are async; keep them on loop (light work)
             try:
                 await trade_tick()
             except Exception as e:
@@ -65,9 +58,8 @@ async def day_loop():
             except Exception as e:
                 log.error(f"tp/sl watcher err: {e}")
 
-        # heartbeat every ~minute
-        iter_no += 1
-        if iter_no % max(1, 60 // max(1, OC_REFRESH_SECS)) == 0:
+        beats += 1
+        if beats % max(1, 30 // max(1, OC_REFRESH_SECS)) == 0:
             log.info("heartbeat: day_loop alive")
 
         await asyncio.sleep(OC_REFRESH_SECS)
@@ -81,9 +73,13 @@ async def main():
 
     app = await init_bot()
     if app:
-        # start Telegram polling (non-blocking)
+        # 1) init app
         await app.initialize()
+        # 2) start bot
         await app.start()
+        # 3) VERY IMPORTANT: start polling updates (else no replies)
+        if app.updater is not None:
+            await app.updater.start_polling()
         log.info("Telegram bot started")
 
     loop_task = asyncio.create_task(day_loop())
@@ -99,6 +95,9 @@ async def main():
     await stop_event.wait()
     loop_task.cancel()
     if app:
+        # stop polling first
+        if app.updater is not None:
+            await app.updater.stop()
         await app.stop()
         await app.shutdown()
 
