@@ -1,13 +1,13 @@
 # integrations/sheets.py
 from __future__ import annotations
-import os, json, time
+import os, json
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
+from typing import List, Dict, Any, Optional
 from utils.logger import log
 
-# Optional Google Sheets
+# Optional Google Sheets (real I/O) with in-memory fallback
 _USE_MEMORY = False
-_UGS_READY = False
 _GS = None
 _WB = None
 
@@ -15,10 +15,11 @@ IST = ZoneInfo("Asia/Kolkata")
 TABS = ["OC_Live","Signals","Trades","Performance","Events","Status","Snapshots","Params_Override"]
 
 # In-memory store
-_DB = {t: [] for t in TABS}
+_DB: Dict[str, List[List[Any]]] = {t: [] for t in TABS}
 
 def _connect_real():
-    global _USE_MEMORY, _UGS_READY, _GS, _WB
+    """Try connect to Google Sheets; if missing/broken → memory mode."""
+    global _USE_MEMORY, _GS, _WB
     sa = os.getenv("GOOGLE_SA_JSON", "").strip()
     sid = os.getenv("GSHEET_TRADES_SPREADSHEET_ID", "").strip()
     if not sa or not sid:
@@ -32,7 +33,6 @@ def _connect_real():
         creds = Credentials.from_service_account_info(info, scopes=scopes)
         _GS = gspread.authorize(creds)
         _WB = _GS.open_by_key(sid)
-        _UGS_READY = True
         _USE_MEMORY = False
     except Exception as e:
         log.warning(f"Google Sheets connect failed → memory mode: {e}")
@@ -44,7 +44,7 @@ def _get_ws(name: str):
         return _WB.worksheet(name)
     except Exception:
         try:
-            return _WB.add_worksheet(title=name, rows=1_000, cols=30)
+            return _WB.add_worksheet(title=name, rows=2000, cols=40)
         except Exception as e:
             log.warning(f"create worksheet {name} failed: {e}")
             return None
@@ -61,77 +61,93 @@ def ensure_tabs():
 def now_str():
     return datetime.now(tz=IST).strftime("%Y-%m-%d %H:%M:%S")
 
-# ----------------- Basic IO -----------------
+# ----------------- Generic IO -----------------
 def append_row(tab: str, row: list):
     if tab not in TABS: 
         return
     if _USE_MEMORY:
-        _DB[tab].append(row); return
+        _DB[tab].append(row); 
+        return
     ws = _get_ws(tab)
-    if not ws: 
-        _DB[tab].append(row); return
+    if not ws:
+        _DB[tab].append(row); 
+        return
     try:
         ws.append_row(row, value_input_option="USER_ENTERED")
     except Exception as e:
         log.warning(f"append_row({tab}) failed → memory mirror: {e}")
         _DB[tab].append(row)
 
-def last_row(tab: str) -> dict | None:
-    rows = []
+def get_all_values(tab: str) -> List[List[str]]:
     if _USE_MEMORY:
-        rows = _DB.get(tab) or []
-    else:
-        ws = _get_ws(tab)
-        if ws:
-            try:
-                vals = ws.get_all_values()
-                rows = vals if vals else []
-            except Exception as e:
-                log.warning(f"last_row({tab}) fetch failed: {e}")
-                rows = _DB.get(tab) or []
-        else:
-            rows = _DB.get(tab) or []
+        return _DB.get(tab, [])
+    ws = _get_ws(tab)
+    if not ws:
+        return _DB.get(tab, [])
+    try:
+        return ws.get_all_values()
+    except Exception as e:
+        log.warning(f"get_all_values({tab}) failed: {e}")
+        return _DB.get(tab, [])
+
+def last_row(tab: str) -> Optional[Dict[str, Any]]:
+    rows = get_all_values(tab)
     if not rows:
         return None
     if tab == "OC_Live":
         r = rows[-1]
         keys = ["timestamp","spot","s1","s2","r1","r2","expiry","signal","vix","pcr","pcr_bucket","max_pain","max_pain_dist","bias_tag","stale"]
         return {k: (r[i] if i < len(r) else None) for i,k in enumerate(keys)}
+    if tab == "Signals":
+        r = rows[-1]
+        # signal_id, ts, side, trigger, c1..c6, eligible, reason, mv_ok, mv_basis, oc_ok, oc_basis, nearfar, notes
+        keys = ["signal_id","ts","side","trigger","c1","c2","c3","c4","c5","c6","eligible","reason","mv_ok","mv_basis","oc_ok","oc_basis","nearfar","notes"]
+        return {k: (r[i] if i < len(r) else None) for i,k in enumerate(keys)}
     return None
 
-def get_oc_live_history(days=60) -> list[dict]:
-    rows = []
-    if _USE_MEMORY:
-        rows = _DB.get("OC_Live") or []
-    else:
-        try:
-            rows = _get_ws("OC_Live").get_all_values()
-        except Exception:
-            rows = _DB.get("OC_Live") or []
+# ----------------- OC_Live helpers -----------------
+def get_oc_live_history(days=60) -> List[Dict[str, Any]]:
+    rows = get_all_values("OC_Live")
     out = []
     for r in rows[-days*50:] if rows else []:
         keys = ["timestamp","spot","s1","s2","r1","r2","expiry","signal","vix","pcr","pcr_bucket","max_pain","max_pain_dist","bias_tag","stale"]
         out.append({k: (r[i] if i < len(r) else None) for i,k in enumerate(keys)})
     return out
 
-# ----------------- Signals (for logging only) -----------------
+def _parse_ts(ts: str) -> Optional[datetime]:
+    if not ts: return None
+    for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M:%S %Z"):
+        try:
+            dt = datetime.strptime(ts, fmt)
+            return dt.replace(tzinfo=IST)
+        except Exception:
+            continue
+    return None
+
+def get_oc_live_last_minutes(minutes: int = 5) -> List[Dict[str, Any]]:
+    """Return OC_Live rows within last `minutes` minutes (approx by timestamps)."""
+    rows = get_all_values("OC_Live")
+    if not rows:
+        return []
+    cutoff = datetime.now(tz=IST) - timedelta(minutes=minutes)
+    out = []
+    for r in reversed(rows):
+        ts = _parse_ts(r[0] if len(r) > 0 else "")
+        if not ts: break
+        if ts >= cutoff:
+            keys = ["timestamp","spot","s1","s2","r1","r2","expiry","signal","vix","pcr","pcr_bucket","max_pain","max_pain_dist","bias_tag","stale"]
+            out.append({k: (r[i] if i < len(r) else None) for i,k in enumerate(keys)})
+        else:
+            break
+    return list(reversed(out))
+
+# ----------------- Signals -----------------
 def log_signal_row(row: list):
     append_row("Signals", row)
 
-def get_last_event_rows(n=5):
-    rows = _DB.get("Events") or []
-    return rows[-n:]
-
-# ----------------- Trades -----------------
-def get_open_trades() -> list[dict]:
-    rows = []
-    if _USE_MEMORY:
-        rows = _DB.get("Trades") or []
-    else:
-        try:
-            rows = _get_ws("Trades").get_all_values()
-        except Exception:
-            rows = _DB.get("Trades") or []
+# ----------------- Trades & performance -----------------
+def get_open_trades() -> List[Dict[str, Any]]:
+    rows = get_all_values("Trades")
     out = []
     for r in rows:
         if len(r) < 11: 
@@ -148,28 +164,77 @@ def get_open_trades() -> list[dict]:
             })
     return out
 
+def get_open_trades_count() -> int:
+    return len(get_open_trades())
+
+def _find_trade_row_index(tid: str) -> Optional[int]:
+    if _USE_MEMORY:
+        rows = _DB.get("Trades") or []
+        for i, r in enumerate(rows, start=1):
+            if r and r[0] == tid:
+                return i
+        return None
+    try:
+        ws = _get_ws("Trades")
+        cells = ws.findall(tid)
+        for c in cells:
+            if c.col == 1:  # trade_id in col A
+                return c.row
+    except Exception:
+        pass
+    return None
+
 def close_trade(tid: str, exit_ltp: float, result: str, pnl: float, note: str = ""):
+    """Update the trade row in-place if possible; else append a Status row."""
     if _USE_MEMORY:
         rows = _DB.get("Trades") or []
         for i,r in enumerate(rows):
-            if r[0] == tid and r[10] in ("", None):
-                rows[i][5] = exit_ltp
-                rows[i][10] = now_str()
-                rows[i][11] = result
-                rows[i][12] = pnl
-                rows[i][13] = ""  # dedupe_hash
+            if r[0] == tid and (len(r) < 11 or r[10] in ("", None)):
+                # [.., exit_ltp(5), exit_time(10), result(11), pnl(12), dedupe(13)]
+                r[5] = exit_ltp
+                while len(r) < 14: r.append("")
+                r[10] = now_str()
+                r[11] = result
+                r[12] = pnl
+                r[13] = ""
+                rows[i] = r
                 _DB["Trades"] = rows
                 append_row("Status", [now_str(), "trade_closed", tid, result, pnl, note])
-                break
+                return
+        append_row("Status", [now_str(), "trade_closed_missing", tid, result, pnl, note])
         return
-    # Real sheet naive update: append a status row (simpler than row mutation)
-    append_row("Status", [now_str(), "trade_closed", tid, result, pnl, note])
+    # Real sheet path
+    try:
+        ws = _get_ws("Trades")
+        idx = _find_trade_row_index(tid)
+        if idx:
+            ws.update(f"F{idx}:N{idx}", [[exit_ltp, "", "", now_str(), result, pnl, "", note]])
+        else:
+            append_row("Status", [now_str(), "trade_closed_missing", tid, result, pnl, note])
+    except Exception as e:
+        log.warning(f"close_trade update failed: {e}")
+        append_row("Status", [now_str(), "trade_closed_fallback", tid, result, pnl, note])
 
 def update_trade_sl(tid: str, new_sl: float):
-    append_row("Status", [now_str(), "trail_sl", tid, new_sl])
+    if _USE_MEMORY:
+        rows = _DB.get("Trades") or []
+        for i,r in enumerate(rows):
+            if r[0] == tid and (len(r) < 11 or r[10] in ("", None)):
+                r[6] = new_sl; rows[i] = r; _DB["Trades"] = rows; break
+        append_row("Status", [now_str(), "trail_sl", tid, new_sl])
+        return
+    try:
+        ws = _get_ws("Trades")
+        idx = _find_trade_row_index(tid)
+        if idx:
+            ws.update_acell(f"G{idx}", new_sl)
+        append_row("Status", [now_str(), "trail_sl", tid, new_sl])
+    except Exception as e:
+        log.warning(f"update_trade_sl failed: {e}")
+        append_row("Status", [now_str(), "trail_sl_fail", tid, new_sl])
 
 def count_today_trades() -> int:
-    rows = _DB.get("Trades") or []
+    rows = get_all_values("Trades")
     today = datetime.now(tz=IST).date().isoformat()
     cnt = 0
     for r in rows:
@@ -177,24 +242,27 @@ def count_today_trades() -> int:
             cnt += 1
     return cnt
 
-def get_recent_trades(n=50) -> list[dict]:
-    rows = _DB.get("Trades") or []
+def get_recent_trades(n=50) -> List[Dict[str, Any]]:
+    rows = get_all_values("Trades")
     out = []
     for r in rows[-n:]:
-        out.append({"trade_id": r[0], "result": r[11] if len(r)>11 else "", "pnl": float(r[12]) if len(r)>12 and r[12] else 0.0})
+        out.append({
+            "trade_id": r[0] if len(r)>0 else "",
+            "result": r[11] if len(r)>11 else "",
+            "pnl": float(r[12]) if len(r)>12 and r[12] else 0.0
+        })
     return out
 
-# ----------------- Overrides & Performance -----------------
-def get_overrides_map() -> dict[str, str]:
-    rows = []
-    if _USE_MEMORY:
-        rows = _DB.get("Params_Override") or []
-    else:
-        try:
-            rows = _get_ws("Params_Override").get_all_values()
-        except Exception:
-            rows = _DB.get("Params_Override") or []
-    m = {}
+def update_performance(metrics: Dict[str, Any]):
+    append_row("Performance", [
+        now_str(), metrics.get("win_rate"), metrics.get("avg_pl"),
+        metrics.get("drawdown"), metrics.get("version")
+    ])
+
+# ----------------- Overrides -----------------
+def get_overrides_map() -> Dict[str, str]:
+    rows = get_all_values("Params_Override")
+    m: Dict[str,str] = {}
     for r in rows:
         if not r: continue
         k = (r[0] or "").strip()
@@ -202,24 +270,16 @@ def get_overrides_map() -> dict[str, str]:
         if k: m[k] = v
     return m
 
-def get_override_int(key: str, default: int) -> int:
-    try:
-        v = get_overrides_map().get(key)
-        return int(float(v)) if v is not None and str(v).strip() != "" else default
-    except Exception:
-        return default
-
 def upsert_override(key: str, value: str):
+    """Naive upsert: in memory replace; in real mode append a new row."""
     if _USE_MEMORY:
         m = get_overrides_map()
         m[key] = value
-        # naive replace
         _DB["Params_Override"] = [[k, v, now_str()] for k, v in m.items()]
         return
     append_row("Params_Override", [key, value, now_str()])
 
-def update_performance(metrics: dict):
-    append_row("Performance", [
-        now_str(), metrics.get("win_rate"), metrics.get("avg_pl"),
-        metrics.get("drawdown"), metrics.get("version")
-    ])
+# ----------------- Events -----------------
+def get_last_event_rows(n=5):
+    rows = get_all_values("Events")
+    return rows[-n:] if rows else []
