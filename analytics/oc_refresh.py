@@ -4,21 +4,56 @@ from utils.logger import log
 from utils.params import Params
 from utils.cache import OCSnapshot, set_snapshot
 from integrations import sheets as sh
-from integrations.option_chain_dhan import fetch_levels  # NEW
+from integrations.option_chain_dhan import fetch_levels
 
 SYMBOL = os.getenv("OC_SYMBOL", "NIFTY").upper()
 MODE = os.getenv("OC_MODE", "sheet").lower()
 
-BUFFERS = {"NIFTY": 12, "BANKNIFTY": 30, "FINNIFTY": 15}
+def _buffer_for_symbol(params: Params) -> int:
+    return params.buffer_points()
 
-def _buffer_for_symbol(sym: str, params: Params) -> int:
-    return params.buffer_points or BUFFERS.get(sym.upper(), 12)
+def _mv_flags_and_basis(spot, pcr, max_pain, mp_dist_needed, p: Params) -> dict:
+    """
+    Compute MV 1-of-2 booleans for CE and PE sides + basis strings.
+    CE ok if (PCR >= bull_high) OR (spot >= max_pain + dist)
+    PE ok if (PCR <= bear_low)  OR (spot <= max_pain - dist)
+    """
+    bull_h = p.pcr_bull_high()
+    bear_l = p.pcr_bear_low()
+    ce_ok = False
+    pe_ok = False
+    ce_basis = []
+    pe_basis = []
+
+    if pcr is not None:
+        if pcr >= bull_h:
+            ce_ok = True
+            ce_basis.append(f"PCR {pcr} ≥ {bull_h}")
+        if pcr <= bear_l:
+            pe_ok = True
+            pe_basis.append(f"PCR {pcr} ≤ {bear_l}")
+
+    if spot is not None and max_pain is not None:
+        delta = round(spot - max_pain, 2)
+        if spot >= max_pain + mp_dist_needed:
+            ce_ok = True
+            ce_basis.append(f"MP Δ +{delta} ≥ {mp_dist_needed}")
+        if spot <= max_pain - mp_dist_needed:
+            pe_ok = True
+            pe_basis.append(f"MP Δ {delta} ≤ -{mp_dist_needed}")
+
+    return {
+        "ce_ok": ce_ok,
+        "pe_ok": pe_ok,
+        "ce_basis": " | ".join(ce_basis) if ce_basis else "—",
+        "pe_basis": " | ".join(pe_basis) if pe_basis else "—",
+    }
 
 def refresh_once() -> OCSnapshot | None:
-    params = Params()
+    p = Params()
     try:
         if MODE == "dhan":
-            data = fetch_levels()  # uses env to talk to Dhan v2
+            data = fetch_levels()
         else:
             row = sh.last_row("OC_Live")
             if not row:
@@ -35,24 +70,30 @@ def refresh_once() -> OCSnapshot | None:
                 "expiry": row.get("expiry", ""),
             }
 
-        b = _buffer_for_symbol(SYMBOL, params)
+        b = _buffer_for_symbol(p)
         s1s = (data["s1"] - b) if data.get("s1") else None
         s2s = (data["s2"] - b) if data.get("s2") else None
         r1s = (data["r1"] + b) if data.get("r1") else None
         r2s = (data["r2"] + b) if data.get("r2") else None
 
         mp = data.get("max_pain")
-        mpd = (data["spot"] - mp) if (mp and data.get("spot")) else None
+        spot = data.get("spot")
+        mpd = (spot - mp) if (mp is not None and spot is not None) else None
 
+        # MV flags (for 1-of-2 gate)
+        mp_dist_needed = p.mp_support_dist()
+        mv = _mv_flags_and_basis(spot, data.get("pcr"), mp, mp_dist_needed, p)
+
+        # bias tags (light)
         bias = None
-        if mp and mpd is not None:
-            if data["spot"] >= mp + params.mp_support_dist():
+        if mp is not None and mpd is not None:
+            if spot >= mp + mp_dist_needed:
                 bias = "mv_bull_mp"
-            elif data["spot"] <= mp - params.mp_support_dist():
+            elif spot <= mp - mp_dist_needed:
                 bias = "mv_bear_mp"
 
         snap = OCSnapshot(
-            spot=data["spot"],
+            spot=spot,
             s1=data.get("s1"),
             s2=data.get("s2"),
             r1=data.get("r1"),
@@ -64,7 +105,16 @@ def refresh_once() -> OCSnapshot | None:
             max_pain_dist=mpd,
             bias_tag=bias,
             stale=False,
-            extras={"s1s": s1s, "s2s": s2s, "r1s": r1s, "r2s": r2s, "buffer": b},
+            extras={
+                "s1s": s1s, "s2s": s2s, "r1s": r1s, "r2s": r2s,
+                "buffer": b,
+                "mv": {
+                    "ce_ok": mv["ce_ok"], "pe_ok": mv["pe_ok"],
+                    "ce_basis": mv["ce_basis"], "pe_basis": mv["pe_basis"],
+                    "pcr_hi": p.pcr_bull_high(), "pcr_lo": p.pcr_bear_low(),
+                    "mp_dist_need": mp_dist_needed,
+                },
+            },
         )
         set_snapshot(snap)
         return snap
