@@ -1,5 +1,4 @@
 # telegram_bot.py
-# Python-Telegram-Bot v20+
 from __future__ import annotations
 import os, asyncio
 from datetime import datetime
@@ -14,12 +13,13 @@ from utils.cache import get_snapshot
 from utils.params import Params
 from utils.rr import rr_feasible
 from utils.time_windows import is_no_trade_now, IST
-from utils.state import is_oc_auto, set_oc_auto
+from utils.state import is_oc_auto, set_oc_auto, get_last_signal, is_last_signal_placed
 from integrations.news_feed import hold_active
 from integrations import sheets as sh
 from agents.tp_sl_watcher import trail_tick
 from agents.trade_loop import force_flat_all
-from ops import handlers as ops
+
+APP_VERSION = os.getenv("APP_VERSION", "dev")
 
 # ------------------------------ helpers ------------------------------
 def _owner_id() -> Optional[int]:
@@ -70,31 +70,6 @@ def _ocp_block(extras: dict) -> str:
         f"• PE_OK={_check(bool(ocp.get('pe_ok')))} ({ocp.get('pe_type','-')}) [{ocp.get('basis_pe','—')}]"
     )
 
-def _six_checks_preview(side: str, tag: str, entry: float, buf: int, bias_tag: Optional[str], p: Params):
-    # mirrors generator simplification
-    c1 = True; r1 = "TriggerCross"
-    bull = (bias_tag or "").startswith("mv_bull")
-    bear = (bias_tag or "").startswith("mv_bear")
-    if side == "CE":
-        c2 = bull; r2 = f"FlowBias {'bull' if bull else 'flat/bear'}"
-        sl = entry - buf
-    else:
-        c2 = bear; r2 = f"FlowBias {'bear' if bear else 'flat/bull'}"
-        sl = entry + buf
-    c3, r3 = True, "WallSupport placeholder"
-    c4, r4 = True, "Momentum placeholder"
-    rr_ok, risk, tp = rr_feasible(entry, sl, p.min_target_points())
-    c5, r5 = rr_ok, f"RR risk={_num(risk,0)} tp={_num(tp,0)}"
-    hold_on, h_reason = hold_active()
-    caps_ok = (sh.count_today_trades() < int(os.getenv('MAX_TRADES_PER_DAY','10')))
-    c6 = (not is_no_trade_now()) and (not hold_on) and caps_ok
-    sysr = []
-    if is_no_trade_now(): sysr.append("NoTradeWindow")
-    if hold_on: sysr.append(h_reason)
-    if not caps_ok: sysr.append("DayCap")
-    r6 = "SystemGates " + (",".join(sysr) if sysr else "OK")
-    return (c1,c2,c3,c4,c5,c6), (r1,r2,r3,r4,r5,r6), sl, tp
-
 def _build_oc_now_message() -> str:
     snap = get_snapshot()
     if not snap:
@@ -112,46 +87,19 @@ def _build_oc_now_message() -> str:
     r2st, r2d = _near_or_cross("R2*", snap.spot, r2s, b)
 
     hold_on, hold_reason = hold_active()
-
-    # choose candidate
-    cand = None
-    for tag, st, lvl in (("S1*", s1st, s1s), ("S2*", s2st, s2s), ("R1*", r1st, r1s), ("R2*", r2st, r2s)):
-        if st == "CROSS" and lvl:
-            cand = (tag, lvl); break
-    if cand is None:
-        for tag, st, lvl in (("S1*", s1st, s1s), ("S2*", s2st, s2s), ("R1*", r1st, r1s), ("R2*", r2st, r2s)):
-            if st == "NEAR" and lvl:
-                cand = (tag, lvl); break
-
-    dec = []
-    table = ""
-    if cand:
-        tag, lvl = cand
-        side = "CE" if tag in ("S1*","S2*") else "PE"
-        (c1,c2,c3,c4,c5,c6), (r1,r2,r3,r4,r5,r6), sl, tp = _six_checks_preview(side, tag, float(lvl), b, snap.bias_tag, p)
-        table = (
-            "<b>6-Checks</b>\n"
-            f"• C1 {_check(c1)} {r1}\n"
-            f"• C2 {_check(c2)} {r2}\n"
-            f"• C3 {_check(c3)} {r3}\n"
-            f"• C4 {_check(c4)} {r4}\n"
-            f"• C5 {_check(c5)} {r5}\n"
-            f"• C6 {_check(c6)} {r6}"
-        )
-        dec.append(f"<b>Decision</b>: {'Eligible' if all([c1,c2,c3,c4,c5,c6]) else 'Not Eligible'} – {side} @ {tag}")
-        dec.append(f"Entry={_num(lvl,0)} SL={_num(sl,0)} TP={_num(tp,0)}")
-    else:
-        dec.append("<b>Decision</b>: No trigger NEAR/CROSS")
-
-    mv_block = _mv_block(snap.extras or {}, snap.pcr, snap.max_pain, snap.max_pain_dist)
-    ocp_block = _ocp_block(snap.extras or {})
+    last_sig = get_last_signal()
+    sig_line = "—"
+    if last_sig:
+        sig_line = f"{last_sig['id']} ({'placed' if is_last_signal_placed() else 'pending'}) {last_sig['side']}@{last_sig['trigger']}"
+    opens = sh.get_open_trades_count()
 
     header = (
         f"<b>/oc_now</b>  <i>{_now_str()}</i>\n"
         f"Spot <b>{_num(snap.spot,2)}</b> | VIX {_num(snap.vix)} | PCR {_num(snap.pcr)} | "
         f"MaxPain <b>{_num(snap.max_pain,0)}</b> (Δ {_num(snap.max_pain_dist)}) "
         f"| HOLD={ 'ON' if hold_on else 'OFF'}{('('+hold_reason+')' if hold_on else '')}"
-        f"{(' → ' + snap.bias_tag) if snap.bias_tag else ''}"
+        f"{(' → ' + snap.bias_tag) if snap.bias_tag else ''}\n"
+        f"<i>Signal:</i> {sig_line} | <i>Open trades:</i> {opens}"
     )
     levels = (
         "<b>Levels</b>\n"
@@ -164,10 +112,10 @@ def _build_oc_now_message() -> str:
         f"• S1* {s1st} (Δ={_num(s1d)}) | S2* {s2st} (Δ={_num(s2d)})\n"
         f"• R1* {r1st} (Δ={_num(r1d)}) | R2* {r2st} (Δ={_num(r2d)})"
     )
-    blocks = [header, levels, trig, mv_block, ocp_block]
-    if table: blocks.append(table)
-    blocks.append("\n".join(dec))
-    return "\n\n".join(blocks)
+    mv_block = _mv_block(snap.extras or {}, snap.pcr, snap.max_pain, snap.max_pain_dist)
+    ocp_block = _ocp_block(snap.extras or {})
+
+    return "\n\n".join([header, levels, trig, mv_block, ocp_block])
 
 # ------------------------------ handlers ------------------------------
 async def _guard(update: Update) -> bool:
@@ -186,6 +134,10 @@ async def health_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await _guard(update): return
     await update.message.reply_text(f"OK {datetime.now(tz=IST).strftime('%H:%M:%S %Z')} | OC-AUTO={is_oc_auto()}")
 
+async def version_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await _guard(update): return
+    await update.message.reply_text(f"Version: {APP_VERSION} | tz=IST | oc_auto={is_oc_auto()}")
+
 async def oc_now_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await _guard(update): return
     try:
@@ -199,7 +151,7 @@ async def oc_now_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def run_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await _guard(update): return
     if not context.args:
-        await update.message.reply_text("Usage: /run oc_auto on|off|status")
+        await update.message.reply_text("Usage: /run oc_auto on|off|status | oc_now")
         return
     sub = context.args[0].lower()
     if sub == "oc_auto":
@@ -245,36 +197,52 @@ async def eod_tuner_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     tuner_run()
     await update.message.reply_text("EOD tuner executed.")
 
-# ops_* passthrough
-async def ops_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+# /set_levels — for quick buffer override (Params_Override)
+async def set_levels_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await _guard(update): return
     if not context.args:
-        await update.message.reply_text("Usage: /ops <mem_backup|git_file_update|render_restart|tick_speed N|diag_conflict|learn TEXT|queue|approve I|list>")
+        await update.message.reply_text("Usage: /set_levels buffer <points>\nExample: /set_levels buffer 12")
         return
     sub = context.args[0].lower()
-    if sub == "mem_backup":
-        await update.message.reply_text(ops.ops_mem_backup())
-    elif sub == "git_file_update":
-        await update.message.reply_text(ops.ops_git_file_update())
-    elif sub == "render_restart":
-        await update.message.reply_text(ops.ops_render_restart())
-    elif sub == "tick_speed" and len(context.args) >= 2:
-        await update.message.reply_text(ops.ops_tick_speed(context.args[1]))
-    elif sub == "diag_conflict":
-        await update.message.reply_text(ops.ops_diag_conflict())
-    elif sub == "learn":
-        payload = " ".join(context.args[1:]) if len(context.args)>1 else ""
-        await update.message.reply_text(ops.ops_learn(payload))
-    elif sub == "queue":
-        await update.message.reply_text(ops.ops_queue())
-    elif sub == "approve" and len(context.args)>=2:
-        try: idx = int(context.args[1])
-        except: idx = -1
-        await update.message.reply_text(ops.ops_approve(idx))
-    elif sub == "list":
-        await update.message.reply_text(ops.ops_list())
+    if sub == "buffer" and len(context.args) >= 2:
+        try:
+            val = int(float(context.args[1]))
+        except Exception:
+            await update.message.reply_text("buffer must be a number")
+            return
+        symbol = os.getenv("OC_SYMBOL","NIFTY").upper()
+        # update ENTRY_BAND_POINTS_MAP for current symbol
+        m = sh.get_overrides_map()
+        key = "ENTRY_BAND_POINTS_MAP"
+        raw = m.get(key, "")
+        parts = {}
+        if raw:
+            for kv in raw.replace(";",",").split(","):
+                if "=" in kv:
+                    k,v = kv.split("=",1)
+                    k=k.strip().upper(); v=v.strip()
+                    if k: parts[k]=v
+        parts[symbol] = str(val)
+        new_val = ",".join(f"{k}={parts[k]}" for k in sorted(parts.keys()))
+        sh.upsert_override(key, new_val)
+        await update.message.reply_text(f"Buffer override set: {key}={new_val}")
     else:
-        await update.message.reply_text("Unknown /ops subcommand")
+        await update.message.reply_text("Only 'buffer' supported currently.")
+
+# /hold on|off — writes Events row checked by hold_active()
+async def hold_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await _guard(update): return
+    if not context.args or context.args[0].lower() not in ("on","off","status"):
+        await update.message.reply_text("Usage: /hold on|off|status")
+        return
+    sub = context.args[0].lower()
+    if sub == "status":
+        on, reason = hold_active()
+        await update.message.reply_text(f"HOLD={on} {reason}")
+        return
+    status = "HOLD" if sub == "on" else "CLEAR"
+    sh.append_row("Events", [sh.now_str(), "manual", status])
+    await update.message.reply_text(f"Events: {status}")
 
 # ------------------------------ bootstrap ------------------------------
 async def init() -> Optional[Application]:
@@ -290,11 +258,13 @@ async def init() -> Optional[Application]:
 
     app.add_handler(CommandHandler("start", start_cmd))
     app.add_handler(CommandHandler("health", health_cmd))
+    app.add_handler(CommandHandler("version", version_cmd))
     app.add_handler(CommandHandler("oc_now", oc_now_cmd))
     app.add_handler(CommandHandler("run", run_cmd))
     app.add_handler(CommandHandler("force_flat", force_flat_cmd))
     app.add_handler(CommandHandler("trade_status", trade_status_cmd))
     app.add_handler(CommandHandler("eod_report", eod_report_cmd))
     app.add_handler(CommandHandler("eod_tuner", eod_tuner_cmd))
-    app.add_handler(CommandHandler("ops", ops_cmd))
+    app.add_handler(CommandHandler("set_levels", set_levels_cmd))
+    app.add_handler(CommandHandler("hold", hold_cmd))
     return app
