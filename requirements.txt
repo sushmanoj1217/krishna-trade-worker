@@ -1,10 +1,8 @@
+--only-binary=:all:
 python-telegram-bot==20.7
 APScheduler==3.10.4
 requests==2.32.3
 tenacity==8.5.0
-pydantic==2.8.2
-pandas==2.2.2
-numpy==1.26.4
 gspread==6.1.2
 google-auth==2.34.0
 python-dotenv==1.0.1
