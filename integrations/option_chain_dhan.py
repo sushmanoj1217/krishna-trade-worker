@@ -1,15 +1,30 @@
-import os, requests, re, csv, io
+import os
+import re
+import csv
+import io
+import requests
 from datetime import date
 from tenacity import retry, stop_after_attempt, wait_fixed
 from utils.logger import log
 
+# =============================================================================
+# Dhan v2 Option Chain integration (POST JSON) + Instrument resolver (CSV)
+# - Uses /v2/optionchain and /v2/optionchain/expirylist (JSON, POST)
+# - Resolves SecurityID via /v2/instrument/{exchangeSegment} (CSV, GET)
+# - Env mapping supported: DHAN_UNDERLYING_SCRIP="NIFTY=13,BANKNIFTY=25,FINNIFTY=27"
+# - Quiet logging: only logs SecurityID when it changes
+# =============================================================================
+
 # --- ENV ---
 DHAN_BASE = os.getenv("DHAN_BASE", "https://api.dhan.co").rstrip("/")
-DHAN_UNDERLYING_SCRIP = os.getenv("DHAN_UNDERLYING_SCRIP", "").strip()   # optional; if empty, auto-resolve
-DHAN_UNDERLYING_SEG = os.getenv("DHAN_UNDERLYING_SEG", "IDX_I").strip()  # e.g., IDX_I for indices
+DHAN_UNDERLYING_SCRIP = os.getenv("DHAN_UNDERLYING_SCRIP", "").strip()   # int OR mapping OR empty
+DHAN_UNDERLYING_SEG = os.getenv("DHAN_UNDERLYING_SEG", "IDX_I").strip()  # indices: IDX_I
 DHAN_EXPIRY_ENV = os.getenv("DHAN_EXPIRY", "").strip()                   # optional YYYY-MM-DD
 OC_SYMBOL = os.getenv("OC_SYMBOL", "NIFTY").strip().upper()
-MATCH_HINT = os.getenv("DHAN_MATCH_STRING", "").strip()                  # optional e.g. "NIFTY 50"
+MATCH_HINT = os.getenv("DHAN_MATCH_STRING", "").strip()                  # optional, e.g. "NIFTY 50"
+
+_last_sid_logged = None  # module-level cache to avoid noisy logs
+
 
 # ---------- HTTP helpers ----------
 def _headers():
@@ -17,6 +32,7 @@ def _headers():
     cid = os.getenv("DHAN_CLIENT_ID", "")
     if not token or not cid:
         raise RuntimeError("DHAN credentials missing (DHAN_CLIENT_ID / DHAN_ACCESS_TOKEN)")
+    # Dhan v2 headers
     return {"access-token": token, "client-id": cid, "Content-Type": "application/json"}
 
 def _post_json(url: str, payload: dict, timeout=12):
@@ -34,6 +50,7 @@ def _get_text(url: str, timeout=12):
     r.raise_for_status()
     r.encoding = "utf-8"
     return r.text
+
 
 # ---------- v2 APIs (JSON) ----------
 @retry(stop=stop_after_attempt(3), wait=wait_fixed(1))
@@ -53,6 +70,7 @@ def _pick_nearest_expiry(expiries: list[str]) -> str | None:
 def get_option_chain_v2(underlying_scrip: int, underlying_seg: str, expiry: str) -> dict:
     url = f"{DHAN_BASE}/v2/optionchain"
     return _post_json(url, {"UnderlyingScrip": underlying_scrip, "UnderlyingSeg": underlying_seg, "Expiry": expiry})
+
 
 # ---------- Security ID resolver (CSV via v2 instrument endpoint) ----------
 def _norm(x: str) -> str:
@@ -76,8 +94,9 @@ def _targets_for_symbol(sym: str) -> list[str]:
 @retry(stop=stop_after_attempt(3), wait=wait_fixed(1))
 def _fetch_instruments_csv_for_segment(segment: str) -> list[dict]:
     """
-    Dhan v2 'segmentwise list' endpoint returns CSV for the given exchangeSegment.
-    Docs mention: GET /v2/instrument/{exchangeSegment} (CSV). We'll parse to list[dict].
+    Dhan v2 segment-wise instrument list returns CSV:
+      GET /v2/instrument/{exchangeSegment}
+    We'll parse CSV into list[dict].
     """
     url = f"{DHAN_BASE}/v2/instrument/{segment}"
     text = _get_text(url)
@@ -88,8 +107,9 @@ def _fetch_instruments_csv_for_segment(segment: str) -> list[dict]:
 def _extract_security_id(row: dict) -> int | None:
     # Common id columns seen in Dhan CSVs
     candidates = [
-        "Security ID","SecurityID","SecurityId","SEM_SMST_SECURITY_ID","SEM_SECURITY_ID","SECURITY_ID",
-        "SEM_SEC_ID","SEM_SECID","SEC_ID"
+        "Security ID", "SecurityID", "SecurityId",
+        "SEM_SMST_SECURITY_ID", "SEM_SECURITY_ID", "SECURITY_ID",
+        "SEM_SEC_ID", "SEM_SECID", "SEC_ID",
     ]
     for k in candidates:
         v = row.get(k)
@@ -97,19 +117,21 @@ def _extract_security_id(row: dict) -> int | None:
             return int(v.strip())
         if isinstance(v, int):
             return v
-    # sometimes numeric in other fields
+    # last resort: first numeric field
     for k, v in row.items():
         if isinstance(v, str) and v.strip().isdigit():
             return int(v.strip())
     return None
 
 def _name_blob(row: dict) -> str:
+    # Concatenate several likely name fields
     name_cols = [
-        "Display Name","DISPLAY_NAME","display_name",
-        "Trading Symbol","TRADING_SYMBOL","SEM_TRADING_SYMBOL","TradingSymbol",
-        "Scrip Name","SCRIP_NAME","ScripName",
-        "Symbol Name","SYMBOL_NAME","symbol_name",
-        "Instrument Name","INSTRUMENT_NAME","Instrument"
+        "Display Name", "DISPLAY_NAME", "display_name",
+        "Trading Symbol", "TRADING_SYMBOL", "SEM_TRADING_SYMBOL", "TradingSymbol",
+        "Scrip Name", "SCRIP_NAME", "ScripName",
+        "Symbol Name", "SYMBOL_NAME", "symbol_name",
+        "Instrument Name", "INSTRUMENT_NAME", "Instrument",
+        "Name", "NAME",
     ]
     parts = []
     for c in name_cols:
@@ -119,11 +141,33 @@ def _name_blob(row: dict) -> str:
     return _norm(" ".join(parts))
 
 def _looks_like_index(row: dict) -> bool:
-    for k in ["Instrument Type","INSTRUMENT_TYPE","InstrumentType","Instrument","INSTRUMENT"]:
+    for k in ["Instrument Type", "INSTRUMENT_TYPE", "InstrumentType", "Instrument", "INSTRUMENT"]:
         v = row.get(k)
         if isinstance(v, str) and "INDEX" in v.upper():
             return True
     return False
+
+def _sid_from_env_map(sym: str) -> int | None:
+    """
+    Accepts:
+      - single integer: "13"
+      - mapping: "NIFTY=13,BANKNIFTY=25; FINNIFTY=27"
+    """
+    raw = DHAN_UNDERLYING_SCRIP
+    if not raw:
+        return None
+    if raw.isdigit():
+        return int(raw)
+    parts = re.split(r"[;,]", raw)
+    kv = {}
+    for p in parts:
+        if "=" in p:
+            k, v = p.split("=", 1)
+            k = k.strip().upper()
+            v = v.strip()
+            if v.isdigit():
+                kv[k] = int(v)
+    return kv.get(sym.upper())
 
 def _resolve_security_id(sym: str, segment: str) -> int | None:
     targets = _targets_for_symbol(sym)
@@ -158,29 +202,67 @@ def _resolve_security_id(sym: str, segment: str) -> int | None:
         return best_sid
     return None
 
-def ensure_inputs() -> tuple[int, str, str | None]:
-    # if provided explicitly, use it
-    if DHAN_UNDERLYING_SCRIP.isdigit():
-        sid = int(DHAN_UNDERLYING_SCRIP)
-        log.info(f"Using SecurityID from env: {sid}")
-        return sid, DHAN_UNDERLYING_SEG, (DHAN_EXPIRY_ENV or None)
 
-    # resolve via instrument CSV endpoint (auth required)
+# ---------- Inputs (with quiet logging) ----------
+def ensure_inputs() -> tuple[int, str, str | None]:
+    """
+    Decide UnderlyingScrip (SecurityID), Segment, and Expiry override.
+    Priority:
+      1) DHAN_UNDERLYING_SCRIP env (single int or mapping)
+      2) Resolve via /v2/instrument/{segment} CSV
+      3) Fallback to known IDs (NIFTY=13, BANKNIFTY=25, FINNIFTY=27)
+    """
+    global _last_sid_logged
+
+    # 1) env: single or mapping
+    sid_from_env = _sid_from_env_map(OC_SYMBOL)
+    if sid_from_env:
+        if sid_from_env != _last_sid_logged:
+            log.info(f"Using SecurityID from env: {sid_from_env}")
+            _last_sid_logged = sid_from_env
+        return sid_from_env, DHAN_UNDERLYING_SEG, (DHAN_EXPIRY_ENV or None)
+
+    # 2) resolve via instrument CSV
     sid = _resolve_security_id(OC_SYMBOL, DHAN_UNDERLYING_SEG)
     if sid:
+        if sid != _last_sid_logged:
+            log.info(f"Resolved SecurityID {sid} for {OC_SYMBOL}")
+            _last_sid_logged = sid
         return sid, DHAN_UNDERLYING_SEG, (DHAN_EXPIRY_ENV or None)
 
-    # last-resort defaults (indices)
+    # 3) fallback IDs
     fallback = {"NIFTY": 13, "BANKNIFTY": 25, "FINNIFTY": 27}.get(OC_SYMBOL)
     if fallback:
-        log.warning(f"Auto-resolve failed; falling back to hardcoded ID {fallback} for {OC_SYMBOL}")
+        if fallback != _last_sid_logged:
+            log.warning(f"Auto-resolve failed; falling back to hardcoded ID {fallback} for {OC_SYMBOL}")
+            _last_sid_logged = fallback
         return fallback, DHAN_UNDERLYING_SEG, (DHAN_EXPIRY_ENV or None)
 
-    raise RuntimeError("DHAN_UNDERLYING_SCRIP missing/invalid and auto-resolve failed. "
-                       "Set Security ID via env or provide DHAN_MATCH_STRING.")
+    raise RuntimeError(
+        "DHAN_UNDERLYING_SCRIP invalid and auto-resolve failed. "
+        "Set a single ID or use map like 'NIFTY=13,BANKNIFTY=25,FINNIFTY=27'."
+    )
+
 
 # ---------- OC compute ----------
 def compute_levels_from_oc_v2(oc_json: dict, used_expiry: str) -> dict:
+    """
+    oc_json expected (per Dhan v2):
+    {
+      "data": {
+        "last_price": float,
+        "oc": {
+          "25000.000000": {"ce": {"oi": int, ...}, "pe": {"oi": int, ...}},
+          ...
+        }
+      }
+    }
+    We compute:
+      - S1,S2: top-2 PE OI strikes (supports)
+      - R1,R2: top-2 CE OI strikes (resistances)
+      - PCR: sum(PE OI)/sum(CE OI)
+      - Max Pain (approx): strike with max (CE OI + PE OI)
+    """
     data = oc_json.get("data") or {}
     oc = data.get("oc") or {}
     spot = float(data.get("last_price") or 0.0)
@@ -217,7 +299,12 @@ def compute_levels_from_oc_v2(oc_json: dict, used_expiry: str) -> dict:
         "expiry": used_expiry,
     }
 
+
+# ---------- Public API ----------
 def fetch_levels() -> dict:
+    """
+    High-level helper used by analytics.oc_refresh.refresh_once()
+    """
     u_scrip, u_seg, expiry_override = ensure_inputs()
     expiry = expiry_override
     if not expiry:
