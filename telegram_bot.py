@@ -118,6 +118,16 @@ def _six_checks_summary(side: str, trigger: str, entry_lvl: float, buf: int, bia
     all_ok = all([c1, c2, c3, c4, c5, c6])
     return all_ok, reason, sl, tp
 
+def _ocp_block(extras: dict) -> str:
+    ocp = extras.get("ocp", {}) if extras else {}
+    return (
+        "<b>OC-Pattern</b>\n"
+        f"• CE_OK={_check_mark(bool(ocp.get('ce_ok')))} "
+        f"({ocp.get('ce_type','-')}) [{ocp.get('basis_ce','—')}]\n"
+        f"• PE_OK={_check_mark(bool(ocp.get('pe_ok')))} "
+        f"({ocp.get('pe_type','-')}) [{ocp.get('basis_pe','—')}]"
+    )
+
 def _build_oc_now_message() -> str:
     snap = get_snapshot()
     if not snap:
@@ -192,11 +202,9 @@ def _build_oc_now_message() -> str:
     )
 
     mv_block = _mv_block(snap.extras or {}, snap.pcr, snap.max_pain, snap.max_pain_dist)
+    ocp_block = _ocp_block(snap.extras or {})
 
-    # OC-Pattern placeholder (to be implemented in next task)
-    oc_pat = "<b>OC-Pattern</b> – pending (ΔOI basis will show here)"
-
-    blocks = [header, levels, trig, mv_block, oc_pat, "\n".join(decision_lines)]
+    blocks = [header, levels, trig, mv_block, ocp_block, "\n".join(decision_lines)]
     return "\n\n".join(blocks)
 
 # ------------------------------ handlers ------------------------------
