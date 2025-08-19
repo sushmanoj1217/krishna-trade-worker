@@ -1,2 +1,2 @@
 def run():
-return "no conflicts detected"
+    return "no conflicts detected"
