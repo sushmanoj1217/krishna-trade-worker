@@ -1,3 +1,3 @@
 def run():
-# Placeholder to trigger Render deploy hook / API.
-return "render restart requested (dry-run)"
+    # Placeholder: call Render Deploy Hook if configured
+    return "render restart requested (dry-run)"
