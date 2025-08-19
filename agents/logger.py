@@ -1,15 +1,14 @@
 # agents/logger.py
 from __future__ import annotations
 
-import os
 from datetime import datetime
 from typing import Dict, List, Optional
 
-# Expecting integrations/sheets.py to expose a SheetClient with:
-#  - ensure_tab(tab_name: str, headers: List[str]) -> None
-#  - append_row(tab_name: str, row: List) -> None
-#  - tail_rows(tab_name: str, n: int) -> List[List]
-from integrations.sheets import SheetClient
+# We call module-level helpers from integrations/sheets.py:
+#   ensure_tab(tab_name, headers)
+#   append_row(tab_name, row)
+#   tail_rows(tab_name, n)   (optional; we fall back if missing)
+from integrations import sheets
 
 # ---------- Tab Headers ----------
 OC_LIVE_HEADERS = [
@@ -41,17 +40,29 @@ STATUS_HEADERS = ["ts","key","value"]
 SNAPSHOTS_HEADERS = ["ts","key","json"]
 PARAMS_OVERRIDE_HEADERS = ["ts","key","value","who","reason"]
 
+# ---------- Sheet helpers ----------
+def _ensure_tab(name: str, headers: List[str]) -> None:
+    sheets.ensure_tab(name, headers)
+
+def _append(name: str, row: List) -> None:
+    sheets.append_row(name, row)
+
+def _tail(name: str, n: int) -> List[List]:
+    try:
+        return sheets.tail_rows(name, n) or []
+    except Exception:
+        return []
+
 # ---------- Ensures ----------
-def ensure_all_headers(sc: Optional[SheetClient] = None) -> None:
-    sc = sc or SheetClient()
-    sc.ensure_tab("OC_Live", OC_LIVE_HEADERS)
-    sc.ensure_tab("Signals", SIGNALS_HEADERS)
-    sc.ensure_tab("Trades", TRADES_HEADERS)
-    sc.ensure_tab("Performance", PERF_HEADERS)
-    sc.ensure_tab("Events", EVENTS_HEADERS)
-    sc.ensure_tab("Status", STATUS_HEADERS)
-    sc.ensure_tab("Snapshots", SNAPSHOTS_HEADERS)
-    sc.ensure_tab("Params_Override", PARAMS_OVERRIDE_HEADERS)
+def ensure_all_headers() -> None:
+    _ensure_tab("OC_Live", OC_LIVE_HEADERS)
+    _ensure_tab("Signals", SIGNALS_HEADERS)
+    _ensure_tab("Trades", TRADES_HEADERS)
+    _ensure_tab("Performance", PERF_HEADERS)
+    _ensure_tab("Events", EVENTS_HEADERS)
+    _ensure_tab("Status", STATUS_HEADERS)
+    _ensure_tab("Snapshots", SNAPSHOTS_HEADERS)
+    _ensure_tab("Params_Override", PARAMS_OVERRIDE_HEADERS)
 
 # ---------- Helpers ----------
 def _now() -> str:
@@ -64,11 +75,10 @@ def log_oc_live(snapshot: Dict, notes: str = "") -> None:
     'symbol','spot','S1','S2','R1','R2','S1*','S2*','R1*','R2*','MV'
     PCR/VIX will be pulled from Status latest if not in snapshot.
     """
-    sc = SheetClient()
-    ensure_all_headers(sc)
-
+    ensure_all_headers()
     symbol = snapshot.get("symbol", "NIFTY")
     spot = snapshot.get("spot")
+    latest = get_latest_status_map()
     row = [
         snapshot.get("ts") or _now(),
         symbol,
@@ -78,11 +88,11 @@ def log_oc_live(snapshot: Dict, notes: str = "") -> None:
         snapshot.get("S1*"), snapshot.get("S2*"),
         snapshot.get("R1*"), snapshot.get("R2*"),
         snapshot.get("MV"),
-        snapshot.get("PCR") or get_latest_status_map().get("PCR"),
-        snapshot.get("VIX") or get_latest_status_map().get("VIX"),
+        snapshot.get("PCR") or latest.get("PCR"),
+        snapshot.get("VIX") or latest.get("VIX"),
         notes,
     ]
-    sc.append_row("OC_Live", row)
+    _append("OC_Live", row)
 
 # ---------- Signals ----------
 def log_signal(signal: Dict) -> None:
@@ -90,8 +100,7 @@ def log_signal(signal: Dict) -> None:
     signal keys expected:
     'symbol','side','level_tag','trigger_level','mv','reason','target_rr','trail_after_rr'
     """
-    sc = SheetClient()
-    ensure_all_headers(sc)
+    ensure_all_headers()
     row = [
         signal.get("ts") or _now(),
         signal.get("symbol", "NIFTY"),
@@ -103,7 +112,7 @@ def log_signal(signal: Dict) -> None:
         signal.get("target_rr"),
         signal.get("trail_after_rr"),
     ]
-    sc.append_row("Signals", row)
+    _append("Signals", row)
 
 # ---------- Trades (Paper) ----------
 def _trade_row(tr: Dict) -> List:
@@ -128,17 +137,14 @@ def _trade_row(tr: Dict) -> List:
     ]
 
 def log_trade_open(tr: Dict) -> None:
-    sc = SheetClient()
-    ensure_all_headers(sc)
-    sc.append_row("Trades", _trade_row(tr))
+    ensure_all_headers()
+    _append("Trades", _trade_row(tr))
 
 def log_trade_update(tr: Dict) -> None:
-    sc = SheetClient()
-    sc.append_row("Trades", _trade_row(tr))
+    _append("Trades", _trade_row(tr))
 
 def log_trade_close(tr: Dict) -> None:
-    sc = SheetClient()
-    sc.append_row("Trades", _trade_row(tr))
+    _append("Trades", _trade_row(tr))
 
 # ---------- Performance ----------
 def log_perf_eod(stats: Dict) -> None:
@@ -146,8 +152,7 @@ def log_perf_eod(stats: Dict) -> None:
     stats keys expected:
     'date','num_signals','num_trades','gross_pnl','net_pnl','win_count','loss_count','max_dd','notes'
     """
-    sc = SheetClient()
-    ensure_all_headers(sc)
+    ensure_all_headers()
     row = [
         _now(),
         stats.get("date"),
@@ -160,38 +165,34 @@ def log_perf_eod(stats: Dict) -> None:
         stats.get("max_dd"),
         stats.get("notes"),
     ]
-    sc.append_row("Performance", row)
+    _append("Performance", row)
 
 # ---------- Events ----------
 def log_event(name: str, start_ts: str, end_ts: str, meta: str = "") -> None:
-    sc = SheetClient()
-    ensure_all_headers(sc)
-    sc.append_row("Events", [_now(), name, start_ts, end_ts, meta])
+    ensure_all_headers()
+    _append("Events", [_now(), name, start_ts, end_ts, meta])
 
 # ---------- Status (PCR/VIX & misc) ----------
 def log_market_context(pcr: float | None = None, vix: float | None = None) -> None:
-    sc = SheetClient()
-    ensure_all_headers(sc)
+    ensure_all_headers()
     ts = _now()
     if pcr is not None:
-        sc.append_row("Status", [ts, "PCR", round(float(pcr), 4)])
+        _append("Status", [ts, "PCR", round(float(pcr), 4)])
     if vix is not None:
-        sc.append_row("Status", [ts, "VIX", round(float(vix), 2)])
+        _append("Status", [ts, "VIX", round(float(vix), 2)])
 
 def set_status_kv(key: str, value) -> None:
-    sc = SheetClient()
-    ensure_all_headers(sc)
-    sc.append_row("Status", [_now(), key, value])
+    ensure_all_headers()
+    _append("Status", [_now(), key, value])
 
 def get_latest_status_map() -> Dict[str, str]:
-    sc = SheetClient()
-    rows = sc.tail_rows("Status", 300) or []
+    rows = _tail("Status", 300) or []
     out: Dict[str, str] = {}
     for r in rows[::-1]:
         if len(r) >= 3:
             k, v = r[1], r[2]
             if k not in out:
                 out[k] = v
-            if len(out) >= 8:  # guard
+            if len(out) >= 8:
                 break
     return out
