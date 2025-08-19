@@ -1,4 +1,4 @@
-import os, asyncio
+import os, asyncio, sys
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from utils.logger import log
 from analytics.oc_refresh import refresh_once
@@ -26,6 +26,7 @@ async def nightly_jobs():
     run_nightly()
 
 async def main():
+    log.info(f"Python runtime: {sys.version}")
     try:
         ensure_tabs()
         log.info("✅ Sheets tabs ensured")
@@ -38,20 +39,30 @@ async def main():
     scheduler.add_job(nightly_jobs, "cron", hour=20, minute=5, timezone="Asia/Kolkata")
     scheduler.start()
 
-    tasks = [asyncio.create_task(day_loop())]
+    # Start bot (if available)
     if app:
-        tasks.append(app.initialize())
-        tasks.append(app.start())
-        log.info("Telegram bot started")
+        try:
+            await app.initialize()
+            await app.start()
+            log.info("Telegram bot started")
+        except Exception as e:
+            log.error(f"Telegram start failed: {e}")
+            app = None
 
     try:
-        await asyncio.gather(*tasks)
+        await day_loop()
     except Exception as e:
-        log.error(f"Main crashed: {e}")
+        log.error(f"Day loop crashed: {e}")
     finally:
         if app:
-            await app.stop()
-            await app.shutdown()
+            try:
+                await app.stop()
+            except Exception as e:
+                log.warning(f"Bot stop warning: {e}")
+            try:
+                await app.shutdown()
+            except Exception as e:
+                log.warning(f"Bot shutdown warning: {e}")
 
 if __name__ == "__main__":
     asyncio.run(main())
