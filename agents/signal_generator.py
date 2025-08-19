@@ -45,7 +45,8 @@ def run_once() -> Signal | None:
     if r1s: candidates.append(("PE", "R1*", r1s))
     if r2s: candidates.append(("PE", "R2*", r2s))
 
-    mv = (snap.extras or {}).get("mv", {})  # {ce_ok, pe_ok, ce_basis, pe_basis, ...}
+    mv = (snap.extras or {}).get("mv", {})   # {ce_ok, pe_ok, ce_basis, pe_basis, ...}
+    ocp = (snap.extras or {}).get("ocp", {}) # {ce_ok, pe_ok, ce_type, pe_type, basis_*}
 
     now = time.time()
     for side, trig, lvl in candidates:
@@ -56,48 +57,50 @@ def run_once() -> Signal | None:
         if sig_hash in _seen and now - _seen[sig_hash] < _DUP_LOG_COOLDOWN:
             continue
 
-        # --- 6-Checks (simplified placeholders still ok) ---
-        c1 = True  # TriggerCross already satisfied
-        c2 = True  # FlowBias@Trigger (placeholder; MV gate handles macro bias)
-        c3 = True  # WallSupport(ΣΔOI) TODO in OC-pattern task
-        c4 = True  # Momentum(3–5m)  TODO
-        # RR feasibility
+        # --- 6-Checks (placeholders for C3/C4 until momentum/ΔOI walls are detailed) ---
+        c1 = True
+        c2 = True
+        c3 = True
+        c4 = True
         sl = lvl - snap.extras.get("buffer", 12) if side == "CE" else lvl + snap.extras.get("buffer", 12)
         rr_ok, risk, tp = rr_feasible(lvl, sl, p.min_target_points())
         c5 = rr_ok
         c6 = not is_no_trade_now()
-
         six_ok = all([c1, c2, c3, c4, c5, c6])
 
-        # --- MV 1-of-2 (directional) ---
+        # --- MV 1-of-2 ---
         if side == "CE":
             mv_ok = bool(mv.get("ce_ok"))
             mv_basis = mv.get("ce_basis", "—")
+            oc_ok = bool(ocp.get("ce_ok"))
+            oc_basis = f"{ocp.get('ce_type', '-')}; {ocp.get('basis_ce', '—')}"
         else:
             mv_ok = bool(mv.get("pe_ok"))
             mv_basis = mv.get("pe_basis", "—")
+            oc_ok = bool(ocp.get("pe_ok"))
+            oc_basis = f"{ocp.get('pe_type', '-')}; {ocp.get('basis_pe', '—')}"
 
-        eligible = six_ok and mv_ok
+        eligible = six_ok and mv_ok and oc_ok
 
         s = Signal(
             id=signal_id(),
             side=side,
             trigger=trig,
             eligible=eligible,
-            reason=f"6/6={six_ok}; MV={mv_ok}",
-            basis={"entry": lvl, "sl": sl, "tp": tp, "risk": risk, "mv_basis": mv_basis},
+            reason=f"6/6={six_ok}; MV={mv_ok}; OC={oc_ok}",
+            basis={"entry": lvl, "sl": sl, "tp": tp, "risk": risk, "mv_basis": mv_basis, "oc_basis": oc_basis},
         )
 
         log.info(f"Signal {s.id} {s.side} {s.trigger} eligible={s.eligible} "
-                 f"entry={lvl} sl={sl} tp={tp} | MV: {mv_basis}")
+                 f"entry={lvl} sl={sl} tp={tp} | MV: {mv_basis} | OC: {oc_basis}")
 
         try:
             sh.append_row("Signals", [
                 s.id, time.strftime("%Y-%m-%d %H:%M:%S"),
                 s.side, s.trigger,
-                True, True, True, True, c5, c6,  # C1..C6 flags (placeholders for C1..C4=True)
+                True, True, True, True, c5, c6,
                 s.eligible, s.reason,
-                mv_ok, mv_basis
+                mv_ok, mv_basis, oc_ok, oc_basis
             ])
         except Exception as e:
             log.error(f"Signals append failed: {e}")
