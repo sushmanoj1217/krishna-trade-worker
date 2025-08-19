@@ -4,7 +4,6 @@ import os, asyncio
 from datetime import datetime
 from zoneinfo import ZoneInfo
 from utils.logger import log
-from utils.params import Params
 from utils.cache import get_snapshot
 from utils.state import get_last_signal, is_last_signal_placed, mark_last_signal_placed
 from integrations import sheets as sh
@@ -21,6 +20,22 @@ def _within_market():
     return (t >= datetime.strptime("09:30", "%H:%M").time()
             and t < datetime.strptime("15:15", "%H:%M").time())
 
+def _estimate_premium(side: str, entry_level: float, oc_px: dict) -> float:
+    """Try to use oc_px ltp near strike; fallback to simple proxy."""
+    if not oc_px:
+        return max(5.0, min(300.0, 0.3 * abs(entry_level)))
+    # find nearest strike in oc_px
+    try:
+        strikes = sorted(oc_px.keys())
+        strike = min(strikes, key=lambda s: abs(s - entry_level))
+        leg = "ce" if side == "CE" else "pe"
+        px = float((oc_px.get(strike) or {}).get(leg) or 0.0)
+        if px > 0:
+            return px
+    except Exception:
+        pass
+    return max(5.0, min(300.0, 0.3 * abs(entry_level)))
+
 async def trade_tick():
     if not _within_market():
         return
@@ -34,28 +49,24 @@ async def trade_tick():
     if is_last_signal_placed():
         return
 
-    if sh.count_today_trades() >= MAX_TRADES_PER_DAY:
-        log.info("Daily cap hit; skip trade")
-        return
-
+    oc_px = (snap.extras or {}).get("oc_px") or {}
     entry = float(sig["entry"]); side = sig["side"]
-    approx_premium = max(5.0, min(300.0, abs((snap.spot or entry) - entry)))
-    exposure = approx_premium * QTY_PER_TRADE
+    premium = _estimate_premium(side, entry, oc_px)
+    exposure = premium * QTY_PER_TRADE
     if exposure > MAX_EXPOSURE_PER_TRADE:
         log.info(f"Exposure {exposure} > cap {MAX_EXPOSURE_PER_TRADE}; skip")
         return
 
     sl = float(sig["sl"]); tp = float(sig["tp"])
-
     tid = f"TR-{datetime.now(tz=IST).strftime('%Y%m%d-%H%M%S')}"
     row = [
         tid, sig["id"], SYMBOL, side, entry, "", sl, tp, f"oc:{sig['trigger']}",
         datetime.now(tz=IST).strftime("%Y-%m-%d %H:%M:%S"),
-        "", "", "", ""  # exit/result/pnl/hash
+        "", "", "", sig.get("dedupe_hash","")
     ]
     sh.append_row("Trades", row)
     mark_last_signal_placed()
-    log.info(f"TRADE BUY {tid} {side} @ {entry} SL={sl} TP={tp} x{QTY_PER_TRADE}")
+    log.info(f"TRADE BUY {tid} {side} @ {entry} SL={sl} TP={tp} x{QTY_PER_TRADE} prem≈{premium}")
 
 async def force_flat_all(reason="force_flat"):
     open_trades = sh.get_open_trades()
