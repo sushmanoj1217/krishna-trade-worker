@@ -10,11 +10,9 @@ MODE = os.getenv("OC_MODE", "sheet").lower()
 
 BUFFERS = {"NIFTY": 12, "BANKNIFTY": 30, "FINNIFTY": 15}
 
-
 def _buffer_for_symbol(sym: str, params: Params) -> int:
     """Prefer explicit param.buffer_points; else default per symbol."""
     return params.buffer_points or BUFFERS.get(sym.upper(), 12)
-
 
 def refresh_once() -> OCSnapshot | None:
     params = Params()
