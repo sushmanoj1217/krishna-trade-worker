@@ -1,22 +1,16 @@
 # krishna_main.py
-# Krishna Trade Worker v3 — Main entry
-# - Env-driven config (Day/Night)
-# - OC snapshot via plugin (analytics.oc_refresh) or fallback: Sheet OC_Live
-# - Signal generation via agents/signal_generator (OC rules)
-# - Per-level-per-day dedup (Signals.signal_id)
-# - Heartbeat + OC tick schedulers (APScheduler)
-# - Telegram long-polling router (/status, /oc_now, etc.)
-# - Params Override loader (Sheet + optional Firestore)
-# - Events HOLD gate (skip signals during active window in Events tab)
-# - Circuit breaker gate before issuing signals
-# - Time-Exit @ 15:15 IST + EOD Performance @ 15:31 + TG summary @ 15:35 (Mon–Fri)
+# Krishna Trade Worker v3 — Main entry with NEAR alerts
+# - OC snapshot, logging, and signal generation (directional buffer)
+# - Gates: Events HOLD, No-trade windows (09:15–09:30, 14:45–15:15), Circuit pause
+# - Condition-change exit, Daily trade cap, Dedup, Paper OPEN
+# - NEAR alerts: on entering S/R alert zones, send TG with MV/PCR/VIX and action reason
 
 import os, json, time, traceback
 from dataclasses import dataclass
 from typing import Optional, Dict, Any, List
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, time as dtime
 
-# ---- Third-party ----
+# Third-party
 try:
     import gspread
 except Exception as e:
@@ -29,60 +23,56 @@ except Exception as e:
     print(f"[boot] apscheduler import failed: {e}", flush=True)
     BackgroundScheduler = None
 
-# ---- Our modules ----
+# Modules
 from agents import logger
 from agents.signal_generator import generate_signal_from_oc
+from agents.signal_generator import classify_market_view, buffer_points  # for info/reasons
 
-# Optional executor (paper trading)
 try:
-    from agents.trade_executor import open_trade as open_paper_trade  # signature: open_trade(sheet, signal_dict)
+    from agents.trade_executor import open_trade as open_paper_trade
 except Exception:
     open_paper_trade = None
 
-# Optional OC plugin (preferred)
-OC_PLUGIN = None
 try:
-    # Expect get_snapshot(cfg) -> dict with spot,s1,s2,r1,r2,ce_oi_pct,pe_oi_pct,expiry,symbol[,volume_low]
     from analytics.oc_refresh import get_snapshot as _oc_get_snapshot
     OC_PLUGIN = _oc_get_snapshot
 except Exception:
     OC_PLUGIN = None
 
-# Optional Telegram router
 try:
     from ops import tele_router
 except Exception:
     tele_router = None
 
-# Optional EOD writer
 try:
     from ops import eod_perf
 except Exception:
     eod_perf = None
 
-# Optional params override
 try:
     from ops import params_override
 except Exception:
     params_override = None
 
-# Optional time-exit wrapper
 try:
     from ops import closer
 except Exception:
     closer = None
 
-# Optional circuit breaker
 try:
     from agents import circuit
 except Exception:
     circuit = None
 
-# Optional events HOLD gate
 try:
     from ops import events_gate
 except Exception:
     events_gate = None
+
+try:
+    from ops import near_alerts
+except Exception:
+    near_alerts = None
 
 # ------------- Config -------------
 @dataclass
@@ -165,56 +155,7 @@ class SheetsWrapper:
         rows = ws.get_all_values()
         return rows[-1] if rows and len(rows) >= 2 else None
 
-    def read_col(self, title: str, col_index: int) -> List[str]:
-        ws = self.ss.worksheet(title)
-        col = ws.col_values(col_index)
-        return col
-
-# ------------- OC snapshot acquisition -------------
-def _to_float(v, default=None):
-    try:
-        if v is None:
-            return default
-        return float(v)
-    except Exception:
-        return default
-
-def oc_from_sheet_latest(sheet: SheetsWrapper, symbol: str) -> Optional[Dict[str, Any]]:
-    """
-    Expect OC_Live headers (minimum):
-      ts, symbol, spot, s1, s2, r1, r2, expiry, signal
-    Optional:
-      ce_oi_pct, pe_oi_pct, volume_low
-    """
-    try:
-        last = sheet.read_last_row("OC_Live")
-        if not last or len(last) < 8:
-            return None
-        ts      = last[0] if len(last) > 0 else ""
-        sym     = last[1] if len(last) > 1 and last[1] else symbol
-        spot    = _to_float(last[2], 0.0)
-        s1      = _to_float(last[3], 0.0)
-        s2      = _to_float(last[4], 0.0)
-        r1      = _to_float(last[5], 0.0)
-        r2      = _to_float(last[6], 0.0)
-        expiry  = last[7] if len(last) > 7 else ""
-        signal  = last[8] if len(last) > 8 else ""
-        ce_oi_pct = _to_float(last[9])  if len(last) > 9  and last[9]  != "" else None
-        pe_oi_pct = _to_float(last[10]) if len(last) > 10 and last[10] != "" else None
-        volume_low = None
-        if len(last) > 11 and last[11] != "":
-            v = str(last[11]).strip().lower()
-            volume_low = (v in ("1","true","yes","y"))
-        return {
-            "ts": ts, "symbol": sym,
-            "spot": spot, "s1": s1, "s2": s2, "r1": r1, "r2": r2,
-            "expiry": expiry, "signal": signal,
-            "ce_oi_pct": ce_oi_pct, "pe_oi_pct": pe_oi_pct, "volume_low": volume_low,
-        }
-    except Exception as e:
-        print(f"[oc] sheet read failed: {e}", flush=True)
-        return None
-
+# ------------- Helpers -------------
 def get_oc_snapshot(cfg: Config, sheet: SheetsWrapper) -> Optional[Dict[str, Any]]:
     if OC_PLUGIN is not None:
         try:
@@ -223,11 +164,57 @@ def get_oc_snapshot(cfg: Config, sheet: SheetsWrapper) -> Optional[Dict[str, Any
         except Exception as e:
             print(f"[oc] plugin error: {e}", flush=True)
             traceback.print_exc()
-    return oc_from_sheet_latest(sheet, cfg.symbol)
+    # fallback: last sheet row
+    try:
+        last = sheet.read_last_row("OC_Live")
+        if not last or len(last) < 8: return None
+        def f(v, d=None):
+            try: return float(v)
+            except: return d
+        return {
+            "ts": last[0],
+            "symbol": last[1] or cfg.symbol,
+            "spot": f(last[2], 0.0),
+            "s1": f(last[3], None),
+            "s2": f(last[4], None),
+            "r1": f(last[5], None),
+            "r2": f(last[6], None),
+            "expiry": last[7],
+            "signal": last[8] if len(last) > 8 else "",
+            "ce_oi_pct": f(last[9], None) if len(last) > 9 else None,
+            "pe_oi_pct": f(last[10], None) if len(last) > 10 else None,
+            "volume_low": (str(last[11]).strip().lower() in ("1","true","yes","y")) if len(last) > 11 else None,
+        }
+    except Exception as e:
+        print(f"[oc] sheet read failed: {e}", flush=True)
+        return None
 
-# ------------- Dedup helpers -------------
+def _in_no_trade_window() -> bool:
+    now = datetime.now().time()
+    if dtime(9,15) <= now <= dtime(9,30): return True
+    if dtime(14,45) <= now <= dtime(15,15): return True
+    return False
+
+def _today_trade_count(sheet) -> int:
+    try:
+        ws = sheet.ss.worksheet("Trades")
+        rows = ws.get_all_values()
+        if not rows or len(rows) < 2: return 0
+        hdr = rows[0]
+        ix_date = hdr.index("date") if "date" in hdr else None
+        ix_event = hdr.index("event") if "event" in hdr else None
+        today = datetime.now().date().isoformat()
+        cnt = 0
+        for r in rows[1:]:
+            if ix_date is not None and len(r) > ix_date and r[ix_date] == today:
+                ev = r[ix_event] if (ix_event is not None and len(r) > ix_event) else "OPEN"
+                if ev == "OPEN":
+                    cnt += 1
+        return cnt
+    except Exception:
+        return 0
+
 def dedup_exists(sheet: SheetsWrapper, dedup_key: str) -> bool:
-    """Look into Signals tab, last ~500 rows for today's signal_id == dedup_key."""
     try:
         ws = sheet.ss.worksheet("Signals")
         rows = ws.get_all_values()
@@ -247,7 +234,7 @@ def dedup_exists(sheet: SheetsWrapper, dedup_key: str) -> bool:
         print(f"[dedup] check failed: {e}", flush=True)
         return False
 
-# ------------- Main logic -------------
+# ------------- Main -------------
 def main():
     cfg = load_config()
 
@@ -262,58 +249,49 @@ def main():
 
     # Sheets
     sheet = SheetsWrapper(cfg)
-    # Ensure all tabs/headers
     logger.ensure_all_headers(sheet, cfg)
 
-    # Apply Params_Override (Sheet + optional Firestore)
+    # Overrides
     if params_override is not None:
         try:
             applied = params_override.apply_overrides(sheet, cfg)
             if applied:
                 print(f"[override] applied: {applied}", flush=True)
                 logger.log_status(sheet, {
-                    "worker_id": cfg.worker_id,
-                    "shift_mode": cfg.shift_mode,
-                    "state": "OK",
-                    "message": f"params_override {len(applied)} applied"
+                    "worker_id": cfg.worker_id, "shift_mode": cfg.shift_mode,
+                    "state": "OK", "message": f"params_override {len(applied)} applied"
                 })
         except Exception as e:
             print(f"[override] failed: {e}", flush=True)
 
-    # Start Telegram router (daemon thread)
+    # Telegram router
     if tele_router is not None:
         try:
             tele_router.start(sheet, cfg)
         except Exception as e:
             print(f"[boot] tele_router start failed: {e}", flush=True)
-    else:
-        print("[boot] tele_router missing; TG commands disabled", flush=True)
 
-    # ---- Schedulers ----
+    # Scheduler
     if BackgroundScheduler is None:
         raise RuntimeError("apscheduler not available")
     sched = BackgroundScheduler(timezone=cfg.tz)
 
-    # Heartbeat: every 60s
+    # Heartbeat
     def heartbeat():
         try:
             logger.log_status(sheet, {
-                "worker_id": cfg.worker_id,
-                "shift_mode": cfg.shift_mode,
-                "state": "OK",
-                "message": f"hb {cfg.symbol}"
+                "worker_id": cfg.worker_id, "shift_mode": cfg.shift_mode,
+                "state": "OK", "message": f"hb {cfg.symbol}"
             })
         except Exception as e:
             print(f"❌ Job error [heartbeat] {e}", flush=True)
 
     sched.add_job(heartbeat, "interval", seconds=60, id="heartbeat")
 
-    # OC tick: refresh snapshot + evaluate signal
-    _last_oc_at = {"ts": 0.0}  # throttle
+    _last_oc_at = {"ts": 0.0}
 
     def oc_tick():
         try:
-            # Simple throttle (min interval)
             now_ts = time.time()
             if now_ts - _last_oc_at["ts"] < cfg.oc_min_interval_secs:
                 remain = round(cfg.oc_min_interval_secs - (now_ts - _last_oc_at["ts"]), 1)
@@ -324,21 +302,18 @@ def main():
             if not oc:
                 print("[oc] no snapshot available", flush=True)
                 return
-
             _last_oc_at["ts"] = now_ts
 
-            # Print summary
-            spot = oc.get("spot")
-            s1, r1 = oc.get("s1"), oc.get("r1")
+            spot, s1, r1 = oc.get("spot"), oc.get("s1"), oc.get("r1")
             print(f"[oc] {cfg.symbol} spot={spot} s1={s1} r1={r1}", flush=True)
 
-            # Log OC live to sheet (optional)
+            # Log OC to sheet (best-effort)
             try:
                 logger.log_oc_live(sheet, {
                     "ts": oc.get("ts") or "",
                     "symbol": oc.get("symbol") or cfg.symbol,
-                    "spot": spot, "s1": s1, "s2": oc.get("s2"),
-                    "r1": r1, "r2": oc.get("r2"),
+                    "spot": oc.get("spot"), "s1": oc.get("s1"), "s2": oc.get("s2"),
+                    "r1": oc.get("r1"), "r2": oc.get("r2"),
                     "expiry": oc.get("expiry") or "",
                     "signal": oc.get("signal") or "",
                     "ce_oi_pct": oc.get("ce_oi_pct") if "ce_oi_pct" in oc else "",
@@ -348,178 +323,153 @@ def main():
             except Exception as e:
                 print(f"[oc] log_oc_live failed: {e}", flush=True)
 
-            # HOLD gate via Events tab
+            # Auto close on condition change
+            if closer is not None:
+                try:
+                    closer.condition_exit(sheet, cfg, oc)
+                except Exception as e:
+                    print(f"[closer] condition_exit failed: {e}", flush=True)
+
+            # ---- Gate reasons (non-blocking list) ----
+            reasons: List[str] = []
+            hold_active = False
             if events_gate is not None:
                 try:
-                    hold, why = events_gate.is_hold_now(sheet)
+                    hold_active, why = events_gate.is_hold_now(sheet)
+                    if hold_active: reasons.append(f"HOLD:{why[:40]}")
                 except Exception:
-                    hold, why = (False, "")
-                if hold:
-                    print(f"[hold] active event window — skip signals ({why})", flush=True)
-                    try:
-                        logger.log_status(sheet, {
-                            "worker_id": cfg.worker_id,
-                            "shift_mode": cfg.shift_mode,
-                            "state": "HOLD",
-                            "message": f"events_hold {why[:80]}"
-                        })
-                    except Exception:
-                        pass
-                    return
+                    pass
 
-            # Circuit breaker gate
+            if _in_no_trade_window():
+                reasons.append("no_trade_window")
+
+            circ_paused = False
             if circuit is not None and circuit.should_pause():
-                try:
-                    rem = circuit.pause_remaining_secs()
-                except Exception:
-                    rem = 0
-                print(f"[signal] paused by circuit (rem {rem}s)", flush=True)
-                return
+                circ_paused = True
+                reasons.append("circuit_pause")
 
-            # Evaluate OC strategy → signal
+            max_trades_str = os.getenv("MAX_TRADES_PER_DAY", "").strip()
+            max_reached = False
+            if max_trades_str.isdigit():
+                try:
+                    if _today_trade_count(sheet) >= int(max_trades_str):
+                        max_reached = True
+                        reasons.append(f"max_trades_day({max_trades_str})")
+                except Exception:
+                    pass
+
+            auto_trade_off = (cfg.auto_trade.lower() != "on")
+            if auto_trade_off:
+                reasons.append("AUTO_TRADE=off")
+
+            # ---- Try build signal (for decision + alert context)
             sig = generate_signal_from_oc({
                 "symbol": oc.get("symbol") or cfg.symbol,
-                "spot": spot,
-                "s1": s1, "s2": oc.get("s2"),
-                "r1": r1, "r2": oc.get("r2"),
+                "spot": oc.get("spot"),
+                "s1": oc.get("s1"), "s2": oc.get("s2"),
+                "r1": oc.get("r1"), "r2": oc.get("r2"),
                 "ce_oi_pct": oc.get("ce_oi_pct"),
                 "pe_oi_pct": oc.get("pe_oi_pct"),
                 "volume_low": oc.get("volume_low"),
             })
-            if not sig:
-                return
+            dedup_hit = False
+            trade_taken = False
+            trade_tag = None
+            trade_side = None
 
-            # Dedup per-level-per-day
-            dkey = sig.get("dedup_key")
-            if dkey and dedup_exists(sheet, dkey):
-                print(f"[signal] skip duplicate for {dkey}", flush=True)
-                return
+            # If there is a candidate signal but reasons block trade, skip logging/OPEN
+            can_trade = (sig is not None) and (len(reasons) == 0)
 
-            # Log to Signals (append)
-            logger.log_signal(sheet, {
-                "ts": "",  # auto fill
-                "symbol": sig.get("symbol"),
-                "side": sig.get("side"),
-                "price": "",
-                "reason": sig.get("reason"),
-                "level": sig.get("level"),
-                "sl": "",
-                "tp": "",
-                "rr": "",
-                "signal_id": dkey or "",
-            })
-            print(f"[signal] {sig.get('side')} {cfg.symbol} @ {sig.get('level_tag')} ({sig.get('reason')})", flush=True)
+            if sig is not None:
+                trade_tag  = sig.get("level_tag")
+                trade_side = sig.get("side")
 
-            # Try open paper trade
-            if open_paper_trade and cfg.auto_trade.lower() == "on":
+            if sig is not None and len(reasons) == 0:
+                dkey = sig.get("dedup_key") or ""
+                if dkey and dedup_exists(sheet, dkey):
+                    dedup_hit = True
+                    print(f"[signal] skip duplicate for {dkey}", flush=True)
+                else:
+                    # Log signal
+                    logger.log_signal(sheet, {
+                        "ts": "", "symbol": sig.get("symbol"),
+                        "side": sig.get("side"), "price": "",
+                        "reason": sig.get("reason"),
+                        "level": sig.get("level"),
+                        "sl": "", "tp": "", "rr": "",
+                        "signal_id": dkey,
+                    })
+                    print(f"[signal] {sig.get('side')} {cfg.symbol} @ {sig.get('level_tag')} ({sig.get('reason')})", flush=True)
+                    # OPEN (paper)
+                    if open_paper_trade and cfg.auto_trade.lower() == "on":
+                        try:
+                            open_paper_trade(sheet, sig)
+                            trade_taken = True
+                        except Exception as e:
+                            reasons.append("executor_error")
+                            print(f"[trade] open_paper_trade failed: {e}", flush=True)
+
+            # ---- NEAR alert (send once per level with cooldown)
+            if near_alerts is not None:
                 try:
-                    open_paper_trade(sheet, sig)
+                    near_alerts.check_and_alert(oc, {
+                        "trade_taken": trade_taken,
+                        "trade_side": trade_side,
+                        "trade_tag": trade_tag,
+                        "dedup_hit": dedup_hit,
+                        "reasons": reasons
+                    })
                 except Exception as e:
-                    print(f"[trade] open_paper_trade failed: {e}", flush=True)
+                    print(f"[alert] near_alerts failed: {e}", flush=True)
 
         except Exception as e:
             print(f"❌ Job error [oc_tick] {e}", flush=True)
             traceback.print_exc()
 
-    # OC tick interval
-    sched.add_job(
-        oc_tick,
-        "interval",
-        seconds=max(5, cfg.oc_refresh_secs),
-        id="oc_tick",
-        next_run_time=datetime.now() + timedelta(seconds=1),
-    )
+    # OC tick job
+    sched.add_job(oc_tick, "interval",
+                  seconds=max(5, cfg.oc_refresh_secs),
+                  id="oc_tick",
+                  next_run_time=datetime.now() + timedelta(seconds=1))
 
-    # ---- Time-Exit (Mon–Fri, 15:15 IST) ----
+    # Time-exit 15:15 IST
     def time_exit_job():
-        if closer is None:
-            return
+        if closer is None: return
         try:
             closer.time_exit_all(sheet, cfg)
         except Exception as e:
             print(f"❌ Job error [time_exit] {e}", flush=True)
+    sched.add_job(time_exit_job, "cron", day_of_week="mon-fri", hour=15, minute=15, id="time_exit")
 
-    sched.add_job(
-        time_exit_job,
-        "cron",
-        day_of_week="mon-fri",
-        hour=15, minute=15,
-        id="time_exit",
-    )
-
-    # ---- EOD jobs (Mon–Fri) ----
+    # EOD jobs
     def eod_write():
-        if eod_perf is None:
-            print("[eod] eod_perf module missing", flush=True)
-            return
+        if eod_perf is None: return
         try:
             perf = eod_perf.write_eod(sheet, cfg, cfg.symbol)
             print(f"[eod] performance row written: {perf}", flush=True)
         except Exception as e:
             print(f"❌ Job error [eod_write] {e}", flush=True)
-
-    sched.add_job(
-        eod_write,
-        "cron",
-        day_of_week="mon-fri",
-        hour=15, minute=31,
-        id="eod_write",
-    )
+    sched.add_job(eod_write, "cron", day_of_week="mon-fri", hour=15, minute=31, id="eod_write")
 
     def eod_summary():
-        if eod_perf is None:
-            return
+        if eod_perf is None: return
         try:
-            ws = sheet.ss.worksheet("Performance")
-            rows = ws.get_all_values()
-            perf = None
-            if rows and len(rows) >= 2:
-                last = rows[-1]
-                if last and len(last) >= 10:
-                    today = datetime.now().date().isoformat()
-                    if str(last[0]).strip() == today:
-                        def _f(x):
-                            try: return float(x)
-                            except: return 0.0
-                        perf = {
-                            "trades": _f(last[2]),
-                            "wins": _f(last[3]),
-                            "losses": _f(last[4]),
-                            "win_rate": _f(last[5]),
-                            "avg_pnl": _f(last[6]),
-                            "gross_pnl": _f(last[7]),
-                            "net_pnl": _f(last[8]),
-                            "max_dd": _f(last[9]),
-                        }
-            if perf is None:
-                perf = eod_perf.write_eod(sheet, cfg, cfg.symbol)
-            eod_perf.send_daily_summary(perf, cfg)
+            eod_perf.send_daily_summary(None, cfg)  # module reads latest row
             print("[eod] daily summary sent", flush=True)
         except Exception as e:
             print(f"❌ Job error [eod_summary] {e}", flush=True)
+    sched.add_job(eod_summary, "cron", day_of_week="mon-fri", hour=15, minute=35, id="eod_summary")
 
-    sched.add_job(
-        eod_summary,
-        "cron",
-        day_of_week="mon-fri",
-        hour=15, minute=35,
-        id="eod_summary",
-    )
-
-    # Start
     sched.start()
 
-    # Main loop keepalive
     try:
         while True:
             time.sleep(1)
     except KeyboardInterrupt:
         print("[main] KeyboardInterrupt, exiting...", flush=True)
     finally:
-        try:
-            sched.shutdown(wait=False)
-        except Exception:
-            pass
+        try: sched.shutdown(wait=False)
+        except Exception: pass
 
 if __name__ == "__main__":
     main()
