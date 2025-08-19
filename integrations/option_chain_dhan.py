@@ -1,16 +1,15 @@
-import os, requests, csv, io, re
+import os, requests, re
 from datetime import date
 from tenacity import retry, stop_after_attempt, wait_fixed
 from utils.logger import log
 
+# --- ENV ---
 DHAN_BASE = os.getenv("DHAN_BASE", "https://api.dhan.co").rstrip("/")
-DHAN_UNDERLYING_SCRIP = os.getenv("DHAN_UNDERLYING_SCRIP", "").strip()   # if empty, auto-resolve
-DHAN_UNDERLYING_SEG = os.getenv("DHAN_UNDERLYING_SEG", "IDX_I").strip()  # indices: IDX_I
+DHAN_UNDERLYING_SCRIP = os.getenv("DHAN_UNDERLYING_SCRIP", "").strip()   # optional; if empty we auto-resolve
+DHAN_UNDERLYING_SEG = os.getenv("DHAN_UNDERLYING_SEG", "IDX_I").strip()  # indices: IDX_I (per Annexure)
 DHAN_EXPIRY_ENV = os.getenv("DHAN_EXPIRY", "").strip()                   # optional YYYY-MM-DD
-MASTER_CSV_URL = os.getenv("DHAN_MASTER_CSV",
-                           "https://images.dhan.co/api-data/api-scrip-master-detailed.csv")
 OC_SYMBOL = os.getenv("OC_SYMBOL", "NIFTY").strip().upper()
-MATCH_HINT = os.getenv("DHAN_MATCH_STRING", "").strip()  # optional: e.g., "NIFTY 50" / "NIFTY BANK" / "NIFTY FINANCIAL SERVICES"
+MATCH_HINT = os.getenv("DHAN_MATCH_STRING", "").strip()                  # optional, e.g. "NIFTY 50"
 
 # ---------- HTTP helpers ----------
 def _headers():
@@ -20,8 +19,15 @@ def _headers():
         raise RuntimeError("DHAN credentials missing (DHAN_CLIENT_ID / DHAN_ACCESS_TOKEN)")
     return {"access-token": token, "client-id": cid, "Content-Type": "application/json"}
 
-def _post_json(url: str, json_payload: dict, timeout=12):
-    r = requests.post(url, headers=_headers(), json=json_payload, timeout=timeout)
+def _post_json(url: str, payload: dict, timeout=12):
+    r = requests.post(url, headers=_headers(), json=payload, timeout=timeout)
+    if r.status_code >= 400:
+        log.warning(f"Dhan {r.status_code}: {r.text[:300]} @ {url}")
+    r.raise_for_status()
+    return r.json()
+
+def _get_json(url: str, timeout=12):
+    r = requests.get(url, headers=_headers(), timeout=timeout)
     if r.status_code >= 400:
         log.warning(f"Dhan {r.status_code}: {r.text[:300]} @ {url}")
     r.raise_for_status()
@@ -31,8 +37,7 @@ def _post_json(url: str, json_payload: dict, timeout=12):
 @retry(stop=stop_after_attempt(3), wait=wait_fixed(1))
 def get_expiry_list(underlying_scrip: int, underlying_seg: str) -> list[str]:
     url = f"{DHAN_BASE}/v2/optionchain/expirylist"
-    payload = {"UnderlyingScrip": underlying_scrip, "UnderlyingSeg": underlying_seg}
-    data = _post_json(url, payload)
+    data = _post_json(url, {"UnderlyingScrip": underlying_scrip, "UnderlyingSeg": underlying_seg})
     return (data.get("data") or []) if isinstance(data, dict) else []
 
 def _pick_nearest_expiry(expiries: list[str]) -> str | None:
@@ -45,91 +50,127 @@ def _pick_nearest_expiry(expiries: list[str]) -> str | None:
 @retry(stop=stop_after_attempt(3), wait=wait_fixed(1))
 def get_option_chain_v2(underlying_scrip: int, underlying_seg: str, expiry: str) -> dict:
     url = f"{DHAN_BASE}/v2/optionchain"
-    payload = {"UnderlyingScrip": underlying_scrip, "UnderlyingSeg": underlying_seg, "Expiry": expiry}
-    return _post_json(url, payload)
+    return _post_json(url, {"UnderlyingScrip": underlying_scrip, "UnderlyingSeg": underlying_seg, "Expiry": expiry})
 
-# ---------- Security ID resolver ----------
-def _targets_for_symbol(sym: str) -> list[str]:
-    if MATCH_HINT:
-        return [MATCH_HINT.upper()]
-    s = (sym or "").upper()
-    if s == "NIFTY":
-        return ["NIFTY 50", "NIFTY50", "NIFTY-50"]
-    if s == "BANKNIFTY":
-        return ["NIFTY BANK", "BANK NIFTY", "BANKNIFTY", "NIFTYBANK"]
-    if s == "FINNIFTY":
-        return ["NIFTY FINANCIAL SERVICES", "FINNIFTY", "NIFTY FIN SERVICES"]
-    return [s]
-
-def _norm_text(x: str) -> str:
+# ---------- Security ID resolver via v2 instrument API ----------
+def _norm(x: str) -> str:
     x = (x or "").upper()
     x = re.sub(r"[^A-Z0-9 ]+", " ", x)
     x = re.sub(r"\s+", " ", x).strip()
     return x
 
+def _targets_for_symbol(sym: str) -> list[str]:
+    if MATCH_HINT:
+        return [_norm(MATCH_HINT)]
+    s = (sym or "").upper()
+    if s == "NIFTY":
+        return [_norm("NIFTY 50"), "NIFTY50", "NIFTY-50"]
+    if s == "BANKNIFTY":
+        return [_norm("NIFTY BANK"), "BANK NIFTY", "BANKNIFTY", "NIFTYBANK"]
+    if s == "FINNIFTY":
+        return [_norm("NIFTY FINANCIAL SERVICES"), "FINNIFTY", _norm("NIFTY FIN SERVICES")]
+    return [s]
+
 @retry(stop=stop_after_attempt(3), wait=wait_fixed(1))
-def _fetch_master_csv_text() -> str:
-    r = requests.get(MASTER_CSV_URL, timeout=12)
-    r.raise_for_status()
-    r.encoding = "utf-8"
-    return r.text
+def _fetch_instruments(segment: str) -> list[dict]:
+    """
+    v2 instruments endpoint (segment-wise).
+    Docs: /v2/instruments (Segmentwise List), GET /v2/instrument/{exchangeSegment}
+    """
+    url = f"{DHAN_BASE}/v2/instrument/{segment}"
+    data = _get_json(url)
+    # Expect data to be a list[object]; keep as-is
+    if isinstance(data, dict) and "data" in data:
+        return data["data"] or []
+    if isinstance(data, list):
+        return data
+    return []
 
-def _find_security_id_from_master(sym: str) -> int | None:
-    """
-    Scan Dhan scrip master CSV; be generous with column names & content.
-    We match any row whose concatenated name-like columns contain our target token.
-    Then pick first numeric column that looks like a Security ID.
-    """
-    text = _fetch_master_csv_text()
-    f = io.StringIO(text)
-    reader = csv.reader(f)
-    rows = list(reader)
+def _extract_security_id(row: dict) -> int | None:
+    # Try common keys
+    for key in ["SecurityID", "SecurityId", "security_id", "SECURITY_ID", "SEM_SMST_SECURITY_ID"]:
+        val = row.get(key)
+        if isinstance(val, int):
+            return val
+        if isinstance(val, str) and val.isdigit():
+            return int(val)
+    # sometimes nested under 'instrument' or similar
+    for k, v in row.items():
+        if isinstance(v, dict):
+            sid = _extract_security_id(v)
+            if sid:
+                return sid
+    return None
+
+def _name_blob(row: dict) -> str:
+    # Concatenate a bunch of likely name fields
+    keys = [
+        "DisplayName","DISPLAY_NAME","display_name",
+        "SymbolName","SYMBOL_NAME","symbol_name",
+        "TradingSymbol","TRADING_SYMBOL","trading_symbol",
+        "ScripName","SCRIP_NAME","scrip_name",
+        "Name","NAME","name","Instrument","INSTRUMENT","instrument"
+    ]
+    parts = []
+    for k in keys:
+        v = row.get(k)
+        if isinstance(v, str) and v:
+            parts.append(v)
+    return _norm(" ".join(parts))
+
+def _looks_like_index(row: dict) -> bool:
+    # prefer index instruments
+    for k in ["InstrumentType","INSTRUMENT_TYPE","instrument_type","Instrument","INSTRUMENT","instrument"]:
+        v = row.get(k)
+        if isinstance(v, str) and "INDEX" in v.upper():
+            return True
+    return False  # not strict, just a hint
+
+def _resolve_security_id_via_api(sym: str, segment: str) -> int | None:
+    targets = _targets_for_symbol(sym)
+    rows = _fetch_instruments(segment)
     if not rows:
+        log.warning("Instrument API returned empty list")
         return None
-    headers = rows[0]
-    data_rows = rows[1:]
 
-    # Build header index map (normalized)
-    norm_headers = [ _norm_text(h) for h in headers ]
-    idx_map = { i: norm_headers[i] for i in range(len(norm_headers)) }
+    # Hard match first
+    for row in rows:
+        blob = _name_blob(row)
+        if any(t == blob for t in targets):
+            sid = _extract_security_id(row)
+            if sid:
+                log.info(f"Resolved SecurityID {sid} via exact name match: {blob}")
+                return sid
 
-    # Which columns to concatenate for name search?
-    name_cols_keywords = ["SCRIP", "NAME", "INSTRUMENT", "TRADING", "SYMBOL", "SECURITY", "DESCRIPTION"]
-    name_col_idx = [i for i,h in idx_map.items() if any(k in h for k in name_cols_keywords)]
-    # Candidate ID columns
-    id_cols_keywords = ["SECURITY", "SEC", "ID", "CODE"]
-    id_col_idx = [i for i,h in idx_map.items() if any(k in h for k in id_cols_keywords)]
-
-    targets = [_norm_text(t) for t in _targets_for_symbol(sym)]
-
-    for row in data_rows:
-        # Make row safe length
-        if len(row) < len(headers):
-            row = row + [""]*(len(headers)-len(row))
-        name_blob = _norm_text(" ".join([row[i] for i in name_col_idx]))
-        if any(t in name_blob for t in targets):
-            # soft preference for index-like segments but don't strictly require
-            # (many CSVs have varied segment naming)
-            # Find first numeric candidate in id columns
-            for i in id_col_idx:
-                val = (row[i] or "").strip()
-                if val.isdigit():
-                    sid = int(val)
-                    log.info(f"Resolved SecurityID {sid} for {sym} via master CSV match='{name_blob[:80]}'")
+    # Contains match with index preference
+    best_sid = None
+    for row in rows:
+        blob = _name_blob(row)
+        if any(t in blob for t in targets):
+            sid = _extract_security_id(row)
+            if sid:
+                if _looks_like_index(row):
+                    log.info(f"Resolved SecurityID {sid} via index match: {blob}")
                     return sid
+                best_sid = best_sid or sid
+    if best_sid:
+        log.info(f"Resolved SecurityID {best_sid} via fuzzy name match")
+        return best_sid
     return None
 
 def ensure_inputs() -> tuple[int, str, str | None]:
+    # If provided explicitly, use it
     if DHAN_UNDERLYING_SCRIP.isdigit():
         sid = int(DHAN_UNDERLYING_SCRIP)
         log.info(f"Using SecurityID from env: {sid}")
         return sid, DHAN_UNDERLYING_SEG, (DHAN_EXPIRY_ENV or None)
 
-    sid = _find_security_id_from_master(OC_SYMBOL)
+    # Resolve via v2 instrument API (no CSV dependency)
+    sid = _resolve_security_id_via_api(OC_SYMBOL, DHAN_UNDERLYING_SEG)
     if sid:
         return sid, DHAN_UNDERLYING_SEG, (DHAN_EXPIRY_ENV or None)
 
-    # Last-resort known defaults (try; if wrong, API will 4xx and log URL)
+    # Last-resort known defaults (may vary by feed; override if wrong)
     fallback = {"NIFTY": 13, "BANKNIFTY": 25, "FINNIFTY": 27}.get(OC_SYMBOL)
     if fallback:
         log.warning(f"Auto-resolve failed; falling back to hardcoded ID {fallback} for {OC_SYMBOL}")
