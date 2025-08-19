@@ -294,3 +294,7 @@ def upsert_override(key: str, value: str):
         _DB["Params_Override"] = [[k, v, now_str()] for k, v in m.items()]
         return
     append_row("Params_Override", [key, value, now_str()])
+def get_last_event_rows(n: int = 5):
+    """Return last n rows from Events tab (safe for memory/real)."""
+    rows = get_all_values("Events")
+    return rows[-n:] if rows else []
