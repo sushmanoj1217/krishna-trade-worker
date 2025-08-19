@@ -1,128 +1,103 @@
 # ops/near_alerts.py
-# Sends Telegram alerts when spot is NEAR or CROSSING S/R zones (directional buffer):
-# Supports zone: [S - band, S] ; Cross if spot <= (S - band)
-# Resistances zone: [R, R + band] ; Cross if spot >= (R + band)
-# Includes: market view tag, PCR/VIX, and whether trade taken or skipped + why.
-
 from __future__ import annotations
-import os, time
-from typing import Dict, Any, List, Optional, Tuple
 
+import os
+import time
+from typing import Dict, Tuple
+
+from agents.logger import get_latest_status_map
 from ops.notify import send_telegram
-from agents.signal_generator import (
-    buffer_points, adj_support, adj_resistance,
-    classify_market_view, compute_bias_tag, read_pcr_vix
-)
 
-_STATE = {"last": {}}  # cooldown: key=(symbol, tag, kind) -> ts
+NEAR_ALERT_COOLDOWN_SECS = int(os.getenv("NEAR_ALERT_COOLDOWN_SECS", "120"))
+NEAR_ALERT_DEBUG = os.getenv("NEAR_ALERT_DEBUG", "0") == "1"
 
-def _cooldown_secs() -> int:
-    v = os.getenv("NEAR_ALERT_COOLDOWN_SECS", "").strip()
-    if v.isdigit():
-        return max(30, int(v))
-    return 300  # default 5 min
+# Per-symbol entry band points (fallback to ENTRY_BAND_POINTS)
+ENTRY_BAND_POINTS = float(os.getenv("ENTRY_BAND_POINTS", "12"))
+ENTRY_BAND_POINTS_MAP = os.getenv("ENTRY_BAND_POINTS_MAP", "")  # e.g. "NIFTY=12,BANKNIFTY=30,FINNIFTY=15"
 
-def _debug_on() -> bool:
-    return os.getenv("NEAR_ALERT_DEBUG", "").strip().lower() in ("1","true","on","yes")
+def _band_for(symbol: str) -> float:
+    if ENTRY_BAND_POINTS_MAP:
+        parts = [p.strip() for p in ENTRY_BAND_POINTS_MAP.split(",") if "=" in p]
+        for p in parts:
+            k, v = p.split("=", 1)
+            if k.strip().upper() == symbol.upper():
+                try:
+                    return float(v.strip())
+                except Exception:
+                    pass
+    return ENTRY_BAND_POINTS
 
-def _on_cooldown(symbol: str, tag: str, kind: str) -> bool:
-    key = (symbol, tag, kind)
-    last = _STATE["last"].get(key, 0)
-    return (time.time() - last) < _cooldown_secs()
+# cooldown memory
+_last_alert_at: Dict[str, float] = {}
 
-def _mark_sent(symbol: str, tag: str, kind: str):
-    _STATE["last"][(symbol, tag, kind)] = time.time()
+def _cooldown_ok(key: str) -> bool:
+    now = time.time()
+    last = _last_alert_at.get(key, 0)
+    if now - last >= NEAR_ALERT_COOLDOWN_SECS:
+        _last_alert_at[key] = now
+        return True
+    return False
 
-def _fmt(x: Optional[float]) -> str:
-    try: return f"{float(x):.2f}"
-    except Exception: return str(x)
+def _decorate(msg: str) -> str:
+    ctx = get_latest_status_map()
+    tails = []
+    if ctx.get("PCR"): tails.append(f"PCR {ctx['PCR']}")
+    if ctx.get("VIX"): tails.append(f"VIX {ctx['VIX']}")
+    if tails:
+        return f"{msg} | " + " • ".join(tails)
+    return msg
 
-def _zones(oc: Dict[str,Any]) -> List[Tuple[str,float,float,float,float]]:
+def _fmt(x) -> str:
+    try:
+        return f"{float(x):.2f}"
+    except Exception:
+        return str(x)
+
+def nudge(snapshot: Dict) -> None:
     """
-    Returns per-level tuple:
-      (tag, zone_lo, zone_hi, cross_thr, base_level)
-      - Supports: zone_lo = S - band, zone_hi = S, cross_thr = S - band
-      - Resistances: zone_lo = R, zone_hi = R + band, cross_thr = R + band
+    Called every OC tick, decides NEAR/CROSS alerts for S* / R*.
+    snapshot keys used: symbol, spot, S1*,S2*,R1*,R2*, MV
     """
-    out: List[Tuple[str,float,float,float,float]] = []
-    symbol = (oc.get("symbol") or "NIFTY").upper()
-    band = buffer_points(symbol)
-    s1,s2,r1,r2 = oc.get("s1"), oc.get("s2"), oc.get("r1"), oc.get("r2")
-    def f(x): return None if x is None else float(x)
-
-    if s1 is not None:
-        S = f(s1); Sb = adj_support(S, band)
-        out.append(("S1", float(Sb), float(S), float(Sb), float(S)))
-    if s2 is not None:
-        S = f(s2); Sb = adj_support(S, band)
-        out.append(("S2", float(Sb), float(S), float(Sb), float(S)))
-    if r1 is not None:
-        R = f(r1); Rb = adj_resistance(R, band)
-        out.append(("R1", float(R), float(Rb), float(Rb), float(R)))
-    if r2 is not None:
-        R = f(r2); Rb = adj_resistance(R, band)
-        out.append(("R2", float(R), float(Rb), float(Rb), float(R)))
-    return out
-
-def _why_str(reasons: List[str], dedup_hit: bool, for_tag: Optional[str]) -> str:
-    rs = list(reasons)
-    if dedup_hit and for_tag:
-        rs = ["duplicate level today"]
-    if not rs: return "—"
-    s = ", ".join(rs)
-    return s[:180]
-
-def _send(kind: str, symbol: str, spot, tag: str, zone_lo, zone_hi, cross_thr,
-          mv_tag: str, bias_tag: str, pcr: Optional[float], vix: Optional[float],
-          context: Dict[str,Any]) -> None:
-    if _on_cooldown(symbol, tag, kind):
+    symbol = snapshot.get("symbol", "NIFTY")
+    spot = snapshot.get("spot")
+    mv = snapshot.get("MV", "-")
+    if spot is None:
         return
-    header = f"{kind} ⚠️ {symbol} spot={_fmt(spot)}  Level={tag}"
-    zone = f"[{_fmt(zone_lo)} … {_fmt(zone_hi)}] (trigger={_fmt(cross_thr)})"
-    pcrline = f"PCR={_fmt(pcr) if pcr is not None else 'n/a'}  VIX={_fmt(vix) if vix is not None else 'n/a'}"
-    taken = bool(context.get("trade_taken", False))
-    trade_tag = context.get("trade_tag")
-    trade_side = context.get("trade_side","")
-    dedup_hit = bool(context.get("dedup_hit", False))
-    reasons = context.get("reasons", [])
 
-    if taken and trade_tag == tag:
-        action = f"Action: TAKEN ✅ {trade_side}"
-    else:
-        action = f"Action: NOT TAKEN ❌ ({_why_str(reasons, dedup_hit, tag)})"
+    band = _band_for(symbol)
 
-    msg = (
-        f"{header}\n"
-        f"Zone: {zone}\n"
-        f"View: {mv_tag}; {bias_tag}\n"
-        f"{pcrline}\n"
-        f"{action}"
-    )
-    if send_telegram(msg):
-        _mark_sent(symbol, tag, kind)
+    levels = []
+    if snapshot.get("S1*") is not None: levels.append(("S1*", float(snapshot["S1*"])))
+    if snapshot.get("S2*") is not None: levels.append(("S2*", float(snapshot["S2*"])))
+    if snapshot.get("R1*") is not None: levels.append(("R1*", float(snapshot["R1*"])))
+    if snapshot.get("R2*") is not None: levels.append(("R2*", float(snapshot["R2*"])))
 
-def check_and_alert(oc: Dict[str, Any], context: Dict[str, Any]) -> None:
-    symbol = (oc.get("symbol") or "NIFTY").upper()
-    spot = oc.get("spot")
-    if spot is None: return
-    try: spot = float(spot)
-    except Exception: return
+    for tag, trig in levels:
+        # Define zone & cross by side semantics
+        if tag.startswith("S"):  # CE entries at supports
+            zone_low, zone_high = trig, trig + band
+            near = (spot >= zone_low) and (spot <= zone_high)
+            cross = spot <= trig
+        else:  # R* for PE
+            zone_low, zone_high = trig - band, trig
+            near = (spot >= zone_low) and (spot <= zone_high)
+            cross = spot >= trig
 
-    mv, mv_tag = classify_market_view(oc)
-    bias = compute_bias_tag()
-    pcr, vix = read_pcr_vix()
+        # NEAR
+        key_near = f"NEAR:{symbol}:{tag}"
+        if near and _cooldown_ok(key_near):
+            delta = spot - trig
+            msg = f"🟨 NEAR {symbol} {tag} | spot { _fmt(spot) } vs trigger { _fmt(trig) } (Δ { _fmt(delta) }) • MV {mv}"
+            send_telegram(_decorate(msg))
 
-    for tag, zlo, zhi, cross_thr, base in _zones(oc):
-        is_near = (zlo <= spot <= zhi)
-        is_cross = (spot <= cross_thr) if tag.startswith("S") else (spot >= cross_thr)
+        # CROSS
+        key_cross = f"CROSS:{symbol}:{tag}"
+        if cross and _cooldown_ok(key_cross):
+            delta = spot - trig
+            msg = f"🟩 CROSS {symbol} {tag} | spot { _fmt(spot) } vs trigger { _fmt(trig) } (Δ { _fmt(delta) }) • MV {mv}"
+            send_telegram(_decorate(msg))
 
-        if _debug_on():
-            print(f"[near_debug] {symbol} {tag}: spot={_fmt(spot)} zone=[{_fmt(zlo)},{_fmt(zhi)}] cross_thr={_fmt(cross_thr)} near={is_near} cross={is_cross}", flush=True)
-
-        # NEAR alert
-        if is_near:
-            _send("NEAR", symbol, spot, tag, zlo, zhi, cross_thr, mv_tag, bias, pcr, vix, context)
-
-        # CROSS alert (separate cooldown key)
-        if is_cross:
-            _send("CROSS", symbol, spot, tag, zlo, zhi, cross_thr, mv_tag, bias, pcr, vix, context)
+        if NEAR_ALERT_DEBUG:
+            # helpful debug without cooldown
+            msg = f"🔎 DEBUG {symbol} {tag} zone[{_fmt(zone_low)}..{_fmt(zone_high)}] spot={_fmt(spot)} cross={cross}"
+            send_telegram(msg)
