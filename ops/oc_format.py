@@ -1,34 +1,39 @@
 # ops/oc_format.py
 from __future__ import annotations
-from typing import Dict, Any
-from agents.signal_generator import buffer_points, adj_support, adj_resistance, classify_market_view, compute_bias_tag, read_pcr_vix
 
-def format_oc_reply(oc: Dict[str,Any]) -> str:
-    sym = (oc.get("symbol") or "NIFTY").upper()
-    band = buffer_points(sym)
-    s1,s2,r1,r2 = oc.get("s1"), oc.get("s2"), oc.get("r1"), oc.get("r2")
-    mv, mv_tag = classify_market_view(oc)
-    bias = compute_bias_tag()
-    pcr, vix = read_pcr_vix()
+from agents.logger import get_latest_status_map
 
-    def f(x): 
-        try: return f"{float(x):.2f}"
-        except: return str(x)
+def _fmt(v, digits=2):
+    try:
+        if v is None or v == "":
+            return "-"
+        return f"{float(v):.{digits}f}"
+    except Exception:
+        return str(v)
 
-    lines = [ "OC updated ✅",
-              f"spot={f(oc.get('spot'))}  S1={f(s1)}  S2={f(s2)}",
-              f"R1={f(r1)}  R2={f(r2)}",
-              f"expiry={oc.get('expiry','')}" ]
+def format_oc_reply(snapshot: dict) -> str:
+    """
+    snapshot expects:
+      symbol, spot, S1,S2,R1,R2, S1*,S2*,R1*,R2*, MV
+    PCR/VIX are read from Status sheet (latest) if not provided.
+    """
+    ctx = get_latest_status_map()
+    pcr = snapshot.get("PCR") or ctx.get("PCR", "-")
+    vix = snapshot.get("VIX") or ctx.get("VIX", "-")
 
-    # Buffered (directional) trigger levels:
-    buf = []
-    if s1 is not None: buf.append(f"S1*={f(adj_support(s1, band))}")
-    if s2 is not None: buf.append(f"S2*={f(adj_support(s2, band))}")
-    if r1 is not None: buf.append(f"R1*={f(adj_resistance(r1, band))}")
-    if r2 is not None: buf.append(f"R2*={f(adj_resistance(r2, band))}")
-    if buf:
-        lines.append(f"band={band}  " + "  ".join(buf))
+    sym = snapshot.get("symbol", "NIFTY")
+    spot = _fmt(snapshot.get("spot"))
 
-    lines.append(f"view: {mv_tag}; {bias}")
-    lines.append(f"PCR={pcr if pcr is not None else 'n/a'}  VIX={vix if vix is not None else 'n/a'}")
+    s1 = _fmt(snapshot.get("S1")); s1s = _fmt(snapshot.get("S1*"))
+    s2 = _fmt(snapshot.get("S2")); s2s = _fmt(snapshot.get("S2*"))
+    r1 = _fmt(snapshot.get("R1")); r1s = _fmt(snapshot.get("R1*"))
+    r2 = _fmt(snapshot.get("R2")); r2s = _fmt(snapshot.get("R2*"))
+    mv = snapshot.get("MV", "-")
+
+    lines = [
+        f"📈 {sym} @ {spot} | MV: {mv}",
+        f"S: S1 {s1} (S1* {s1s}) • S2 {s2} (S2* {s2s})",
+        f"R: R1 {r1} (R1* {r1s}) • R2 {r2} (R2* {r2s})",
+        f"Context → PCR: {pcr} • VIX: {vix}",
+    ]
     return "\n".join(lines)
