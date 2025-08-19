@@ -1,12 +1,13 @@
 # analytics/oc_refresh.py
 from __future__ import annotations
-import os
+import os, time
 from utils.logger import log
 from utils.params import Params
 from utils.cache import OCSnapshot, set_snapshot, get_snapshot
 from integrations import sheets as sh
 from integrations.option_chain_dhan import fetch_levels
 from integrations.news_feed import hold_active
+from utils import telemetry
 
 SYMBOL = os.getenv("OC_SYMBOL", "NIFTY").upper()
 MODE = os.getenv("OC_MODE", "dhan").lower()
@@ -67,7 +68,6 @@ def _oc_pattern(cur_oi: dict[float, dict], prev_oi: dict[float, dict] | None,
                 "basis_ce": "prev OI unavailable", "basis_pe": "prev OI unavailable"}
     strikes = sorted(cur_oi.keys())
     w = max(0, p.oi_cluster_strikes())
-    # choose strike near triggers
     def pick(*levels):
         lev = min([x for x in levels if x is not None], default=None)
         return _nearest_strike(strikes, lev) or (strikes[len(strikes)//2] if strikes else None)
@@ -108,6 +108,7 @@ def refresh_once() -> OCSnapshot | None:
             row = sh.last_row("OC_Live")
             if not row:
                 log.warning("OC_Live empty in sheet")
+                telemetry.inc("oc_fetch_fail")
                 return None
             data = {
                 "spot": float(row.get("spot") or 0),
@@ -118,7 +119,7 @@ def refresh_once() -> OCSnapshot | None:
                 "pcr": float(row.get("pcr") or 0),
                 "max_pain": float(row.get("max_pain") or 0),
                 "expiry": row.get("expiry") or "",
-                "oc_oi": {}, "strike_step": None,
+                "oc_oi": {}, "oc_px": {}, "strike_step": None,
             }
 
         b = p.buffer_points()
@@ -137,7 +138,9 @@ def refresh_once() -> OCSnapshot | None:
         prev_oi = (prev.extras.get("oc_oi") if (prev and prev.extras) else None)
         ocp = _oc_pattern(cur_oi, prev_oi, s1s, s2s, r1s, r2s, p)
 
-        # bias tag
+        # premiums map for CE/PE
+        oc_px = data.get("oc_px") or {}
+
         bias = None
         if mp is not None and mpd is not None:
             if spot >= mp + p.mp_support_dist(): bias = "mv_bull_mp"
@@ -149,24 +152,26 @@ def refresh_once() -> OCSnapshot | None:
             max_pain=mp, max_pain_dist=mpd, bias_tag=bias, stale=False,
             extras={
                 "s1s": s1s, "s2s": s2s, "r1s": r1s, "r2s": r2s,
-                "buffer": b, "mv": mv, "ocp": ocp, "oc_oi": cur_oi,
+                "buffer": b, "mv": mv, "ocp": ocp,
+                "oc_oi": cur_oi, "oc_px": oc_px,
                 "strike_step": data.get("strike_step"),
             },
         )
         set_snapshot(snap)
 
-        # Write OC_Live row (SoR)
+        # OC_Live write
         pcr_bucket = "bull" if (data.get("pcr") and data.get("pcr") >= p.pcr_bull_high()) else \
                      ("bear" if (data.get("pcr") is not None and data.get("pcr") <= p.pcr_bear_low()) else "")
         sh.append_row("OC_Live", [
             sh.now_str(), spot, data.get("s1"), data.get("s2"), data.get("r1"), data.get("r2"),
             data.get("expiry"), "", None, data.get("pcr"), pcr_bucket, mp, mpd, bias, False
         ])
+        telemetry.mark("oc_ok_at")
         return snap
 
     except Exception as e:
         log.error(f"OC refresh failed: {e}")
-        # Mark stale in OC_Live
+        telemetry.inc("oc_fetch_fail")
         try:
             sh.append_row("OC_Live", [sh.now_str(), None, None, None, None, None, "", "", None, None, "", None, None, "stale", True])
         except Exception:
