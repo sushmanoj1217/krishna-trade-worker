@@ -1,6 +1,6 @@
 # krishna_main.py
 from __future__ import annotations
-import os, asyncio, signal
+import os, asyncio, signal, time
 from datetime import datetime, time as dtime
 from zoneinfo import ZoneInfo
 
@@ -12,6 +12,7 @@ from agents import signal_generator
 from agents.trade_loop import trade_tick, force_flat_all
 from agents.tp_sl_watcher import trail_tick
 from utils.state import is_oc_auto
+from utils import telemetry
 
 IST = ZoneInfo("Asia/Kolkata")
 OC_REFRESH_SECS = int(os.getenv("OC_REFRESH_SECS", "10"))
@@ -30,6 +31,7 @@ async def day_loop():
     log.info("Day loop started")
     beats = 0
     while True:
+        telemetry.mark("loop_beat")
         nowt = datetime.now(tz=IST).time()
         if nowt >= MARKET_CUTOFF:
             try:
@@ -73,11 +75,8 @@ async def main():
 
     app = await init_bot()
     if app:
-        # 1) init app
         await app.initialize()
-        # 2) start bot
         await app.start()
-        # 3) VERY IMPORTANT: start polling updates (else no replies)
         if app.updater is not None:
             await app.updater.start_polling()
         log.info("Telegram bot started")
@@ -95,7 +94,6 @@ async def main():
     await stop_event.wait()
     loop_task.cancel()
     if app:
-        # stop polling first
         if app.updater is not None:
             await app.updater.stop()
         await app.stop()
