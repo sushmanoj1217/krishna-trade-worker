@@ -234,3 +234,81 @@ def get_sheet_values(tab: str) -> List[List[Any]]:
 
 def append_status(event: str, detail: str = ""):
     write_status(event, detail)
+# -------------------- EXTRA HELPERS (compat with callers) --------------------
+
+def _rows_as_dicts(tab: str):
+    """Return rows of a tab as list of dicts using header row."""
+    rows = get_all_values(tab)
+    if not rows:
+        return []
+    header = [h.strip().lower() for h in rows[0]]
+    out = []
+    for r in rows[1:]:
+        d = {}
+        for i, v in enumerate(r):
+            key = header[i] if i < len(header) else f"col{i+1}"
+            d[key] = v
+        out.append(d)
+    return out
+
+def _date_yyyy_mm_dd(s: str) -> str:
+    s = (s or "").strip()
+    # Accept "YYYY-MM-DD HH:MM:SS" or already "YYYY-MM-DD"
+    return s[:10] if len(s) >= 10 else s
+
+def get_open_trades():
+    """
+    Return a list[dict] of open trades from Trades tab.
+    Open = exit_time empty (or result empty).
+    Keys use lowercased header names: trade_id, signal_id, symbol, side, buy_ltp,
+    exit_ltp, sl, tp, basis, buy_time, exit_time, result, pnl, dedupe_hash ...
+    """
+    rows = _rows_as_dicts("Trades")
+    out = []
+    for d in rows:
+        exit_time = d.get("exit_time", "").strip()
+        result = d.get("result", "").strip()
+        if exit_time == "" or result == "":
+            out.append(d)
+    return out
+
+def get_today_signal_dedupes(tz="Asia/Kolkata"):
+    """
+    Return a set of dedupe_hash values for today's Signals (fallback to Trades).
+    """
+    try:
+        from datetime import datetime
+        from zoneinfo import ZoneInfo
+        today = datetime.now(ZoneInfo(tz)).strftime("%Y-%m-%d")
+    except Exception:
+        from datetime import datetime, timezone
+        today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+
+    # Prefer Signals tab if it has 'dedupe_hash'
+    sigs = _rows_as_dicts("Signals")
+    has_dedupe = any("dedupe_hash" in d for d in sigs)
+    dest = set()
+    if has_dedupe:
+        for d in sigs:
+            ts = _date_yyyy_mm_dd(d.get("ts", ""))
+            if ts == today:
+                dh = d.get("dedupe_hash", "").strip()
+                if dh:
+                    dest.add(dh)
+        if dest:
+            return dest
+
+    # Fallback: use Trades tab (may also contain dedupe_hash)
+    trades = _rows_as_dicts("Trades")
+    for d in trades:
+        ts = _date_yyyy_mm_dd(d.get("buy_time", "")) or _date_yyyy_mm_dd(d.get("ts", ""))
+        if ts == today:
+            dh = d.get("dedupe_hash", "").strip()
+            if dh:
+                dest.add(dh)
+    return dest
+
+# Back-compat names some callers might expect
+def get_today_dedupe_hashes():
+    return get_today_signal_dedupes()
+
