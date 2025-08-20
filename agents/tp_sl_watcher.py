@@ -13,16 +13,13 @@ except Exception:
     def get_snapshot():
         return None
 
-# Sheets IO (we'll use read + targeted update by key)
+# Sheets IO (read open trades + targeted update by row)
 try:
     from integrations import sheets as sh
 except Exception:
     class _S:
         def get_all_values(self, *a, **k): return []
         def update_row(self, *a, **k): pass
-        def now_str(self): 
-            import datetime as _dt
-            return _dt.datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
         def get_open_trades(self): return []
     sh = _S()  # type: ignore
 
@@ -31,7 +28,7 @@ IST = "Asia/Kolkata"
 QTY_PER_TRADE = int(os.getenv("QTY_PER_TRADE", "1"))
 AUTO_FLAT_HHMM = os.getenv("AUTO_FLAT_HHMM", "15:15")  # "HH:MM" IST
 
-# Trailing disabled until live LTP is wired
+# Trailing disabled until live option LTP feed is wired
 ENABLE_TRAIL = False
 
 
@@ -196,9 +193,22 @@ def check_trades_once():
         try:
             trade_id = t.get("trade_id") or ""
             side = str(t.get("side", "")).upper()
-            buy_ltp = float(t.get("buy_ltp", 0.0) or 0.0)
-            sl = float(t.get("sl", 0.0) or 0.0)
-            tp = float(t.get("tp", 0.0) or 0.0)
+            # Some sheets rows might miss fields — be defensive:
+            buy_ltp = 0.0
+            try:
+                buy_ltp = float(t.get("buy_ltp", 0.0) or 0.0)
+            except Exception:
+                buy_ltp = 0.0
+            sl = 0.0
+            try:
+                sl = float(t.get("sl", 0.0) or 0.0)
+            except Exception:
+                sl = 0.0
+            tp = 0.0
+            try:
+                tp = float(t.get("tp", 0.0) or 0.0)
+            except Exception:
+                tp = 0.0
 
             # 1) Time exit
             if is_after_hhmm_ist(AUTO_FLAT_HHMM):
@@ -215,13 +225,21 @@ def check_trades_once():
                 # TODO: Optional flip: open reverse direction entry here (paper)
                 continue
 
-            # 3) Trailing 1:2 (disabled) — placeholder logging
+            # 3) Trailing 1:2 (disabled) — placeholder
             if ENABLE_TRAIL and buy_ltp > 0 and sl > 0 and tp > 0:
                 # require live option LTP feed to compute in-flight trail
                 pass
 
         except Exception as e:
             log.error(f"tp/sl watcher err for trade {t.get('trade_id')}: {e}")
+
+
+# ====== Backward-compat API (krishna_main.py expects trail_tick) ======
+def trail_tick():
+    """
+    Backward-compatible wrapper so old imports keep working.
+    """
+    check_trades_once()
 
 
 # ====== Public loop ======
