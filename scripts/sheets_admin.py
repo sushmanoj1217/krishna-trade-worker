@@ -6,7 +6,7 @@ import sys
 import time
 import argparse
 from typing import List, Any, Optional, Dict, Tuple
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 # We reuse the project's Sheets wrapper so auth/rate-limits are consistent
 try:
@@ -101,7 +101,7 @@ def _now_ist_str() -> str:
         from zoneinfo import ZoneInfo
         return datetime.now(ZoneInfo("Asia/Kolkata")).strftime("%Y-%m-%d %H:%M:%S")
     except Exception:
-        return datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+        return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
 
 def _env_bool(name: str, default: bool = False) -> bool:
     v = os.getenv(name)
@@ -118,11 +118,40 @@ def _env_int(name: str, default: Optional[int]) -> Optional[int]:
     except Exception:
         return default
 
-def _parse_ts(s: str) -> Optional[datetime]:
+def _parse_ts_aware_utc(s: str) -> Optional[datetime]:
+    """
+    Parse a timestamp string from Sheets and return a **timezone-aware UTC** datetime.
+    Rules:
+      - If string has offset or 'Z', use it and convert to UTC.
+      - If naive like 'YYYY-MM-DD HH:MM:SS', assume IST and convert to UTC.
+      - If parse fails, return None.
+    """
     if not s:
         return None
-    s = s.strip()
-    # Common formats
+    s = str(s).strip()
+    if not s:
+        return None
+
+    # ISO Z normalization
+    si = s.replace("Z", "+00:00")
+
+    # First try fromisoformat (handles 'YYYY-MM-DDTHH:MM:SS±HH:MM')
+    try:
+        dt = datetime.fromisoformat(si)
+        if dt.tzinfo is None:
+            # Treat as IST
+            try:
+                from zoneinfo import ZoneInfo
+                dt = dt.replace(tzinfo=ZoneInfo("Asia/Kolkata"))
+            except Exception:
+                # Fallback to fixed offset +05:30
+                ist = timezone(timedelta(hours=5, minutes=30))
+                dt = dt.replace(tzinfo=ist)
+        return dt.astimezone(timezone.utc)
+    except Exception:
+        pass
+
+    # Try common formats (naive) => assume IST
     fmts = [
         "%Y-%m-%d %H:%M:%S",
         "%Y-%m-%d",
@@ -135,14 +164,18 @@ def _parse_ts(s: str) -> Optional[datetime]:
     ]
     for f in fmts:
         try:
-            return datetime.strptime(s, f)
+            dt = datetime.strptime(s, f)
+            try:
+                from zoneinfo import ZoneInfo
+                dt = dt.replace(tzinfo=ZoneInfo("Asia/Kolkata"))
+            except Exception:
+                ist = timezone(timedelta(hours=5, minutes=30))
+                dt = dt.replace(tzinfo=ist)
+            return dt.astimezone(timezone.utc)
         except Exception:
             continue
-    # ISO-ish fallback
-    try:
-        return datetime.fromisoformat(s.replace("Z", ""))
-    except Exception:
-        return None
+
+    return None
 
 def _get_retention_days(tab: str) -> Optional[int]:
     if tab not in RET_ENV_KEYS:
@@ -192,21 +225,27 @@ def _timestamp_col_index(tab: str, header: List[str]) -> int:
             return i
     return 0  # fallback
 
-def _split_rows_by_cutoff(rows: List[List[Any]], col_idx: int, cutoff: datetime) -> Tuple[List[List[Any]], List[List[Any]]]:
+def _split_rows_by_cutoff(rows: List[List[Any]], col_idx: int, cutoff_utc: datetime) -> Tuple[List[List[Any]], List[List[Any]]]:
     """
     Returns (older_rows, newer_rows) excluding header.
+    cutoff_utc must be timezone-aware UTC. Row timestamps are normalized to UTC too.
     """
     older, newer = [], []
     for r in rows[1:]:
         ts = r[col_idx] if col_idx < len(r) else ""
-        dt = _parse_ts(str(ts))
-        if dt and dt < cutoff:
+        dt_utc = _parse_ts_aware_utc(str(ts))
+        if dt_utc is None:
+            # If timestamp unparsable, keep it (treat as newer)
+            newer.append(r)
+            continue
+        if dt_utc < cutoff_utc:
             older.append(r)
         else:
             newer.append(r)
     return older, newer
 
 def _ensure_archive_ws(arch_id: str, tab: str, header: List[str]):
+    # Kept for compatibility; not used when direct-delete path is preferred
     gc = sh.get_client()
     if not gc:
         return None
@@ -215,9 +254,7 @@ def _ensure_archive_ws(arch_id: str, tab: str, header: List[str]):
         ws = arch.worksheet(tab)
     except Exception:
         ws = arch.add_worksheet(title=tab, rows=200, cols=max(26, len(header)))
-        # put header
         ws.update(f"A1:{_col_letters(len(header))}1", [header])
-    # ensure header present
     vals = ws.get_all_values()
     if not vals:
         ws.update(f"A1:{_col_letters(len(header))}1", [header])
@@ -237,7 +274,6 @@ def _append_rows_ws(ws, header_len: int, rows: List[List[Any]]):
     """
     if not rows:
         return
-    # find next row
     vals = ws.get_all_values()
     start_idx = (len(vals) + 1) if vals else 1
     rng = f"A{start_idx}:{_col_letters(max(header_len, max(len(r) for r in rows)))}{start_idx + len(rows) - 1}"
@@ -286,18 +322,24 @@ def cmd_archive(args):
     total_moved = 0
     total_deleted = 0
 
+    # Timezone-aware cutoff in UTC
+    cutoff_utc = datetime.now(timezone.utc) - timedelta(days=0)  # initialize
+    # will recompute per-tab with configured days
     for tab, (env_key, default_days) in RET_ENV_KEYS.items():
         days = _get_retention_days(tab)
         if days is None:
             continue
+
+        # Recompute cutoff per-tab
+        cutoff_utc = datetime.now(timezone.utc) - timedelta(days=days)
+
         rows = sh.get_all_values(tab)
         if not rows:
             continue
         header = rows[0]
         col_idx = _timestamp_col_index(tab, header)
-        cutoff = datetime.utcnow() - timedelta(days=days)
 
-        older, newer = _split_rows_by_cutoff(rows, col_idx, cutoff)
+        older, newer = _split_rows_by_cutoff(rows, col_idx, cutoff_utc)
         if not older:
             _log(f"  {tab}: nothing to prune (keep ≥ {days}d).")
             continue
@@ -306,7 +348,7 @@ def cmd_archive(args):
         deleted = 0
 
         if dry:
-            _log(f"  {tab}: would move/delete {len(older)} rows older than {cutoff.date()} (keep ≥ {days}d)")
+            _log(f"  {tab}: would move/delete {len(older)} rows older than {cutoff_utc.date()} (keep ≥ {days}d)")
         else:
             if archive_enabled and arch_id:
                 try:
