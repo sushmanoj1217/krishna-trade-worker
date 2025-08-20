@@ -31,11 +31,9 @@ except Exception:
     _OC_AUTO = True
     _APPROVALS = False
     def is_oc_auto(): return _OC_AUTO
-    def set_oc_auto(v: bool):
-        globals()["_OC_AUTO"] = bool(v)
+    def set_oc_auto(v: bool): globals()["_OC_AUTO"] = bool(v)
     def approvals_required(): return _APPROVALS
-    def set_approvals_required(v: bool):
-        globals()["_APPROVALS"] = bool(v)
+    def set_approvals_required(v: bool): globals()["_APPROVALS"] = bool(v)
 
 # OC snapshot cache & refresher (safe fallbacks)
 try:
@@ -61,6 +59,7 @@ except Exception:
         def write_status(self, *a, **k): pass
         def write_signal_row(self, *a, **k): pass
         def write_trade_row(self, *a, **k): pass
+        def get_last_signal_dict(self): return {}
     sh = _S()  # type: ignore
 
 # telemetry (optional)
@@ -106,6 +105,8 @@ async def _guard(update: Update) -> bool:
     return True
 
 def _fmt_num(x) -> str:
+    if x is None or str(x).strip().lower() == "none":
+        return "—"
     try:
         return f"{float(x):.2f}"
     except Exception:
@@ -130,12 +131,49 @@ def _rows_as_dicts(rows: List[List[Any]]) -> List[Dict[str, Any]]:
     return out
 
 
-# ========= latest signal fetch (for full conditions) =========
+# ========= latest signal fetch (memory-first) =========
 def _latest_signal_dict() -> Dict[str, Any]:
     """
-    Read last row from Sheets→Signals and normalize keys we need.
-    Returns {} if sheet not available/empty.
+    Prefer in-memory captured signal (fast, no Sheets needed).
+    Fall back to Sheets→Signals last row if available.
     """
+    # 1) memory-first
+    try:
+        mem = {}
+        if hasattr(sh, "get_last_signal_dict"):
+            mem = sh.get_last_signal_dict() or {}
+        if mem:
+            def _tb(x):
+                s = str(x).strip().lower()
+                if s in ("1","true","yes","y","✅","ok"): return True
+                if s in ("0","false","no","n","❌"): return False
+                return None
+            mem_norm = {
+                "signal_id": mem.get("signal_id",""),
+                "ts": mem.get("ts",""),
+                "side": str(mem.get("side","")).upper(),
+                "trigger": mem.get("trigger",""),
+                "near_cross": mem.get("near/cross","") or mem.get("near_cross",""),
+                "eligible": _tb(mem.get("eligible","")),
+                "eligible_reason": mem.get("reason","") or mem.get("notes",""),
+                "c1": _tb(mem.get("c1","")), "c2": _tb(mem.get("c2","")),
+                "c3": _tb(mem.get("c3","")), "c4": _tb(mem.get("c4","")),
+                "c5": _tb(mem.get("c5","")), "c6": _tb(mem.get("c6","")),
+                "mv_pcr_ok": _tb(mem.get("mv_pcr_ok","")),
+                "mv_mp_ok": _tb(mem.get("mv_mp_ok","")),
+                "mv_basis": mem.get("mv_basis",""),
+                "oc_bull_normal": _tb(mem.get("oc_bull_normal","")),
+                "oc_bull_shortcover": _tb(mem.get("oc_bull_shortcover","")),
+                "oc_bear_normal": _tb(mem.get("oc_bear_normal","")),
+                "oc_bear_crash": _tb(mem.get("oc_bear_crash","")),
+                "oc_pattern_basis": mem.get("oc_pattern_basis",""),
+                "notes": mem.get("notes",""),
+            }
+            return mem_norm
+    except Exception as e:
+        log.warning(f"latest_signal memory read failed: {e}")
+
+    # 2) fallback: read from Sheets if available
     try:
         rows = sh.get_all_values("Signals")
     except Exception as e:
@@ -144,26 +182,31 @@ def _latest_signal_dict() -> Dict[str, Any]:
     if not rows or len(rows) < 2:
         return {}
 
-    d = _rows_as_dicts(rows)[-1]  # last row
-    # Normalize booleans & fields we use in rendering
+    d = _rows_as_dicts(rows)[-1]
+    def _tb(x):
+        s = str(x).strip().lower()
+        if s in ("1","true","yes","y","✅","ok"): return True
+        if s in ("0","false","no","n","❌"): return False
+        return None
+
     norm = {
         "signal_id": d.get("signal_id",""),
         "ts": d.get("ts",""),
         "side": str(d.get("side","")).upper(),
         "trigger": d.get("trigger",""),
         "near_cross": d.get("near/cross","") or d.get("near_cross",""),
-        "eligible": _to_bool(d.get("eligible","")),
+        "eligible": _tb(d.get("eligible","")),
         "eligible_reason": d.get("reason","") or d.get("notes",""),
-        "c1": _to_bool(d.get("c1","")), "c2": _to_bool(d.get("c2","")),
-        "c3": _to_bool(d.get("c3","")), "c4": _to_bool(d.get("c4","")),
-        "c5": _to_bool(d.get("c5","")), "c6": _to_bool(d.get("c6","")),
-        "mv_pcr_ok": _to_bool(d.get("mv_pcr_ok","")),
-        "mv_mp_ok": _to_bool(d.get("mv_mp_ok","")),
+        "c1": _tb(d.get("c1","")), "c2": _tb(d.get("c2","")),
+        "c3": _tb(d.get("c3","")), "c4": _tb(d.get("c4","")),
+        "c5": _tb(d.get("c5","")), "c6": _tb(d.get("c6","")),
+        "mv_pcr_ok": _tb(d.get("mv_pcr_ok","")),
+        "mv_mp_ok": _tb(d.get("mv_mp_ok","")),
         "mv_basis": d.get("mv_basis",""),
-        "oc_bull_normal": _to_bool(d.get("oc_bull_normal","")),
-        "oc_bull_shortcover": _to_bool(d.get("oc_bull_shortcover","")),
-        "oc_bear_normal": _to_bool(d.get("oc_bear_normal","")),
-        "oc_bear_crash": _to_bool(d.get("oc_bear_crash","")),
+        "oc_bull_normal": _tb(d.get("oc_bull_normal","")),
+        "oc_bull_shortcover": _tb(d.get("oc_bull_shortcover","")),
+        "oc_bear_normal": _tb(d.get("oc_bear_normal","")),
+        "oc_bear_crash": _tb(d.get("oc_bear_crash","")),
         "oc_pattern_basis": d.get("oc_pattern_basis",""),
         "notes": d.get("notes",""),
     }
@@ -208,11 +251,10 @@ def _render_oc_now(snap, sig: Dict[str,Any]) -> str:
         f"Triggers → S1* {shifter(s1,-1)} | S2* {shifter(s2,-1)} | R1* {shifter(r1,+1)} | R2* {shifter(r2,+1)}"
     )
 
-    # Pull latest signal fields (if any)
+    # Six-checks, Trigger, Patterns, MV — from latest signal
     def flag(x: Optional[bool]) -> str:
         return "✅" if x is True else ("❌" if x is False else "—")
 
-    # Six-checks + reasons
     c_line = f"*6-Checks* C1 {flag(sig.get('c1'))} · C2 {flag(sig.get('c2'))} · C3 {flag(sig.get('c3'))} · C4 {flag(sig.get('c4'))} · C5 {flag(sig.get('c5'))} · C6 {flag(sig.get('c6'))}"
     trig_line = ""
     if sig.get("trigger") or sig.get("near_cross"):
@@ -231,9 +273,7 @@ def _render_oc_now(snap, sig: Dict[str,Any]) -> str:
     return "\n".join([p for p in parts if p])
 
 def _best_pattern(sig: Dict[str,Any]) -> str:
-    # prefer explicit basis
     if sig.get("oc_pattern_basis"): return sig["oc_pattern_basis"]
-    # otherwise infer strongest true flag
     if sig.get("oc_bull_shortcover"): return "bull_shortcover"
     if sig.get("oc_bull_normal"): return "bull_normal"
     if sig.get("oc_bear_crash"): return "bear_crash"
@@ -245,7 +285,7 @@ def _mv_summary(sig: Dict[str,Any], pcr, mp, mp_dist) -> str:
     mp_ok  = sig.get("mv_mp_ok")
     basis  = sig.get("mv_basis","")
     parts = []
-    parts.append(f"PCR {pcr} → {('✅' if pcr_ok else '❌' if pcr_ok is False else '—')}")
+    parts.append(f"PCR {_fmt_num(pcr)} → {('✅' if pcr_ok else '❌' if pcr_ok is False else '—')}")
     parts.append(f"MPΔ {_fmt_num(mp_dist)} → {('✅' if mp_ok else '❌' if mp_ok is False else '—')}")
     if basis: parts.append(f"| {basis}")
     return " ".join(parts)
@@ -289,10 +329,10 @@ async def oc_now_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             except Exception as e:
                 log.warning(f"/oc_now refresh_once failed: {e}")
 
-        # 2) latest signal row (for conditions)
+        # 2) latest signal (memory-first → sheets fallback)
         sig = _latest_signal_dict()
 
-        # 3) if nothing at all, explain gracefully
+        # 3) nothing at all?
         if not snap and not sig:
             await update.message.reply_text(
                 "OC snapshot unavailable (rate-limit/first snapshot). 20–30s बाद फिर से /oc_now भेजें."
