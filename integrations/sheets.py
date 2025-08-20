@@ -57,6 +57,7 @@ def _sleep_until_gap():
 
 def _retryable(fn, *args, **kwargs):
     """429/5xx-safe wrapper with exponential backoff."""
+    global _sheet_full  # declare at function start
     n = 0
     while True:
         _sleep_until_gap()
@@ -72,7 +73,6 @@ def _retryable(fn, *args, **kwargs):
 
             # Hard stop if workbook exceeded cell limit
             if "increase the number of cells" in text:
-                global _sheet_full
                 _sheet_full = True
                 raise
 
@@ -189,6 +189,7 @@ def get_all_values(tab: str) -> List[List[Any]]:
 
 
 def append_row(tab: str, row: List[Any]):
+    global _sheet_full  # declare at function start
     if _sheet_full:
         # Workbook already hit 10M cells; skip to avoid hard crash loops
         return
@@ -200,12 +201,12 @@ def append_row(tab: str, row: List[Any]):
     except APIError as e:
         # If workbook cell cap hit, trip the flag so future writes no-op
         if "increase the number of cells" in str(e):
-            global _sheet_full
             _sheet_full = True
         # swallow; caller shouldn't crash trading loop
 
 
 def set_rows(tab: str, rows: List[List[Any]]):
+    global _sheet_full  # declare at function start
     if _sheet_full:
         return
     ws = ensure_ws(tab)
@@ -216,11 +217,11 @@ def set_rows(tab: str, rows: List[List[Any]]):
         _retryable(ws.update, rng, rows)
     except APIError as e:
         if "increase the number of cells" in str(e):
-            global _sheet_full
             _sheet_full = True
 
 
 def update_row(tab: str, idx1: int, values: List[Any]):
+    global _sheet_full  # declare at function start
     if _sheet_full:
         return
     ws = ensure_ws(tab)
@@ -231,7 +232,6 @@ def update_row(tab: str, idx1: int, values: List[Any]):
         _retryable(ws.update, rng, [values])
     except APIError as e:
         if "increase the number of cells" in str(e):
-            global _sheet_full
             _sheet_full = True
 
 
