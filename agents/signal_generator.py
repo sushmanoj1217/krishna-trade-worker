@@ -1,4 +1,5 @@
 # agents/signal_generator.py
+from agents.signal_emit import emit_signal_row_from_dict, emit_signal_row_from_list
 from __future__ import annotations
 from dataclasses import dataclass
 from typing import Dict, Any, Optional, Tuple, List
