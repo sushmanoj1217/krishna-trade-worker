@@ -4,7 +4,7 @@ from __future__ import annotations
 import os
 import time
 import json
-from typing import List, Any, Optional
+from typing import List, Any, Optional, Dict
 
 import gspread
 from gspread.exceptions import APIError
@@ -251,10 +251,6 @@ def write_oc_live_row(data: List[Any]):
     append_row("OC_Live", data)
 
 
-def write_signal_row(data: List[Any]):
-    append_row("Signals", data)
-
-
 def write_trade_row(data: List[Any]):
     append_row("Trades", data)
 
@@ -419,20 +415,55 @@ def count_today_trades(tz="Asia/Kolkata"):
         if ts == today:
             cnt += 1
     return cnt
-# -------------------- Legacy alias helpers (for older callers) --------------------
 
+
+# =========================
+# In-memory "last signal" capture (for /oc_now without Sheets)
+# =========================
+_LAST_SIGNAL_ROW: List[Any] | None = None
+# Expected column order (as per your master brief)
+_EXPECTED_SIGNAL_COLS = [
+    "signal_id", "ts", "side", "trigger",
+    "c1", "c2", "c3", "c4", "c5", "c6",
+    "eligible", "reason",
+    "mv_pcr_ok", "mv_mp_ok", "mv_basis",
+    "oc_bull_normal", "oc_bull_shortcover", "oc_bear_normal", "oc_bear_crash",
+    "oc_pattern_basis", "near/cross", "notes",
+]
+
+def tap_signal_row(row: List[Any]):
+    """Capture the last signal row in memory regardless of Sheets availability."""
+    global _LAST_SIGNAL_ROW
+    try:
+        _LAST_SIGNAL_ROW = list(row)
+    except Exception:
+        _LAST_SIGNAL_ROW = row
+
+def get_last_signal_dict() -> Dict[str, Any]:
+    """Return normalized dict for the last signal captured in memory."""
+    dest: Dict[str, Any] = {}
+    row = _LAST_SIGNAL_ROW
+    if not row:
+        return dest
+    for i, key in enumerate(_EXPECTED_SIGNAL_COLS):
+        if i < len(row):
+            dest[key] = row[i]
+    return dest
+
+
+# Override writer so we always tap memory first
+def write_signal_row(data: List[Any]):
+    # tap memory first so /oc_now can render even if workbook is full
+    try:
+        tap_signal_row(data)
+    except Exception:
+        pass
+    append_row("Signals", data)
+
+# Legacy alias
 def log_signal_row(row):
-    """Alias → append to Signals."""
+    try:
+        tap_signal_row(row)
+    except Exception:
+        pass
     return write_signal_row(row)
-
-def log_trade_row(row):
-    """Alias → append to Trades."""
-    return write_trade_row(row)
-
-def log_oc_live_row(row):
-    """Alias → append to OC_Live."""
-    return write_oc_live_row(row)
-
-def log_status(event: str, detail: str = ""):
-    """Alias → append to Status with timestamp."""
-    return write_status(event, detail)
