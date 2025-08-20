@@ -9,19 +9,18 @@ from typing import List, Any, Optional, Dict
 import gspread
 from gspread.exceptions import APIError
 
-
 # =========================
 # Config (via env)
 # =========================
 SPREADSHEET_ID = os.getenv("GSHEET_TRADES_SPREADSHEET_ID", "").strip()
 DEFAULT_WS = os.getenv("GSHEET_TRADES_WORKSHEET", "Trades")
 
-# Throttling / retries for Sheets
+# Throttling / retries
 MIN_INTERVAL_MS = int(os.getenv("SHEETS_MIN_INTERVAL_MS", "300"))   # per-call gap
 MAX_RETRIES     = int(os.getenv("SHEETS_MAX_RETRIES", "5"))
 BACKOFF_BASE    = float(os.getenv("SHEETS_BACKOFF_BASE", "0.6"))
 
-# Our expected tabs (idempotent create)
+# Our expected tabs
 EXPECTED_TABS = [
     "OC_Live",
     "Signals",
@@ -41,7 +40,6 @@ _gc: Optional[gspread.Client] = None
 _sh: Optional[gspread.Spreadsheet] = None
 _sheet_full: bool = False  # trip when 10M cells cap is hit
 
-
 # =========================
 # Internal helpers
 # =========================
@@ -56,7 +54,7 @@ def _sleep_until_gap():
 
 
 def _retryable(fn, *args, **kwargs):
-    """429/5xx-safe wrapper with exponential backoff."""
+    """429/5xx-safe wrapper with exponential backoff; marks _sheet_full if 10M cap hit."""
     global _sheet_full
     n = 0
     while True:
@@ -71,7 +69,6 @@ def _retryable(fn, *args, **kwargs):
             except Exception:
                 pass
 
-            # Hard stop if workbook exceeded cell limit
             if "increase the number of cells" in text:
                 _sheet_full = True
                 raise
@@ -88,8 +85,7 @@ def _retryable(fn, *args, **kwargs):
 
 def _sa_dict() -> dict:
     """
-    GOOGLE_SA_JSON should be one-line JSON.
-    If pasted with outer quotes, we strip them.
+    GOOGLE_SA_JSON should be one-line JSON. If pasted with outer quotes, strip them.
     """
     raw = os.getenv("GOOGLE_SA_JSON", "").strip()
     if not raw:
@@ -150,7 +146,6 @@ def ensure_tabs():
     try:
         existing = {ws.title for ws in _retryable(sh.worksheets)}
     except APIError:
-        # If list fails transiently, just return; caller will retry later.
         return
 
     for name in EXPECTED_TABS:
@@ -159,7 +154,6 @@ def ensure_tabs():
         try:
             _retryable(sh.add_worksheet, title=name, rows=200, cols=26)
         except APIError as e:
-            # Ignore race / already exists
             if "already exists" not in str(e):
                 raise
 
@@ -195,7 +189,6 @@ def append_row(tab: str, row: List[Any]):
       even when the workbook hits 10M cells or we hit 429s.
     """
     global _sheet_full
-    # Auto-tap for Signals (so you don't have to change existing call-sites)
     if str(tab).strip().lower() == "signals":
         try:
             tap_signal_row(row)
@@ -203,7 +196,6 @@ def append_row(tab: str, row: List[Any]):
             pass
 
     if _sheet_full:
-        # Workbook already hit 10M cells; skip to avoid hard crash loops
         return
     ws = ensure_ws(tab)
     if not ws:
@@ -211,10 +203,9 @@ def append_row(tab: str, row: List[Any]):
     try:
         _retryable(ws.append_row, row)
     except APIError as e:
-        # If workbook cell cap hit, trip the flag so future writes no-op
         if "increase the number of cells" in str(e):
             _sheet_full = True
-        # swallow; caller shouldn't crash trading loop
+        # swallow; trading loop shouldn't crash
 
 
 def set_rows(tab: str, rows: List[List[Any]]):
@@ -469,10 +460,107 @@ def write_signal_row(data: List[Any]):
         pass
     append_row("Signals", data)
 
-# Legacy alias
-def log_signal_row(row):
+# Legacy alias (accepts list or dict)
+def log_signal_row(row_or_dict):
+    if isinstance(row_or_dict, dict):
+        row = [
+            row_or_dict.get("signal_id") or row_or_dict.get("id", ""),
+            row_or_dict.get("ts") or row_or_dict.get("time", ""),
+            str(row_or_dict.get("side") or row_or_dict.get("type", "")).upper(),
+            row_or_dict.get("trigger") or row_or_dict.get("level", ""),
+            row_or_dict.get("c1", ""), row_or_dict.get("c2", ""), row_or_dict.get("c3", ""),
+            row_or_dict.get("c4", ""), row_or_dict.get("c5", ""), row_or_dict.get("c6", ""),
+            row_or_dict.get("eligible", ""), row_or_dict.get("reason", "") or row_or_dict.get("comment",""),
+            row_or_dict.get("mv_pcr_ok",""), row_or_dict.get("mv_mp_ok",""), row_or_dict.get("mv_basis",""),
+            row_or_dict.get("oc_bull_normal",""), row_or_dict.get("oc_bull_shortcover",""),
+            row_or_dict.get("oc_bear_normal",""), row_or_dict.get("oc_bear_crash",""),
+            row_or_dict.get("oc_pattern_basis",""),
+            row_or_dict.get("near/cross") or row_or_dict.get("near_cross",""),
+            row_or_dict.get("notes",""),
+        ]
+    else:
+        row = list(row_or_dict)
     try:
         tap_signal_row(row)
     except Exception:
         pass
-    return write_signal_row(row)
+    append_row("Signals", row)
+
+
+# =========================
+# Trade closing helper (NEW)
+# =========================
+def _find_trade_row_index(trade_id: str) -> Optional[int]:
+    """
+    Return 1-based row index in Trades for given trade_id (including header row as 1).
+    """
+    try:
+        rows = get_all_values("Trades")
+    except Exception:
+        return None
+    if not rows or len(rows) < 2:
+        return None
+    header = [str(h).strip().lower() for h in rows[0]]
+    try:
+        col_idx = header.index("trade_id")
+    except ValueError:
+        try:
+            col_idx = header.index("id")
+        except ValueError:
+            return None
+    for i, r in enumerate(rows[1:], start=2):
+        if col_idx < len(r) and str(r[col_idx]).strip() == str(trade_id).strip():
+            return i
+    return None
+
+
+def _header_col_map(header: List[str]) -> Dict[str, int]:
+    return {h: i for i, h in enumerate([str(x).strip().lower() for x in header])}
+
+
+def close_trade(trade_id: str, exit_ltp: float, result: str, pnl: float) -> None:
+    """
+    Public helper used by EOD auto-flat / MV-reversal exit:
+    Updates Trades row for given trade_id with exit_ltp, exit_time(IST), result, pnl.
+    Safe on missing columns / 10M cap / 429 (no crash).
+    """
+    try:
+        rows = get_all_values("Trades")
+        if not rows or len(rows) < 2:
+            return
+        header = [str(h).strip().lower() for h in rows[0]]
+        cmap = _header_col_map(header)
+        idx = _find_trade_row_index(trade_id)
+        if not idx:
+            return
+
+        row = rows[idx - 1]  # zero-based
+        need = max(
+            cmap.get("exit_ltp", 0),
+            cmap.get("exit_time", 0),
+            cmap.get("result", 0),
+            cmap.get("pnl", 0),
+        ) + 1
+        if len(row) < need:
+            row = row + [""] * (need - len(row))
+
+        def _set(col: str, val: Any):
+            j = cmap.get(col)
+            if j is not None:
+                if col in ("exit_ltp", "pnl"):
+                    try:
+                        row[j] = f"{float(val):.2f}"
+                    except Exception:
+                        row[j] = str(val)
+                else:
+                    row[j] = str(val)
+
+        _set("exit_ltp", exit_ltp)
+        _set("exit_time", now_str())
+        _set("result", result)
+        _set("pnl", pnl)
+
+        update_row("Trades", idx, row)
+    except Exception:
+        # swallow; callers shouldn't crash
+        return
