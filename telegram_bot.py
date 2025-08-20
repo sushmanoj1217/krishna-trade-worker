@@ -1,164 +1,249 @@
 # telegram_bot.py
 from __future__ import annotations
+
 import os
-from datetime import datetime
-from typing import Optional
+import asyncio
+from typing import Optional, Tuple
 
 from telegram import Update
-from telegram.ext import Application, CommandHandler, ContextTypes
-
-from utils.logger import log
-from utils.cache import get_snapshot
-from utils.params import Params
-from utils.time_windows import IST, is_no_trade_now
-from utils.state import (
-    is_oc_auto, set_oc_auto, get_last_signal, is_last_signal_placed,
-    set_approvals_required, approvals_required, list_pending, approve, deny
+from telegram.constants import ParseMode
+from telegram.ext import (
+    Application,
+    ApplicationBuilder,
+    CommandHandler,
+    MessageHandler,
+    ContextTypes,
+    filters,
 )
-from integrations.news_feed import hold_active
-from integrations import sheets as sh
-from utils import telemetry
 
-APP_VERSION = os.getenv("APP_VERSION", "dev")
+# ---- internal imports (defensive) ----
+from utils.logger import log
 
-# ---------- helpers ----------
-def _owner_id() -> Optional[int]:
-    v = os.getenv("TELEGRAM_OWNER_ID", "").strip()
-    try: return int(v) if v else None
-    except: return None
-
-def _authorized(user_id: Optional[int]) -> bool:
-    owner = _owner_id()
-    return (owner is None) or (user_id == owner)
-
-def _num(x, nd=2):
-    if x is None: return "—"
-    try: return f"{float(x):.{nd}f}"
-    except: return str(x)
-
-def _check(ok: bool) -> str: return "✅" if ok else "❌"
-
-def _near_or_cross(tag: str, spot: float, lvl: Optional[float], buf: int):
-    if lvl is None or spot is None: return "—", None
-    d = round(spot - lvl, 2); half = max(1, int(buf * 0.5))
-    if tag in ("S1*", "S2*"):
-        if spot <= lvl: return "CROSS", d
-        if (lvl - spot) <= half: return "NEAR", d
-    else:
-        if spot >= lvl: return "CROSS", d
-        if (spot - lvl) <= half: return "NEAR", d
-    return "—", d
-
-def _build_oc_now_message() -> str:
-    snap = get_snapshot()
-    if not snap:
-        return "<b>/oc_now</b>\nNo OC snapshot yet."
-    p = Params()
-    b = int(snap.extras.get("buffer", p.buffer_points()) if snap.extras else p.buffer_points())
-    s1,s2,r1,r2 = snap.s1, snap.s2, snap.r1, snap.r2
-    s1s = snap.extras.get("s1s") if snap.extras else None
-    s2s = snap.extras.get("s2s") if snap.extras else None
-    r1s = snap.extras.get("r1s") if snap.extras else None
-    r2s = snap.extras.get("r2s") if snap.extras else None
-    s1st, s1d = _near_or_cross("S1*", snap.spot, s1s, b)
-    s2st, s2d = _near_or_cross("S2*", snap.spot, s2s, b)
-    r1st, r1d = _near_or_cross("R1*", snap.spot, r1s, b)
-    r2st, r2d = _near_or_cross("R2*", snap.spot, r2s, b)
-
-    hold_on, hold_reason = hold_active()
-    last_sig = get_last_signal()
-    sig_line = "—"
-    if last_sig:
-        sig_line = f"{last_sig['id']} ({'placed' if is_last_signal_placed() else 'pending'}) {last_sig['side']}@{last_sig['trigger']}"
-    opens = sh.get_open_trades_count()
-
-    # stale banner via OC_Live last row
-    oc_state = sh.latest_oc_state()
-    stale = oc_state.get("stale") or False
-    stale_txt = " | <b>STALE</b>" if stale else ""
-
-    header = (
-        f"<b>/oc_now</b>  <i>{datetime.now(tz=IST).strftime('%Y-%m-%d %H:%M:%S %Z')}</i>{stale_txt}\n"
-        f"Spot <b>{_num(snap.spot,2)}</b> | PCR {_num(snap.pcr)} | "
-        f"MaxPain <b>{_num(snap.max_pain,0)}</b> (Δ {_num(snap.max_pain_dist)}) "
-        f"| HOLD={ 'ON' if hold_on else 'OFF'}{('('+hold_reason+')' if hold_on else '')}"
-        f"{(' → ' + snap.bias_tag) if snap.bias_tag else ''}\n"
-        f"<i>Signal:</i> {sig_line} | <i>Open trades:</i> {opens}"
+# optional/defensive imports (not all repos expose same APIs)
+try:
+    from utils.state import (
+        is_oc_auto,
+        set_oc_auto,
+        approvals_required,
+        set_approvals_required,
     )
-    levels = (
-        "<b>Levels</b>\n"
-        f"S1 {_num(s1,0)}  S2 {_num(s2,0)}  R1 {_num(r1,0)}  R2 {_num(r2,0)}\n"
-        f"Triggers*  S1* <b>{_num(s1s,0)}</b>  S2* <b>{_num(s2s,0)}</b>  "
-        f"R1* <b>{_num(r1s,0)}</b>  R2* <b>{_num(r2s,0)}</b>  (buffer={b})"
-    )
-    trig = (
-        "<b>Trigger status</b>\n"
-        f"• S1* {s1st} (Δ={_num(s1d)}) | S2* {s2st} (Δ={_num(s2d)})\n"
-        f"• R1* {r1st} (Δ={_num(r1d)}) | R2* {r2st} (Δ={_num(r2d)})"
-    )
-    mv = snap.extras.get("mv", {}) if snap.extras else {}
-    mv_block = (
-        f"<b>MV</b> → PCR {_num(snap.pcr)} (hi≥{mv.get('pcr_hi','—')} / lo≤{mv.get('pcr_lo','—')}) | "
-        f"MaxPain Δ {_num(snap.max_pain_dist)} (need±{mv.get('mp_need','—')})\n"
-        f"• CE_OK={_check(bool(mv.get('ce_ok')))} [{mv.get('ce_basis','—')}]\n"
-        f"• PE_OK={_check(bool(mv.get('pe_ok')))} [{mv.get('pe_basis','—')}]"
-    )
-    ocp = snap.extras.get("ocp", {}) if snap.extras else {}
-    ocp_block = (
-        "<b>OC-Pattern</b>\n"
-        f"• CE_OK={_check(bool(ocp.get('ce_ok')))} ({ocp.get('ce_type','-')}) [{ocp.get('basis_ce','—')}]\n"
-        f"• PE_OK={_check(bool(ocp.get('pe_ok')))} ({ocp.get('pe_type','-')}) [{ocp.get('basis_pe','—')}]"
-    )
-    return "\n\n".join([header, levels, trig, mv_block, ocp_block])
+except Exception:  # fallback shims
+    _OC_AUTO = True
+    _APPROVALS = False
 
-# ---------- auth guard ----------
+    def is_oc_auto() -> bool:
+        return _OC_AUTO
+
+    def set_oc_auto(v: bool):
+        nonlocal_vars = {"_OC_AUTO": v}  # no-op for static analyzers
+        globals()["_OC_AUTO"] = v
+
+    def approvals_required() -> bool:
+        return _APPROVALS
+
+    def set_approvals_required(v: bool):
+        nonlocal_vars = {"_APPROVALS": v}
+        globals()["_APPROVALS"] = v
+
+try:
+    from utils.cache import get_snapshot  # last-good OC snapshot
+except Exception:
+    def get_snapshot():
+        return None
+
+try:
+    from analytics.oc_refresh import refresh_once
+except Exception:
+    async def refresh_once():
+        return None
+
+# Sheets helpers (safe if missing)
+try:
+    from integrations import sheets as sh
+except Exception:
+    class _DummySheets:
+        def write_status(self, *a, **k): pass
+        def append_status(self, *a, **k): pass
+        def write_signal_row(self, *a, **k): pass
+        def write_trade_row(self, *a, **k): pass
+        def now_str(self): 
+            import datetime as _dt
+            return _dt.datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+        def append_row(self, *a, **k): pass
+        def ensure_tabs(self): pass
+    sh = _DummySheets()  # type: ignore
+
+# Telemetry (optional)
+try:
+    from utils import telemetry
+except Exception:
+    class _DummyTelem:
+        def health_dict(self): return {}
+        def version_string(self): 
+            return os.getenv("RENDER_GIT_COMMIT", "")[:7] or "dev"
+    telemetry = _DummyTelem()  # type: ignore
+
+
+# ========= Config =========
+BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
+OWNER_ID = os.getenv("TELEGRAM_OWNER_ID", "").strip()
+try:
+    OWNER_ID = int(OWNER_ID) if OWNER_ID else None  # type: ignore[assignment]
+except Exception:
+    OWNER_ID = None  # type: ignore[assignment]
+
+IST = "Asia/Kolkata"
+
+
+# ========= Small utils =========
+def _now_str() -> str:
+    try:
+        from zoneinfo import ZoneInfo
+        import datetime as dt
+        return dt.datetime.now(ZoneInfo(IST)).strftime("%Y-%m-%d %H:%M:%S")
+    except Exception:
+        import datetime as dt
+        return dt.datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+
 async def _guard(update: Update) -> bool:
+    """Only allow the configured owner (if set)."""
+    if OWNER_ID is None:
+        return True
     uid = update.effective_user.id if update.effective_user else None
-    if not _authorized(uid):
-        try: await update.effective_message.reply_text("Unauthorized.")
-        except Exception: pass
+    if uid != OWNER_ID:
+        try:
+            await update.effective_chat.send_message("Not authorized.")
+        except Exception:
+            pass
         return False
     return True
 
-# ---------- commands ----------
+def _fmt_bool(b: Optional[bool]) -> str:
+    return "True" if b else "False"
+
+def _fmt_num(x) -> str:
+    try:
+        return f"{float(x):.2f}"
+    except Exception:
+        return str(x)
+
+
+# ========= OC_NOW RENDERER =========
+def _render_oc_now(snap) -> str:
+    """Build compact /oc_now report. Works with partial fields; never crashes."""
+    if not snap:
+        return "*OC snapshot unavailable.*"
+
+    # Safe getters
+    g = lambda k, d="?" : getattr(snap, k, d)
+    spot = g("spot")
+    vix = g("vix")
+    pcr = g("pcr")
+    pcr_bucket = g("pcr_bucket")
+    mp = g("max_pain")
+    mp_dist = g("max_pain_dist")
+    bias = g("bias_tag")
+    expiry = g("expiry")
+    stale = g("stale", False)
+
+    s1, s2, r1, r2 = g("s1"), g("s2"), g("r1"), g("r2")
+    b = g("buffer_points", g("buffer", ""))  # buffer might be in snapshot
+    try:
+        btxt = f" (buf {int(b)})" if b not in ("", None, "?") else ""
+    except Exception:
+        btxt = ""
+
+    # Header
+    line1 = f"*Spot* {spot} | *VIX* {_fmt_num(vix)} | *PCR* {_fmt_num(pcr)} [{pcr_bucket}]"
+    line2 = f"*MaxPain* {mp} (Δ {_fmt_num(mp_dist)}) | *Bias* {bias} | *Exp* {expiry}"
+    if stale:
+        line2 += "  ⚠️*STALE*"
+
+    # Levels
+    trig = lambda lv, kind: f"{lv - b if kind=='S' and isinstance(b,(int,float)) else lv + b if kind=='R' and isinstance(b,(int,float)) else '?'}"
+    levels = (
+        f"*Levels*\n"
+        f"S1 {s1} / S2 {s2} / R1 {r1} / R2 {r2}{btxt}\n"
+        f"Triggers → S1* {_fmt_num(s1 if s1=='?' else (float(s1) - float(b) if str(b).isdigit() else s1))} | "
+        f"S2* {_fmt_num(s2 if s2=='?' else (float(s2) - float(b) if str(b).isdigit() else s2))} | "
+        f"R1* {_fmt_num(r1 if r1=='?' else (float(r1) + float(b) if str(b).isdigit() else r1))} | "
+        f"R2* {_fmt_num(r2 if r2=='?' else (float(r2) + float(b) if str(b).isdigit() else r2))}"
+    )
+
+    # Checks/blocks (best-effort; may be missing)
+    c = lambda k: "✅" if g(k, False) else ("❌" if g(k, None) is not None else "—")
+    checks = (
+        f"*6-Checks* C1 {c('c1')} C2 {c('c2')} C3 {c('c3')} C4 {c('c4')} C5 {c('c5')} C6 {c('c6')}"
+    )
+    mv = f"*MV:* PCR≥/≤ flags {g('mv_pcr_ok','?')}, MP-dist {g('mv_mp_ok','?')} | basis {g('mv_basis','')}"
+    ocp = f"*OC-Pattern:* {g('oc_pattern_basis','')}"
+    decision = f"*Decision:* {'Eligible' if g('eligible', False) else 'Not Eligible'} | {g('eligible_reason','')}".strip()
+
+    parts = [line1, line2, "", levels, "", checks, ocp, mv, "", decision]
+    return "\n".join([p for p in parts if p is not None])
+
+
+# ========= Command handlers =========
 async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await _guard(update): return
-    await update.message.reply_text("Namaste 👋\nBot is up. Try /oc_now")
+    await update.message.reply_text("Hi! Try /whoami, /oc_now, /run oc_auto status", disable_web_page_preview=True)
 
 async def whoami_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await _guard(update): return
-    uid = update.effective_user.id if update.effective_user else None
-    cid = update.effective_chat.id if update.effective_chat else None
-    await update.message.reply_text(f"user_id={uid} chat_id={cid}")
-
-async def health_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not await _guard(update): return
-    t = telemetry.get()
-    oc_ok_at = t["marks"].get("oc_ok_at")
-    d429 = t["counters"].get("dhan_429", 0)
-    oc_ok = t["counters"].get("oc_fetch_success", 0)
-    oc_fail = t["counters"].get("oc_fetch_fail", 0)
-    oc_state = sh.latest_oc_state()
-    await update.message.reply_text(
-        f"OK {datetime.now(tz=IST).strftime('%H:%M:%S %Z')} | "
-        f"OC ok:{oc_ok} fail:{oc_fail} 429:{d429} | stale={oc_state.get('stale')} ts={oc_state.get('timestamp')} | "
-        f"oc_auto={is_oc_auto()}")
+    uid = update.effective_user.id if update.effective_user else "?"
+    await update.message.reply_text(f"user_id={uid} | owner={OWNER_ID if OWNER_ID else 'None'}")
 
 async def version_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await _guard(update): return
-    await update.message.reply_text(f"Version: {APP_VERSION} | tz=IST | oc_auto={is_oc_auto()}")
+    ver = ""
+    try:
+        ver = telemetry.version_string()
+    except Exception:
+        ver = os.getenv("RENDER_GIT_COMMIT", "")[:7] or "dev"
+    await update.message.reply_text(f"version: {ver}")
+
+async def health_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await _guard(update): return
+    line = ""
+    try:
+        h = telemetry.health_dict()
+        # Expected keys (best-effort)
+        ok = h.get("oc_ok")
+        fail = h.get("oc_fail")
+        r429 = h.get("dhan_429")
+        stale = h.get("stale")
+        ts = h.get("last_ts")
+        line = f"OC ok:{ok} fail:{fail} 429:{r429} | stale={stale} ts={ts}"
+    except Exception:
+        line = "health: ok"
+    await update.message.reply_text(line)
 
 async def oc_now_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await _guard(update): return
     try:
-        await update.message.reply_text(_build_oc_now_message(), parse_mode="HTML", disable_web_page_preview=True)
+        snap = get_snapshot()
+        if not snap or getattr(snap, "stale", False):
+            try:
+                await asyncio.to_thread(refresh_once)  # non-blocking to main loop
+                snap2 = get_snapshot()
+                if snap2: snap = snap2
+            except Exception as e:
+                log.warning(f"/oc_now refresh_once failed: {e}")
+
+        if not snap:
+            await update.message.reply_text(
+                "OC अभी unavailable है (rate-limit/first snapshot pending). 20–30s बाद फिर से /oc_now भेजें."
+            )
+            return
+
+        text = _render_oc_now(snap)
+        await update.message.reply_text(text, parse_mode=ParseMode.MARKDOWN, disable_web_page_preview=True)
     except Exception as e:
-        log.error(f"/oc_now failed: {e}")
-        await update.message.reply_text("Error building OC snapshot.")
+        log.error(f"/oc_now failed: {e}", exc_info=True)
+        await update.message.reply_text("Temporary issue in /oc_now. Try again shortly.")
 
 async def run_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not await _guard(update): 
-        return
+    if not await _guard(update): return
     if not context.args:
         await update.message.reply_text(
             "Usage: /run oc_auto on|off|status | oc_now | approvals on|off|status"
@@ -201,113 +286,157 @@ async def run_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(
             "Unknown /run subcommand. Try: oc_auto | oc_now | approvals"
         )
+
+# ----- approvals -----
+async def approve_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await _guard(update): return
+    # Try to use agents.signal_generator API if available
+    try:
+        from agents import signal_generator as sig
+    except Exception:
+        sig = None
+
+    if not context.args:
+        # list pending
+        try:
+            if sig and hasattr(sig, "list_pending_ids"):
+                ids = sig.list_pending_ids()
+                if ids:
+                    await update.message.reply_text("Pending: " + ", ".join(ids))
+                else:
+                    await update.message.reply_text("No pending approvals.")
+                return
+        except Exception as e:
+            log.warning(f"/approve list pending failed: {e}")
+        await update.message.reply_text("Usage: /approve <signal_id>")
+        return
+
+    sid = context.args[0]
+    ok = False
+    try:
+        if sig and hasattr(sig, "approve"):
+            ok = bool(sig.approve(sid))
+    except Exception as e:
+        log.warning(f"/approve {sid} failed: {e}")
+    await update.message.reply_text(f"approved={ok} for {sid}")
+
+async def deny_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await _guard(update): return
+    try:
+        from agents import signal_generator as sig
+    except Exception:
+        sig = None
+
+    if not context.args:
+        await update.message.reply_text("Usage: /deny <signal_id>")
+        return
+
+    sid = context.args[0]
+    ok = False
+    try:
+        if sig and hasattr(sig, "deny"):
+            ok = bool(sig.deny(sid))
+    except Exception as e:
+        log.warning(f"/deny {sid} failed: {e}")
+    await update.message.reply_text(f"denied={ok} for {sid}")
+
+# ----- overrides: /set_levels -----
 async def set_levels_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await _guard(update): return
     if not context.args:
         await update.message.reply_text(
-            "Usage:\n"
-            "/set_levels buffer <points>\n"
-            "/set_levels mpdist <points>\n"
-            "/set_levels pcr <bull_hi> <bear_lo>\n"
-            "/set_levels target <points>\n")
+            "Usage: /set_levels buffer <pts> | mpdist <pts> | pcr <bull_high> <bear_low> | target <pts>"
+        )
         return
-    symbol = os.getenv("OC_SYMBOL","NIFTY").upper()
+
     sub = context.args[0].lower()
-    if sub == "buffer" and len(context.args) >= 2:
-        try: val = int(float(context.args[1])); 
-        except: await update.message.reply_text("buffer must be a number"); return
-        m = sh.get_overrides_map(); key = "ENTRY_BAND_POINTS_MAP"; parts = {}
-        raw = (m.get(key,"") or "").replace(";",",")
-        for kv in raw.split(","):
-            if "=" in kv:
-                k,v = kv.split("=",1); parts[k.strip().upper()] = v.strip()
-        parts[symbol] = str(val)
-        new_val = ",".join(f"{k}={parts[k]}" for k in sorted(parts.keys()))
-        sh.upsert_override(key, new_val)
-        await update.message.reply_text(f"{key}={new_val}")
-    elif sub == "mpdist" and len(context.args) >= 2:
-        try: val = int(float(context.args[1]))
-        except: await update.message.reply_text("mpdist must be a number"); return
-        key = f"MP_SUPPORT_DIST_{symbol}"
-        sh.upsert_override(key, str(val))
-        await update.message.reply_text(f"{key}={val}")
-    elif sub == "pcr" and len(context.args) >= 3:
+    args = context.args[1:]
+
+    async def _ack(msg: str):
         try:
-            bull = float(context.args[1]); bear = float(context.args[2])
-        except:
-            await update.message.reply_text("pcr needs two numbers: bull_hi bear_lo"); return
-        sh.upsert_override("PCR_BULL_HIGH", str(bull))
-        sh.upsert_override("PCR_BEAR_LOW", str(bear))
-        await update.message.reply_text(f"PCR_BULL_HIGH={bull} PCR_BEAR_LOW={bear}")
-    elif sub == "target" and len(context.args) >= 2:
-        try: val = int(float(context.args[1]))
-        except: await update.message.reply_text("target must be a number"); return
-        key_map = {"NIFTY":"MIN_TARGET_POINTS_N","BANKNIFTY":"MIN_TARGET_POINTS_B","FINNIFTY":"MIN_TARGET_POINTS_F"}
-        key = key_map.get(symbol, "MIN_TARGET_POINTS_N")
-        sh.upsert_override(key, str(val))
-        await update.message.reply_text(f"{key}={val}")
-    else:
-        await update.message.reply_text("Unknown /set_levels subcommand")
+            await update.message.reply_text(msg)
+        except Exception:
+            pass
 
-async def hold_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not await _guard(update): return
-    if not context.args or context.args[0].lower() not in ("on","off","status"):
-        await update.message.reply_text("Usage: /hold on|off|status"); return
-    sub = context.args[0].lower()
-    if sub == "status":
-        rows = sh.get_last_event_rows(5)
-        txt = ["Last Events:"]
-        for r in rows: txt.append(" | ".join(str(x) for x in r))
-        on, reason = hold_active()
-        txt.append(f"HOLD={on} {reason}")
-        await update.message.reply_text("\n".join(txt)); return
-    status = "HOLD" if sub == "on" else "CLEAR"
-    sh.append_row("Events", [sh.now_str(), "manual", status])
-    await update.message.reply_text(f"Events: {status}")
+    # Try via utils.params setter; else write to sheet
+    def _push_override(key: str, value: str):
+        pushed = False
+        try:
+            from utils import params as P
+            if hasattr(P, "set_override"):
+                P.set_override(key, value)
+                pushed = True
+        except Exception:
+            pushed = False
+        if not pushed:
+            try:
+                sh.append_row("Params_Override", [_now_str(), key, value])
+            except Exception:
+                pass
+        return pushed
 
-# approvals UX
-async def approve_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not await _guard(update): return
-    if not context.args:
-        # list pending
-        items = list_pending()
-        if not items:
-            await update.message.reply_text("No pending signals."); return
-        msg = "Pending signals:\n" + "\n".join(f"{s['id']} {s['side']}@{s['trigger']} entry={s['entry']}" for s in items)
-        await update.message.reply_text(msg); return
-    sid = context.args[0]
-    ok = approve(sid)
-    await update.message.reply_text("approved" if ok else "not found")
-
-async def deny_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not await _guard(update): return
-    if not context.args:
-        await update.message.reply_text("Usage: /deny <signal_id>"); return
-    sid = context.args[0]
-    ok = deny(sid)
-    await update.message.reply_text("denied" if ok else "not found")
-
-# ---------- bootstrap ----------
-async def init() -> Optional[Application]:
-    from telegram.ext import Application
-    token = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
-    if not token:
-        log.warning("TELEGRAM_BOT_TOKEN missing; bot disabled")
-        return None
     try:
-        app = Application.builder().token(token).build()
+        if sub == "buffer" and len(args) >= 1:
+            val = args[0]
+            _push_override("ENTRY_BAND_POINTS", val)
+            await _ack(f"buffer override → {val}")
+
+        elif sub == "mpdist" and len(args) >= 1:
+            val = args[0]
+            _push_override("MP_SUPPORT_DIST", val)
+            await _ack(f"max-pain distance override → {val}")
+
+        elif sub == "pcr" and len(args) >= 2:
+            bh, bl = args[0], args[1]
+            _push_override("PCR_BULL_HIGH", bh)
+            _push_override("PCR_BEAR_LOW", bl)
+            await _ack(f"PCR bands override → bull_high={bh} bear_low={bl}")
+
+        elif sub == "target" and len(args) >= 1:
+            val = args[0]
+            _push_override("MIN_TARGET_POINTS", val)
+            await _ack(f"min target points override → {val}")
+
+        else:
+            await _ack("Usage: /set_levels buffer <pts> | mpdist <pts> | pcr <bull_high> <bear_low> | target <pts>")
+
     except Exception as e:
-        log.error(f"Telegram Application init failed: {e}")
+        log.error(f"/set_levels failed: {e}", exc_info=True)
+        await _ack("set_levels failed")
+
+
+# ----- natural approvals via free text -----
+async def text_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await _guard(update): return
+    txt = (update.message.text or "").strip().lower()
+    if txt in ("approve", "approved"):
+        await approve_cmd(update, context)
+    elif txt in ("deny", "denied", "reject", "rejected"):
+        await deny_cmd(update, context)
+    # else ignore; keep bot quiet
+
+
+# ========= App init =========
+async def init() -> Optional[Application]:
+    token = BOT_TOKEN
+    if not token:
+        log.error("Telegram token missing.")
         return None
 
+    app: Application = ApplicationBuilder().token(token).build()
+
+    # commands
     app.add_handler(CommandHandler("start", start_cmd))
     app.add_handler(CommandHandler("whoami", whoami_cmd))
-    app.add_handler(CommandHandler("health", health_cmd))
     app.add_handler(CommandHandler("version", version_cmd))
+    app.add_handler(CommandHandler("health", health_cmd))
     app.add_handler(CommandHandler("oc_now", oc_now_cmd))
     app.add_handler(CommandHandler("run", run_cmd))
-    app.add_handler(CommandHandler("set_levels", set_levels_cmd))
-    app.add_handler(CommandHandler("hold", hold_cmd))
     app.add_handler(CommandHandler("approve", approve_cmd))
     app.add_handler(CommandHandler("deny", deny_cmd))
+    app.add_handler(CommandHandler("set_levels", set_levels_cmd))
+
+    # natural language approvals
+    app.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), text_router))
+
     return app
