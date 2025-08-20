@@ -57,7 +57,7 @@ def _sleep_until_gap():
 
 def _retryable(fn, *args, **kwargs):
     """429/5xx-safe wrapper with exponential backoff."""
-    global _sheet_full  # declare at function start
+    global _sheet_full
     n = 0
     while True:
         _sleep_until_gap()
@@ -189,7 +189,19 @@ def get_all_values(tab: str) -> List[List[Any]]:
 
 
 def append_row(tab: str, row: List[Any]):
-    global _sheet_full  # declare at function start
+    """
+    Generic appender. **Smart Signals support**:
+    - If tab == "Signals", we **tap memory first** so /oc_now can render latest
+      even when the workbook hits 10M cells or we hit 429s.
+    """
+    global _sheet_full
+    # Auto-tap for Signals (so you don't have to change existing call-sites)
+    if str(tab).strip().lower() == "signals":
+        try:
+            tap_signal_row(row)
+        except Exception:
+            pass
+
     if _sheet_full:
         # Workbook already hit 10M cells; skip to avoid hard crash loops
         return
@@ -206,7 +218,7 @@ def append_row(tab: str, row: List[Any]):
 
 
 def set_rows(tab: str, rows: List[List[Any]]):
-    global _sheet_full  # declare at function start
+    global _sheet_full
     if _sheet_full:
         return
     ws = ensure_ws(tab)
@@ -221,7 +233,7 @@ def set_rows(tab: str, rows: List[List[Any]]):
 
 
 def update_row(tab: str, idx1: int, values: List[Any]):
-    global _sheet_full  # declare at function start
+    global _sheet_full
     if _sheet_full:
         return
     ws = ensure_ws(tab)
@@ -348,7 +360,6 @@ def get_open_trades():
             "pnl":         _coerce_float(_pick(d, "pnl", "p&l")),
             "dedupe_hash": _pick(d, "dedupe_hash", "hash"),
         }
-        # Ensure numeric keys exist (avoid KeyError in callers)
         for k in ("buy_ltp", "exit_ltp", "sl", "tp", "pnl"):
             if nd[k] is None:
                 nd[k] = 0.0
@@ -421,7 +432,6 @@ def count_today_trades(tz="Asia/Kolkata"):
 # In-memory "last signal" capture (for /oc_now without Sheets)
 # =========================
 _LAST_SIGNAL_ROW: List[Any] | None = None
-# Expected column order (as per your master brief)
 _EXPECTED_SIGNAL_COLS = [
     "signal_id", "ts", "side", "trigger",
     "c1", "c2", "c3", "c4", "c5", "c6",
@@ -451,9 +461,8 @@ def get_last_signal_dict() -> Dict[str, Any]:
     return dest
 
 
-# Override writer so we always tap memory first
+# Writer that always taps memory first
 def write_signal_row(data: List[Any]):
-    # tap memory first so /oc_now can render even if workbook is full
     try:
         tap_signal_row(data)
     except Exception:
