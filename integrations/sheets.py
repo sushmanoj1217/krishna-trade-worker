@@ -9,16 +9,19 @@ from typing import List, Any, Optional
 import gspread
 from gspread.exceptions import APIError
 
-# ---------- Config ----------
+
+# =========================
+# Config (via env)
+# =========================
 SPREADSHEET_ID = os.getenv("GSHEET_TRADES_SPREADSHEET_ID", "").strip()
 DEFAULT_WS = os.getenv("GSHEET_TRADES_WORKSHEET", "Trades")
 
-# Throttling / retries
-MIN_INTERVAL_MS = int(os.getenv("SHEETS_MIN_INTERVAL_MS", "300"))  # per-call gap
-MAX_RETRIES = int(os.getenv("SHEETS_MAX_RETRIES", "5"))
-BACKOFF_BASE = float(os.getenv("SHEETS_BACKOFF_BASE", "0.6"))
+# Throttling / retries for Sheets
+MIN_INTERVAL_MS = int(os.getenv("SHEETS_MIN_INTERVAL_MS", "300"))   # per-call gap
+MAX_RETRIES     = int(os.getenv("SHEETS_MAX_RETRIES", "5"))
+BACKOFF_BASE    = float(os.getenv("SHEETS_BACKOFF_BASE", "0.6"))
 
-# Expected tabs we manage
+# Our expected tabs (idempotent create)
 EXPECTED_TABS = [
     "OC_Live",
     "Signals",
@@ -30,21 +33,22 @@ EXPECTED_TABS = [
     "Params_Override",
 ]
 
-# ---------- Globals ----------
-_last_call_ts = 0.0
+# =========================
+# Globals
+# =========================
+_last_call_ts: float = 0.0
 _gc: Optional[gspread.Client] = None
 _sh: Optional[gspread.Spreadsheet] = None
+_sheet_full: bool = False  # trip when 10M cells cap is hit
 
 
-# ---------- Small utils ----------
-def _now_ms() -> int:
-    return int(time.time() * 1000)
-
-
+# =========================
+# Internal helpers
+# =========================
 def _sleep_until_gap():
     """Simple rate limiter so we don't spam Sheets and hit 429."""
     global _last_call_ts
-    gap = MIN_INTERVAL_MS / 1000.0
+    gap = max(0.0, MIN_INTERVAL_MS / 1000.0)
     now = time.time()
     if now - _last_call_ts < gap:
         time.sleep(gap - (now - _last_call_ts))
@@ -52,19 +56,26 @@ def _sleep_until_gap():
 
 
 def _retryable(fn, *args, **kwargs):
-    """429-safe wrapper with exponential backoff."""
+    """429/5xx-safe wrapper with exponential backoff."""
     n = 0
     while True:
         _sleep_until_gap()
         try:
             return fn(*args, **kwargs)
         except APIError as e:
+            text = str(e)
             code = None
             try:
-                code = int(getattr(e, "response", None).status_code)  # type: ignore
+                code = int(getattr(e, "response", None).status_code)  # type: ignore[attr-defined]
             except Exception:
                 pass
-            text = str(e)
+
+            # Hard stop if workbook exceeded cell limit
+            if "increase the number of cells" in text:
+                global _sheet_full
+                _sheet_full = True
+                raise
+
             if code in (429, 500, 503) or "Quota exceeded" in text:
                 if n >= MAX_RETRIES:
                     raise
@@ -75,20 +86,25 @@ def _retryable(fn, *args, **kwargs):
             raise
 
 
-# ---------- Auth / Handles ----------
 def _sa_dict() -> dict:
+    """
+    GOOGLE_SA_JSON should be one-line JSON.
+    If pasted with outer quotes, we strip them.
+    """
     raw = os.getenv("GOOGLE_SA_JSON", "").strip()
     if not raw:
         return {}
     try:
         return json.loads(raw)
     except Exception:
-        # Sometimes users paste with outer quotes; try to strip
-        if raw[0] in "\"'" and raw[-1] == raw[0]:
+        if raw and raw[0] in "\"'" and raw[-1] == raw[0]:
             return json.loads(raw[1:-1])
         raise
 
 
+# =========================
+# Public: client / spreadsheet
+# =========================
 def get_client() -> Optional[gspread.Client]:
     global _gc
     if _gc is not None:
@@ -111,34 +127,39 @@ def get_sh() -> Optional[gspread.Spreadsheet]:
     return _sh
 
 
-# ---------- Public helpers ----------
 def now_str(tz="Asia/Kolkata") -> str:
     try:
         import datetime as _dt
-        from zoneinfo import ZoneInfo  # py3.9+
+        from zoneinfo import ZoneInfo
         return _dt.datetime.now(ZoneInfo(tz)).strftime("%Y-%m-%d %H:%M:%S")
     except Exception:
-        # Fallback UTC
         import datetime as _dt
         return _dt.datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
 
 
+# =========================
+# Tabs & worksheet handles
+# =========================
 def ensure_tabs():
     """
     Create only missing tabs (idempotent). Silently no-op if Sheets not configured.
     """
     sh = get_sh()
     if not sh:
-        # Let caller log a friendly warning; many services may not need Sheets.
+        return
+    try:
+        existing = {ws.title for ws in _retryable(sh.worksheets)}
+    except APIError:
+        # If list fails transiently, just return; caller will retry later.
         return
 
-    existing = {ws.title for ws in _retryable(sh.worksheets)}
-    missing = [t for t in EXPECTED_TABS if t not in existing]
-    for name in missing:
+    for name in EXPECTED_TABS:
+        if name in existing:
+            continue
         try:
             _retryable(sh.add_worksheet, title=name, rows=200, cols=26)
         except APIError as e:
-            # If someone created it in parallel; ignore “already exists”.
+            # Ignore race / already exists
             if "already exists" not in str(e):
                 raise
 
@@ -154,6 +175,9 @@ def ensure_ws(name: str):
         return _retryable(sh.worksheet, name)
 
 
+# =========================
+# CRUD helpers (throttled)
+# =========================
 def get_all_values(tab: str) -> List[List[Any]]:
     ws = ensure_ws(tab)
     if not ws:
@@ -165,32 +189,50 @@ def get_all_values(tab: str) -> List[List[Any]]:
 
 
 def append_row(tab: str, row: List[Any]):
+    if _sheet_full:
+        # Workbook already hit 10M cells; skip to avoid hard crash loops
+        return
     ws = ensure_ws(tab)
     if not ws:
         return
-    _retryable(ws.append_row, row)
+    try:
+        _retryable(ws.append_row, row)
+    except APIError as e:
+        # If workbook cell cap hit, trip the flag so future writes no-op
+        if "increase the number of cells" in str(e):
+            global _sheet_full
+            _sheet_full = True
+        # swallow; caller shouldn't crash trading loop
 
 
 def set_rows(tab: str, rows: List[List[Any]]):
-    """
-    Replace entire sheet values with provided rows (limited size); safe wrapper.
-    """
-    ws = ensure_ws(tab)
-    if not ws:
+    if _sheet_full:
         return
-    rng = f"A1:{_col_letters(len(rows[0]) if rows else 1)}{max(1, len(rows))}"
-    _retryable(ws.update, rng, rows)
+    ws = ensure_ws(tab)
+    if not ws or not rows:
+        return
+    rng = f"A1:{_col_letters(len(rows[0]))}{max(1, len(rows))}"
+    try:
+        _retryable(ws.update, rng, rows)
+    except APIError as e:
+        if "increase the number of cells" in str(e):
+            global _sheet_full
+            _sheet_full = True
 
 
 def update_row(tab: str, idx1: int, values: List[Any]):
-    """
-    Update a 1-indexed row.
-    """
+    if _sheet_full:
+        return
     ws = ensure_ws(tab)
     if not ws:
         return
     rng = f"A{idx1}:{_col_letters(len(values))}{idx1}"
-    _retryable(ws.update, rng, [values])
+    try:
+        _retryable(ws.update, rng, [values])
+    except APIError as e:
+        if "increase the number of cells" in str(e):
+            global _sheet_full
+            _sheet_full = True
 
 
 def _col_letters(n: int) -> str:
@@ -202,11 +244,10 @@ def _col_letters(n: int) -> str:
     return s
 
 
-# ---------- Convenience for our bot ----------
+# =========================
+# Convenience writers
+# =========================
 def write_oc_live_row(data: List[Any]):
-    """
-    Append one row to OC_Live (our standard layout).
-    """
     append_row("OC_Live", data)
 
 
@@ -222,26 +263,29 @@ def write_status(event: str, detail: str = ""):
     append_row("Status", [now_str(), event, detail])
 
 
-def get_last_event_rows(n: int = 5):
-    rows = get_all_values("Events")
-    return rows[-n:] if rows else []
-
-
-# Backward-compatible aliases (some legacy callers expect these names)
+# Backward-compatible names (legacy callers)
 def get_sheet_values(tab: str) -> List[List[Any]]:
     return get_all_values(tab)
 
 
 def append_status(event: str, detail: str = ""):
     write_status(event, detail)
-# -------------------- EXTRA HELPERS (compat with callers) --------------------
 
+
+def get_last_event_rows(n: int = 5):
+    rows = get_all_values("Events")
+    return rows[-n:] if rows else []
+
+
+# =========================
+# Extra readers used by agents
+# =========================
 def _rows_as_dicts(tab: str):
-    """Return rows of a tab as list of dicts using header row."""
+    """Return rows of a tab as list of dicts using header row (lowercased keys)."""
     rows = get_all_values(tab)
     if not rows:
         return []
-    header = [h.strip().lower() for h in rows[0]]
+    header = [str(h).strip().lower() for h in rows[0]]
     out = []
     for r in rows[1:]:
         d = {}
@@ -251,30 +295,114 @@ def _rows_as_dicts(tab: str):
         out.append(d)
     return out
 
+
 def _date_yyyy_mm_dd(s: str) -> str:
     s = (s or "").strip()
-    # Accept "YYYY-MM-DD HH:MM:SS" or already "YYYY-MM-DD"
     return s[:10] if len(s) >= 10 else s
+
+
+def _coerce_float(x):
+    try:
+        return float(str(x).replace(",", "").strip())
+    except Exception:
+        return None
+
+
+def _pick(d: dict, *candidates, default=""):
+    for k in candidates:
+        if k in d and str(d[k]).strip() != "":
+            return d[k]
+    return default
+
 
 def get_open_trades():
     """
-    Return a list[dict] of open trades from Trades tab.
-    Open = exit_time empty (or result empty).
-    Keys use lowercased header names: trade_id, signal_id, symbol, side, buy_ltp,
-    exit_ltp, sl, tp, basis, buy_time, exit_time, result, pnl, dedupe_hash ...
+    Normalized open trades (exit not filled). Keys guaranteed:
+    trade_id, signal_id, symbol, side, buy_ltp, exit_ltp, sl, tp,
+    basis, buy_time, exit_time, result, pnl, dedupe_hash.
+    Numeric fields coerced to float when possible.
     """
-    rows = _rows_as_dicts("Trades")
+    raw = _rows_as_dicts("Trades")
     out = []
-    for d in rows:
-        exit_time = d.get("exit_time", "").strip()
-        result = d.get("result", "").strip()
-        if exit_time == "" or result == "":
-            out.append(d)
+    for d in raw:
+        buy_time  = _pick(d, "buy_time", "buy_ts", "entry_time", "ts")
+        exit_time = _pick(d, "exit_time", "sell_time", "close_time")
+        result    = _pick(d, "result")
+        open_pos  = (str(exit_time).strip() == "") or (str(result).strip() == "")
+        if not open_pos:
+            continue
+
+        side = str(_pick(d, "side")).strip().upper()
+        if side in ("CALL", "C"): side = "CE"
+        if side in ("PUT", "P"):  side = "PE"
+
+        nd = {
+            "trade_id":    _pick(d, "trade_id", "id"),
+            "signal_id":   _pick(d, "signal_id"),
+            "symbol":      _pick(d, "symbol", "ticker"),
+            "side":        side,
+            "buy_ltp":     _coerce_float(_pick(d, "buy_ltp", "buy_price", "entry_ltp", "entry_price", "buy")),
+            "exit_ltp":    _coerce_float(_pick(d, "exit_ltp", "sell_ltp", "exit_price", "sell")),
+            "sl":          _coerce_float(_pick(d, "sl", "stop", "stop_loss")),
+            "tp":          _coerce_float(_pick(d, "tp", "target")),
+            "basis":       _pick(d, "basis", "reason"),
+            "buy_time":    str(buy_time),
+            "exit_time":   str(exit_time),
+            "result":      _pick(d, "result"),
+            "pnl":         _coerce_float(_pick(d, "pnl", "p&l")),
+            "dedupe_hash": _pick(d, "dedupe_hash", "hash"),
+        }
+        # Ensure numeric keys exist (avoid KeyError in callers)
+        for k in ("buy_ltp", "exit_ltp", "sl", "tp", "pnl"):
+            if nd[k] is None:
+                nd[k] = 0.0
+        out.append(nd)
     return out
 
+
 def get_today_signal_dedupes(tz="Asia/Kolkata"):
+    """Set of dedupe_hash for today's Signals; falls back to Trades if needed."""
+    try:
+        from datetime import datetime
+        from zoneinfo import ZoneInfo
+        today = datetime.now(ZoneInfo(tz)).strftime("%Y-%m-%d")
+    except Exception:
+        from datetime import datetime, timezone
+        today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+
+    dest = set()
+
+    # Prefer Signals (if schema has dedupe_hash)
+    sigs = _rows_as_dicts("Signals")
+    if any("dedupe_hash" in d for d in sigs):
+        for d in sigs:
+            ts = _date_yyyy_mm_dd(_pick(d, "ts"))
+            if ts == today:
+                dh = _pick(d, "dedupe_hash").strip()
+                if dh:
+                    dest.add(dh)
+        if dest:
+            return dest
+
+    # Fallback to Trades
+    trades = _rows_as_dicts("Trades")
+    for d in trades:
+        ts = _date_yyyy_mm_dd(_pick(d, "buy_time", "ts", "entry_time"))
+        if ts == today:
+            dh = _pick(d, "dedupe_hash").strip()
+            if dh:
+                dest.add(dh)
+    return dest
+
+
+def get_today_dedupe_hashes():
+    return get_today_signal_dedupes()
+
+
+def count_today_trades(tz="Asia/Kolkata"):
     """
-    Return a set of dedupe_hash values for today's Signals (fallback to Trades).
+    Count of Trades with buy_time (or ts) == today (irrespective of exit).
+    Used for daily trade cap.
     """
     try:
         from datetime import datetime
@@ -284,31 +412,10 @@ def get_today_signal_dedupes(tz="Asia/Kolkata"):
         from datetime import datetime, timezone
         today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
 
-    # Prefer Signals tab if it has 'dedupe_hash'
-    sigs = _rows_as_dicts("Signals")
-    has_dedupe = any("dedupe_hash" in d for d in sigs)
-    dest = set()
-    if has_dedupe:
-        for d in sigs:
-            ts = _date_yyyy_mm_dd(d.get("ts", ""))
-            if ts == today:
-                dh = d.get("dedupe_hash", "").strip()
-                if dh:
-                    dest.add(dh)
-        if dest:
-            return dest
-
-    # Fallback: use Trades tab (may also contain dedupe_hash)
     trades = _rows_as_dicts("Trades")
+    cnt = 0
     for d in trades:
-        ts = _date_yyyy_mm_dd(d.get("buy_time", "")) or _date_yyyy_mm_dd(d.get("ts", ""))
+        ts = _date_yyyy_mm_dd(_pick(d, "buy_time", "ts", "entry_time"))
         if ts == today:
-            dh = d.get("dedupe_hash", "").strip()
-            if dh:
-                dest.add(dh)
-    return dest
-
-# Back-compat names some callers might expect
-def get_today_dedupe_hashes():
-    return get_today_signal_dedupes()
-
+            cnt += 1
+    return cnt
