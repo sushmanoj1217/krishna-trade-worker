@@ -157,27 +157,50 @@ async def oc_now_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Error building OC snapshot.")
 
 async def run_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not await _guard(update): return
-    if not context.args:
-        await update.message.reply_text("Usage: /run oc_auto on|off|status | oc_now | approvals on|off")
+    if not await _guard(update): 
         return
+    if not context.args:
+        await update.message.reply_text(
+            "Usage: /run oc_auto on|off|status | oc_now | approvals on|off|status"
+        )
+        return
+
     sub = context.args[0].lower()
+
     if sub == "oc_auto":
-        if len(context.args) < 2:
-            await update.message.reply_text(f"oc_auto={is_oc_auto()}"); return
+        # status (no arg or explicit)
+        if len(context.args) == 1 or context.args[1].lower() == "status":
+            await update.message.reply_text(f"oc_auto={is_oc_auto()}")
+            return
         val = context.args[1].lower()
-        if val == "on": set_oc_auto(True); await update.message.reply_text("oc_auto: ON")
-        elif val == "off": set_oc_auto(False); await update.message.reply_text("oc_auto: OFF")
-        else: await update.message.reply_text("Use on|off|status")
+        if val == "on":
+            set_oc_auto(True)
+            await update.message.reply_text("oc_auto: ON")
+        elif val == "off":
+            set_oc_auto(False)
+            await update.message.reply_text("oc_auto: OFF")
+        else:
+            await update.message.reply_text("Use on|off|status")
+
     elif sub == "oc_now":
         await oc_now_cmd(update, context)
-    elif sub == "approvals" and len(context.args) >= 2:
-        on = context.args[1].lower() == "on"
-        set_approvals_required(on)
-        await update.message.reply_text(f"approvals_required={on}")
-    else:
-        await update.message.reply_text("Unknown /run subcommand.")
 
+    elif sub == "approvals":
+        # approvals status/on/off
+        if len(context.args) == 1 or context.args[1].lower() == "status":
+            await update.message.reply_text(f"approvals_required={approvals_required()}")
+            return
+        on = context.args[1].lower()
+        if on in ("on", "off"):
+            set_approvals_required(on == "on")
+            await update.message.reply_text(f"approvals_required={approvals_required()}")
+        else:
+            await update.message.reply_text("Use approvals on|off|status")
+
+    else:
+        await update.message.reply_text(
+            "Unknown /run subcommand. Try: oc_auto | oc_now | approvals"
+        )
 async def set_levels_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await _guard(update): return
     if not context.args:
