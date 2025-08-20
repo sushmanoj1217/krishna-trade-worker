@@ -419,3 +419,20 @@ def count_today_trades(tz="Asia/Kolkata"):
         if ts == today:
             cnt += 1
     return cnt
+# -------------------- Legacy alias helpers (for older callers) --------------------
+
+def log_signal_row(row):
+    """Alias → append to Signals."""
+    return write_signal_row(row)
+
+def log_trade_row(row):
+    """Alias → append to Trades."""
+    return write_trade_row(row)
+
+def log_oc_live_row(row):
+    """Alias → append to OC_Live."""
+    return write_oc_live_row(row)
+
+def log_status(event: str, detail: str = ""):
+    """Alias → append to Status with timestamp."""
+    return write_status(event, detail)
