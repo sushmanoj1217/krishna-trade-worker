@@ -488,7 +488,7 @@ def log_signal_row(row_or_dict):
 
 
 # =========================
-# Trade closing helper (NEW)
+# Trade closing helper (note-supported)
 # =========================
 def _find_trade_row_index(trade_id: str) -> Optional[int]:
     """
@@ -518,10 +518,11 @@ def _header_col_map(header: List[str]) -> Dict[str, int]:
     return {h: i for i, h in enumerate([str(x).strip().lower() for x in header])}
 
 
-def close_trade(trade_id: str, exit_ltp: float, result: str, pnl: float) -> None:
+def close_trade(trade_id: str, exit_ltp: float, result: str, pnl: float, note: Optional[str] = None) -> None:
     """
     Public helper used by EOD auto-flat / MV-reversal exit:
     Updates Trades row for given trade_id with exit_ltp, exit_time(IST), result, pnl.
+    If `note` provided and a 'notes'/'note' column exists, fills it too.
     Safe on missing columns / 10M cap / 429 (no crash).
     """
     try:
@@ -540,6 +541,8 @@ def close_trade(trade_id: str, exit_ltp: float, result: str, pnl: float) -> None
             cmap.get("exit_time", 0),
             cmap.get("result", 0),
             cmap.get("pnl", 0),
+            cmap.get("notes", 0),
+            cmap.get("note", 0),
         ) + 1
         if len(row) < need:
             row = row + [""] * (need - len(row))
@@ -559,6 +562,11 @@ def close_trade(trade_id: str, exit_ltp: float, result: str, pnl: float) -> None
         _set("exit_time", now_str())
         _set("result", result)
         _set("pnl", pnl)
+        if note is not None:
+            if "notes" in cmap:
+                _set("notes", note)
+            elif "note" in cmap:
+                _set("note", note)
 
         update_row("Trades", idx, row)
     except Exception:
