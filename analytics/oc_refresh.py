@@ -70,3 +70,36 @@ async def day_oc_loop():
             raise
         # else keep old cache
         return
+# ===== Back-compat alias (append-only, safe) =====
+# Some callers (e.g., krishna_main.py) expect `refresh_once` in this module.
+# If it doesn't exist (after refactors), we alias it to whichever refresh function is present.
+# This block is additive and won't interfere with your existing logic.
+
+try:
+    # If already defined by your code, keep it.
+    refresh_once  # type: ignore[name-defined]
+except NameError:
+    # Try common function names we've used across refactors
+    _CANDIDATES = (
+        "refresh_now",
+        "run_once",
+        "refresh",
+        "do_refresh",
+        "refresh_one",
+        "do_oc_refresh",
+    )
+    _bound = None
+    for _name in _CANDIDATES:
+        _fn = globals().get(_name)
+        if callable(_fn):
+            _bound = _fn
+            break
+    if _bound is None:
+        # Give a clear import-time error if nothing matches
+        raise ImportError(
+            "analytics.oc_refresh: 'refresh_once' not found, and none of the fallback "
+            f"names exist: {', '.join(_CANDIDATES)}"
+        )
+    else:
+        refresh_once = _bound  # type: ignore[assignment]
+# ===== /Back-compat alias =====
