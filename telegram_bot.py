@@ -54,7 +54,7 @@ except Exception:
 
 # ---- telegram imports (PTB v13/v20 compatible bootstrap) -------------------
 # We prefer PTB v13 Updater (your logs already show polling OK with it).
-from telegram import Update, ParseMode
+from telegram import Update
 from telegram.ext import (
     Updater,
     CallbackContext,
