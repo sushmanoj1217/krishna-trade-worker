@@ -1,29 +1,26 @@
-from typing import Optional, Dict, Any
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import datetime
 
 @dataclass
 class OCSnapshot:
+    ts: datetime
     spot: float
-    s1: float | None
-    s2: float | None
-    r1: float | None
-    r2: float | None
+    s1: float
+    s2: float
+    r1: float
+    r2: float
     expiry: str
-    vix: float | None = None
-    pcr: float | None = None
-    max_pain: float | None = None
-    max_pain_dist: float | None = None
-    bias_tag: str | None = None
+    vix: float | None
+    pcr: float | None
+    max_pain: float
+    bias: str | None
     stale: bool = False
-    ts: datetime | None = None
-    extras: Dict[str, Any] = field(default_factory=dict)
 
-_last_snapshot: Optional[OCSnapshot] = None
+_CACHE: OCSnapshot | None = None
 
-def set_snapshot(s: OCSnapshot):
-    global _last_snapshot
-    _last_snapshot = s
+def set_snapshot(snap: OCSnapshot):
+    global _CACHE
+    _CACHE = snap
 
-def get_snapshot() -> Optional[OCSnapshot]:
-    return _last_snapshot
+def get_snapshot() -> OCSnapshot | None:
+    return _CACHE
