@@ -1,311 +1,163 @@
-# integrations/option_chain_dhan.py
 import os
-import re
-import csv
-import io
+import json
 import time
+from dataclasses import dataclass
+from datetime import datetime, timezone, timedelta
+from typing import Dict, Any
+
 import requests
-from datetime import date
-from tenacity import retry, stop_after_attempt, wait_fixed
+from tenacity import retry, stop_after_attempt, wait_fixed, retry_if_exception_type
+
 from utils.logger import log
-from utils import telemetry
+from utils.params import Params
 
-DHAN_BASE = os.getenv("DHAN_BASE", "https://api.dhan.co").rstrip("/")
-DHAN_UNDERLYING_SCRIP = os.getenv("DHAN_UNDERLYING_SCRIP", "").strip()
-DHAN_UNDERLYING_SEG = os.getenv("DHAN_UNDERLYING_SEG", "IDX_I").strip()
-DHAN_EXPIRY_ENV = os.getenv("DHAN_EXPIRY", "").strip()
-OC_SYMBOL = os.getenv("OC_SYMBOL", "NIFTY").strip().upper()
-MATCH_HINT = os.getenv("DHAN_MATCH_STRING", "").strip()
+class TooManyRequests(Exception):
+    pass
 
-EXPIRY_TTL_SECS = int(os.getenv("EXPIRY_TTL_SECS", "300"))
-_MIN_INTERVAL = os.getenv("DHAN_MIN_INTERVAL_SECS", os.getenv("OC_REFRESH_SECS", "10"))
-try:
-    MIN_INTERVAL_SECS = max(3, int(_MIN_INTERVAL))
-except Exception:
-    MIN_INTERVAL_SECS = 10
-COOLDOWN_429_SECS = int(os.getenv("DHAN_429_COOLDOWN_SECS", "30"))
+@dataclass
+class OCResult:
+    spot: float
+    s1: float
+    s2: float
+    r1: float
+    r2: float
+    expiry: str
+    pcr: float | None
+    max_pain: float
+    bias_tag: str | None
+    vix: float | None
 
-_last_sid_logged = None
-_expiry_cache = {"value": None, "ts": 0.0}
-_oc_cache = {"data": None, "ts": 0.0, "expiry": None}
-_cooldown_until = 0.0
-
-def _headers():
-    token = os.getenv("DHAN_ACCESS_TOKEN", "")
-    cid = os.getenv("DHAN_CLIENT_ID", "")
-    if not token or not cid:
-        raise RuntimeError("DHAN credentials missing (DHAN_CLIENT_ID / DHAN_ACCESS_TOKEN)")
-    return {"access-token": token, "client-id": cid, "Content-Type": "application/json"}
-
-def _post_json(url: str, payload: dict, timeout=12):
-    r = requests.post(url, headers=_headers(), json=payload, timeout=timeout)
-    if r.status_code >= 400:
-        log.warning(f"Dhan {r.status_code}: {r.text[:300]} @ {url}")
-    r.raise_for_status()
-    return r.json()
-
-def _get_text(url: str, timeout=12):
-    r = requests.get(url, headers=_headers(), timeout=timeout)
-    if r.status_code >= 400:
-        log.warning(f"Dhan {r.status_code}: {r.text[:300]} @ {url}")
-    r.raise_for_status()
-    r.encoding = "utf-8"
-    return r.text
-
-@retry(stop=stop_after_attempt(3), wait=wait_fixed(1))
-def get_expiry_list(underlying_scrip: int, underlying_seg: str) -> list[str]:
-    url = f"{DHAN_BASE}/v2/optionchain/expirylist"
-    data = _post_json(url, {"UnderlyingScrip": underlying_scrip, "UnderlyingSeg": underlying_seg})
-    return (data.get("data") or []) if isinstance(data, dict) else []
-
-def _pick_nearest_expiry(expiries: list[str]) -> str | None:
-    if not expiries:
-        return None
-    today = date.today().isoformat()
-    future = sorted([d for d in expiries if d >= today])
-    return future[0] if future else sorted(expiries)[0]
-
-def _get_option_chain_once(underlying_scrip: int, underlying_seg: str, expiry: str) -> dict:
-    url = f"{DHAN_BASE}/v2/optionchain"
-    r = requests.post(
-        url, headers=_headers(),
-        json={"UnderlyingScrip": underlying_scrip, "UnderlyingSeg": underlying_seg, "Expiry": expiry},
-        timeout=12
-    )
-    if r.status_code == 429:
-        global _cooldown_until
-        _cooldown_until = time.time() + COOLDOWN_429_SECS
-        telemetry.inc("dhan_429")
-        log.warning(f"Dhan 429: {r.text[:200]} @ {url} → cooldown {COOLDOWN_429_SECS}s")
-        r.raise_for_status()
-    if r.status_code >= 400:
-        log.warning(f"Dhan {r.status_code}: {r.text[:300]} @ {url}")
-    r.raise_for_status()
-    return r.json()
-
-def _norm(x: str) -> str:
-    x = (x or "").upper()
-    x = re.sub(r"[^A-Z0-9 ]+", " ", x)
-    x = re.sub(r"\s+", " ", x).strip()
-    return x
-
-def _targets_for_symbol(sym: str) -> list[str]:
-    if MATCH_HINT:
-        return [_norm(MATCH_HINT)]
-    s = (sym or "").upper()
-    if s == "NIFTY":
-        return [_norm("NIFTY 50"), "NIFTY50", "NIFTY-50"]
-    if s == "BANKNIFTY":
-        return [_norm("NIFTY BANK"), "BANK NIFTY", "BANKNIFTY", "NIFTYBANK"]
-    if s == "FINNIFTY":
-        return [_norm("NIFTY FINANCIAL SERVICES"), "FINNIFTY", _norm("NIFTY FIN SERVICES")]
-    return [s]
-
-@retry(stop=stop_after_attempt(3), wait=wait_fixed(1))
-def _fetch_instruments_csv_for_segment(segment: str) -> list[dict]:
-    url = f"{DHAN_BASE}/v2/instrument/{segment}"
-    text = _get_text(url)
-    f = io.StringIO(text)
-    reader = csv.DictReader(f)
-    return [row for row in reader]
-
-def _extract_security_id(row: dict) -> int | None:
-    candidates = [
-        "Security ID", "SecurityID", "SecurityId",
-        "SEM_SMST_SECURITY_ID", "SEM_SECURITY_ID", "SECURITY_ID",
-        "SEM_SEC_ID", "SEM_SECID", "SEC_ID",
-    ]
-    for k in candidates:
-        v = row.get(k)
-        if isinstance(v, str) and v.strip().isdigit():
-            return int(v.strip())
-        if isinstance(v, int):
-            return v
-    for k, v in row.items():
-        if isinstance(v, str) and v.strip().isdigit():
-            return int(v.strip())
-    return None
-
-def _name_blob(row: dict) -> str:
-    cols = [
-        "Display Name","DISPLAY_NAME","display_name",
-        "Trading Symbol","TRADING_SYMBOL","SEM_TRADING_SYMBOL","TradingSymbol",
-        "Scrip Name","SCRIP_NAME","ScripName",
-        "Symbol Name","SYMBOL_NAME","symbol_name",
-        "Instrument Name","INSTRUMENT_NAME","Instrument","NAME","Name"
-    ]
-    parts = [row.get(c) for c in cols if isinstance(row.get(c), str) and row.get(c)]
-    return _norm(" ".join(parts))
-
-def _looks_like_index(row: dict) -> bool:
-    for k in ["Instrument Type","INSTRUMENT_TYPE","InstrumentType","Instrument","INSTRUMENT"]:
-        v = row.get(k)
-        if isinstance(v, str) and "INDEX" in v.upper():
-            return True
-    return False
-
-def _sid_from_env_map(sym: str) -> int | None:
-    raw = DHAN_UNDERLYING_SCRIP
-    if not raw:
-        return None
-    raw = raw.replace(";", ",")
-    if raw.strip().isdigit():
-        return int(raw.strip())
-    kv = {}
-    for p in raw.split(","):
-        if "=" in p:
-            k, v = p.split("=", 1)
-            k = k.strip().upper()
-            v = v.strip()
-            if v.replace(".", "", 1).isdigit():
-                kv[k] = int(float(v))
-    return kv.get(sym.upper())
-
-def _resolve_security_id(sym: str, segment: str) -> int | None:
-    targets = _targets_for_symbol(sym)
-    rows = _fetch_instruments_csv_for_segment(segment)
-    if not rows:
-        log.warning("Instrument CSV empty")
-        return None
-    for row in rows:
-        blob = _name_blob(row)
-        if any(t == blob for t in targets):
-            sid = _extract_security_id(row)
-            if sid:
-                log.info(f"Resolved SecurityID {sid} via exact name match: {blob}")
-                return sid
-    best_sid = None
-    for row in rows:
-        blob = _name_blob(row)
-        if any(t in blob for t in targets):
-            sid = _extract_security_id(row)
-            if sid:
-                if _looks_like_index(row):
-                    log.info(f"Resolved SecurityID {sid} via index match: {blob}")
-                    return sid
-                best_sid = best_sid or sid
-    if best_sid:
-        log.info(f"Resolved SecurityID {best_sid} via fuzzy name match")
-        return best_sid
-    return None
-
-def ensure_inputs() -> tuple[int, str, str | None]:
-    global _last_sid_logged
-    sid_from_env = _sid_from_env_map(OC_SYMBOL)
-    if sid_from_env:
-        if sid_from_env != _last_sid_logged:
-            log.info(f"Using SecurityID from env: {sid_from_env}")
-            _last_sid_logged = sid_from_env
-        return sid_from_env, DHAN_UNDERLYING_SEG, (DHAN_EXPIRY_ENV or None)
-    sid = _resolve_security_id(OC_SYMBOL, DHAN_UNDERLYING_SEG)
-    if sid:
-        if sid != _last_sid_logged:
-            log.info(f"Resolved SecurityID {sid} for {OC_SYMBOL}")
-            _last_sid_logged = sid
-        return sid, DHAN_UNDERLYING_SEG, (DHAN_EXPIRY_ENV or None)
-    fallback = {"NIFTY": 13, "BANKNIFTY": 25, "FINNIFTY": 27}.get(OC_SYMBOL)
-    if fallback:
-        if fallback != _last_sid_logged:
-            log.warning(f"Auto-resolve failed; falling back to hardcoded ID {fallback} for {OC_SYMBOL}")
-            _last_sid_logged = fallback
-        return fallback, DHAN_UNDERLYING_SEG, (DHAN_EXPIRY_ENV or None)
+def _resolve_security_id(p: Params) -> int:
+    sym = p.symbol.upper()
+    # SCRIP_MAP overrides SCRIP numeric
+    map_str = os.getenv("DHAN_UNDERLYING_SCRIP_MAP", "").strip()
+    if map_str:
+        mp = {}
+        for part in map_str.split(","):
+            if "=" in part:
+                k, v = part.split("=")
+                mp[k.strip().upper()] = int(v.strip())
+        if sym in mp:
+            log.info(f"Using SecurityID from map: {sym}={mp[sym]}")
+            return mp[sym]
+    scrip_env = os.getenv("DHAN_UNDERLYING_SCRIP", "").strip()
+    if scrip_env.isdigit():
+        log.info(f"Using SecurityID from env: {scrip_env}")
+        return int(scrip_env)
     raise RuntimeError("DHAN_UNDERLYING_SCRIP invalid and auto-resolve failed. Set '13' or map 'NIFTY=13,...'.")
 
-def compute_levels_from_oc_v2(oc_json: dict, used_expiry: str) -> dict:
-    """
-    Build levels + PCR/MaxPain and also expose per-strike OI & LTP maps for premium proxy.
-    Returns: {spot,s1,s2,r1,r2,pcr,max_pain,expiry, oc_oi:{strike:{ce,pe}}, oc_px:{strike:{ce,pe}}, strike_step}
-    """
-    data = oc_json.get("data") or {}
-    oc = data.get("oc") or {}
-    spot = float(data.get("last_price") or 0.0)
+def _headers() -> Dict[str, str]:
+    cid = os.getenv("DHAN_CLIENT_ID", "")
+    at = os.getenv("DHAN_ACCESS_TOKEN", "")
+    return {
+        "Accept": "application/json",
+        "Content-Type": "application/json",
+        "ClientId": cid,
+        "AccessToken": at,
+    }
 
-    rows = []
-    pe_sum = 0
-    ce_sum = 0
-    oc_oi: dict[float, dict] = {}
-    oc_px: dict[float, dict] = {}
+def _endpoint() -> str:
+    # v2 endpoint for optionchain snapshot (as per Dhan docs; you may adjust if required)
+    return "https://api.dhan.co/v2/optionchain"
 
-    for k, v in oc.items():
+@retry(
+    stop=stop_after_attempt(3),
+    wait=wait_fixed(2),
+    retry=retry_if_exception_type((requests.HTTPError,)),
+    reraise=True
+)
+def _post(url: str, payload: Dict[str, Any]) -> Dict[str, Any]:
+    r = requests.post(url, headers=_headers(), data=json.dumps(payload), timeout=10)
+    if r.status_code == 429:
+        raise TooManyRequests(r.text)
+    if r.status_code >= 400:
         try:
-            strike = float(k)
-        except Exception:
-            continue
-        ce = (v.get("ce") or {})
-        pe = (v.get("pe") or {})
-        ce_oi = int(ce.get("oi") or 0)
-        pe_oi = int(pe.get("oi") or 0)
-        ce_ltp = float(ce.get("ltp") or 0.0)
-        pe_ltp = float(pe.get("ltp") or 0.0)
-        rows.append((strike, ce_oi, pe_oi))
-        oc_oi[strike] = {"ce": ce_oi, "pe": pe_oi}
-        oc_px[strike] = {"ce": ce_ltp, "pe": pe_ltp}
-        ce_sum += ce_oi
-        pe_sum += pe_oi
+            r.raise_for_status()
+        except Exception as e:
+            raise requests.HTTPError(r.text) from e
+    return r.json()
 
-    if not rows:
-        raise RuntimeError("Empty option chain data")
+def _compute_levels_from_oc_v2(data: Dict[str, Any], p: Params) -> Dict[str, Any]:
+    """
+    Expect Dhan OC v2 response with CE/PE OI by strike.
+    Compute:
+    - spot (from underlyingPrice)
+    - S1/S2/R1/R2 (100-pt grid around MaxPain / nearest walls)
+    - PCR (sum OI)
+    - MaxPain (strike of min CE+PE pain)
+    - bias tags (simple rules)
+    """
+    underlying = data.get("underlyingPrice") or data.get("underlying_index_price")
+    if underlying is None:
+        raise RuntimeError("No underlying price in response")
+    spot = float(underlying)
 
-    rows_sorted = sorted(rows, key=lambda t: t[0])
-    diffs = [round(rows_sorted[i+1][0] - rows_sorted[i][0], 2) for i in range(len(rows_sorted)-1)]
-    strike_step = min([d for d in diffs if d > 0], default=None)
+    # Build OI maps
+    ce_map: Dict[int, float] = {}
+    pe_map: Dict[int, float] = {}
+    for row in data.get("optionChain", []):
+        k = int(row["strikePrice"])
+        ce_map[k] = float(row.get("ceOpenInterest", 0))
+        pe_map[k] = float(row.get("peOpenInterest", 0))
 
-    top_pe = sorted(rows, key=lambda t: t[2], reverse=True)
-    top_ce = sorted(rows, key=lambda t: t[1], reverse=True)
-    s1, s2 = (top_pe[0][0], top_pe[1][0]) if len(top_pe) >= 2 else (None, None)
-    r1, r2 = (top_ce[0][0], top_ce[1][0]) if len(top_ce) >= 2 else (None, None)
-    pcr = round(pe_sum / ce_sum, 4) if ce_sum > 0 else None
-    max_pain = max(rows, key=lambda t: (t[1] + t[2]))[0] if rows else None
+    # PCR
+    total_ce = sum(ce_map.values()) or 1.0
+    total_pe = sum(pe_map.values())
+    pcr = round(total_pe / total_ce, 2) if total_ce else None
+
+    # Max Pain (min total OI around strike) – very rough
+    all_strikes = sorted(set(ce_map.keys()) | set(pe_map.keys()))
+    if not all_strikes:
+        raise RuntimeError("Empty OC strikes")
+
+    pain = {k: ce_map.get(k, 0) + pe_map.get(k, 0) for k in all_strikes}
+    max_pain = min(pain, key=pain.get)
+
+    # levels around max_pain on round-100 grid (adjust by band)
+    # For indexes like NIFTY (50/100 step), BANKNIFTY (100), FINNIFTY (50)
+    step = 50 if p.symbol.upper() in ("NIFTY", "FINNIFTY") else 100
+    base = (max_pain // step) * step
+    s1 = float(base)
+    s2 = float(base - step)
+    r1 = float(base + step)
+    r2 = float(base + 2 * step)
+
+    # Bias tags
+    bias = None
+    mp_dist = abs(spot - max_pain)
+    if pcr is not None:
+        if pcr >= p.pcr_bull_high:
+            bias = "mvbullpcr"
+        elif pcr <= p.pcr_bear_low:
+            bias = "mvbearpcr"
+    # MP-based bias
+    mp_tag = "mvbullmp" if spot >= (max_pain + p.mp_support_dist) else ("mvbearmp" if spot <= (max_pain - p.mp_support_dist) else None)
+    if mp_tag:
+        bias = mp_tag
+
+    # VIX – Dhan OC may not include; leave None
+    vix = None
 
     return {
         "spot": spot,
         "s1": s1, "s2": s2, "r1": r1, "r2": r2,
+        "expiry": data.get("expiryDate") or data.get("expiry") or "",
         "pcr": pcr,
-        "max_pain": max_pain,
-        "expiry": used_expiry,
-        "oc_oi": oc_oi,
-        "oc_px": oc_px,
-        "strike_step": strike_step,
+        "max_pain": float(max_pain),
+        "bias_tag": bias,
+        "vix": vix,
+        "oi": {"ce": ce_map, "pe": pe_map},  # exposed for pattern checks
     }
 
-def fetch_levels() -> dict:
-    global _expiry_cache, _oc_cache, _cooldown_until
-    u_scrip, u_seg, expiry_override = ensure_inputs()
-
-    now = time.time()
-    if expiry_override:
-        expiry = expiry_override
-    else:
-        if (_expiry_cache["value"] is None) or (now - _expiry_cache["ts"] > EXPIRY_TTL_SECS):
-            expiries = get_expiry_list(u_scrip, u_seg)
-            picked = _pick_nearest_expiry(expiries)
-            if not picked:
-                raise RuntimeError("No expiry available from Dhan")
-            _expiry_cache = {"value": picked, "ts": now}
-            log.info(f"Picked expiry {picked} (cache {EXPIRY_TTL_SECS}s)")
-        expiry = _expiry_cache["value"]
-
-    if now < _cooldown_until:
-        if _oc_cache["data"] is not None and _oc_cache["expiry"] == expiry:
-            telemetry.inc("oc_fetch_success")  # serving from cache
-            log.warning(f"In cooldown ({int(_cooldown_until - now)}s left) → OC from cache")
-            return compute_levels_from_oc_v2(_oc_cache["data"], expiry)
-        raise RuntimeError("In 429 cooldown and no OC cache available")
-
-    if _oc_cache["data"] is not None and _oc_cache["expiry"] == expiry:
-        if (now - _oc_cache["ts"]) < MIN_INTERVAL_SECS:
-            telemetry.inc("oc_fetch_success")
-            return compute_levels_from_oc_v2(_oc_cache["data"], expiry)
-
-    try:
-        oc = _get_option_chain_once(u_scrip, u_seg, expiry)
-        telemetry.inc("oc_fetch_success")
-    except requests.HTTPError:
-        telemetry.inc("oc_fetch_fail")
-        if _oc_cache["data"] is not None and _oc_cache["expiry"] == expiry:
-            log.warning("HTTP error on OC fetch → serving cache")
-            return compute_levels_from_oc_v2(_oc_cache["data"], expiry)
-        raise
-
-    _oc_cache = {"data": oc, "ts": now, "expiry": expiry}
-    return compute_levels_from_oc_v2(oc, expiry)
+async def fetch_levels(p: Params) -> Dict[str, Any]:
+    sec = _resolve_security_id(p)
+    seg = os.getenv("DHAN_UNDERLYING_SEG", "IDX_I")
+    payload = {
+        "underlying": {
+            "securityType": seg,
+            "securityId": sec
+        }
+    }
+    url = _endpoint()
+    data = _post(url, payload)
+    return _compute_levels_from_oc_v2(data, p)
