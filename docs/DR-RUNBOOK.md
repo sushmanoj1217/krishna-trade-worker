@@ -1,16 +1,19 @@
-# Disaster Recovery Runbook — KRISHNA
+# DR RUNBOOK (KTW)
+**Freeze → Rescue → Restore**
 
-## Triggers
-- Broken deploy / bad params / repo wipe / corrupted cache.
-- Symptoms: worker crash-looping, no trades, OC stale, Telegram offline.
+1. **Freeze**
+   - Render Dashboard: Toggle Auto-Deploy OFF.
+   - Scale to 0 (if conflict/loop) → pause background worker.
 
-## Freeze
-1. On Render **turn OFF Auto-Deploy** (Service → Settings).
-2. Stop traffic to broken version: **Manual Deploy** previous good commit if needed.
-3. Snapshot current ENV: Render → Environment → **Download .env** (or copy).
+2. **Rescue**
+   - Open Shell.
+   - `printf` all critical env: TELEGRAM_*, GSHEET_*, OC_* , DHAN_*.
+   - Fix obvious drifts (OC_SYMBOL single; DHAN_UNDERLYING_* consistent).
+   - `python -u scripts/sheets_admin.py setup` to re-create tabs.
 
-## Rescue (Render Shell)
-1. Open a **Shell** on current instance.
-2. Export environment:
-   ```bash
-   printenv | sort > /opt/render/project/.env.backup
+3. **Restore**
+   - Manual Deploy → check logs: “✅ Sheets tabs ensured”, “Telegram bot started”, “Day loop started”.
+   - `/run oc_auto status` on Telegram.
+   - `/oc_now` to verify snapshot & checks.
+
+> Note: Telegram **409 Conflict** तब आएगा जब **एक से ज़्यादा** polling instances चल रहे हों. Ensure only **one** background worker or one shell run at a time.
