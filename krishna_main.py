@@ -42,7 +42,7 @@ async def day_loop():
             except Exception as e: log.error(f"signal gen err: {e}")
             try: await trade_tick()
             except Exception as e: log.error(f"trade loop err: {e}")
-            try: await trail_tick()
+            try: trail_tick(
             except Exception as e: log.error(f"tp/sl watcher err: {e}")
 
         beats += 1
