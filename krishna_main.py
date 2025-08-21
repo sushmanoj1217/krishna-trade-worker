@@ -14,7 +14,7 @@ from utils.logger import log
 from integrations import sheets as sh
 
 # OC refresh (pulls Dhan OC / compute levels / write OC_Live etc.)
-from analytics.oc_refresh import refresh_once
+from analytics.oc_refresh_shim import refresh_once
 
 # Telegram application factory (must return telegram.ext.Application or None if disabled)
 from telegram_bot import init as init_bot
