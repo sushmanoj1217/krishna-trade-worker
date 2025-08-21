@@ -1,7 +1,12 @@
-from typing import Tuple
+from utils.params import Params
 
-def rr_feasible(entry: float, stop: float, min_target_points: float) -> Tuple[bool, float, float]:
-    risk = abs(entry - stop)
-    tp = entry + 2 * risk if entry > stop else entry - 2 * risk
-    rr_ok = risk > 0 and abs(tp - entry) >= max(min_target_points, 1)
-    return rr_ok, risk, tp
+def rr_feasible(side: str, entry: float, sl: float, p: Params) -> bool:
+    # simple: requires >= 2x SL distance & min points
+    if side == "CE":
+        min_pts = p.min_target_points_n if p.symbol=="NIFTY" else (p.min_target_points_b if p.symbol=="BANKNIFTY" else p.min_target_points_f)
+        tgt = entry + 2*(entry - sl)
+        return (tgt - entry) >= min_pts
+    else:
+        min_pts = p.min_target_points_n if p.symbol=="NIFTY" else (p.min_target_points_b if p.symbol=="BANKNIFTY" else p.min_target_points_f)
+        tgt = entry - 2*(sl - entry)
+        return (entry - tgt) >= min_pts
