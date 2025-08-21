@@ -11,7 +11,6 @@ try:
     from utils.logger import log
 except Exception:
     import logging
-
     logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
     log = logging.getLogger("telegram_bot")
 
@@ -44,7 +43,7 @@ except Exception:
     ops_cmds = None  # type: ignore
     _HAS_OPS = False
 
-# Optional signal generator (name-agnostic dynamic call)
+# Optional signal generator
 try:
     import agents.signal_generator as sg
     _HAS_SG = True
@@ -52,9 +51,9 @@ except Exception:
     sg = None  # type: ignore
     _HAS_SG = False
 
-# ---- telegram imports (PTB v13 compatible bootstrap) -----------------------
+# ---- telegram imports (PTB v20+) ------------------------------------------
 from telegram import Update
-from telegram.ext import Updater, CallbackContext, CommandHandler
+from telegram.ext import Application, ApplicationBuilder, CommandHandler, ContextTypes
 
 # ----------------------------------------------------------------------------
 # Module state
@@ -63,7 +62,7 @@ _LAST_OC_TS: float = 0.0
 _MIN_OC_REUSE_SEC = 8  # allow quick /oc_now right after /run oc_now without spamming OC feed
 
 def _ensure_params() -> Any:
-    """Get merged Params (defaults+overrides)."""
+    """Get merged Params (defaults+overrides) with safe fallback."""
     if Params is None:
         class _P:  # minimal fallback
             symbol = os.getenv("OC_SYMBOL", "NIFTY")
@@ -102,7 +101,6 @@ def _try_compute_checks(snapshot: Dict[str, Any], params: Any) -> Dict[str, Any]
         result["reason"] = "signal_engine_unavailable"
         return result
 
-    # Try function signatures in decreasing preference
     candidates = [
         "evaluate_checks",     # (snapshot, params) -> dict
         "evaluate",            # (snapshot, params) -> dict OR (signal, dict)
@@ -122,12 +120,10 @@ def _try_compute_checks(snapshot: Dict[str, Any], params: Any) -> Dict[str, Any]
                 out = out[1]
             if isinstance(out, dict):
                 result.update({k: out.get(k, result.get(k)) for k in result.keys()})
-                # sometimes engines return keys like 'checks': {'c1':True,...}
                 if "checks" in out and isinstance(out["checks"], dict):
                     for ck, v in out["checks"].items():
                         if ck in result:
                             result[ck] = v
-                # mv flags alt names
                 for a, b in [("mv_pcr", "mv_pcr_ok"), ("mv_mp", "mv_mp_ok")]:
                     if a in out and result.get(b) is None:
                         result[b] = out[a]
@@ -155,7 +151,6 @@ def _fmt_none(v: Any, alt: str = "—") -> str:
     return alt if v is None else str(v)
 
 def _derive_bias(checks: Dict[str, Any]) -> str:
-    # populate bias from mv/oc-pattern if engine provided
     tags = []
     if checks.get("mv_pcr_ok") or checks.get("mv_mp_ok"):
         tags.append("mv")
@@ -165,7 +160,7 @@ def _derive_bias(checks: Dict[str, Any]) -> str:
 
 def _format_oc_now(snapshot: Dict[str, Any], checks: Dict[str, Any]) -> str:
     spot = snapshot.get("spot")
-    vix = snapshot.get("vix")  # often None from Dhan
+    vix = snapshot.get("vix")
     pcr = snapshot.get("pcr")
     mp = snapshot.get("max_pain")
     mp_dist = None
@@ -175,19 +170,15 @@ def _format_oc_now(snapshot: Dict[str, Any], checks: Dict[str, Any]) -> str:
     except Exception:
         mp_dist = None
 
-    s1 = snapshot.get("s1")
-    s2 = snapshot.get("s2")
-    r1 = snapshot.get("r1")
-    r2 = snapshot.get("r2")
+    s1 = snapshot.get("s1"); s2 = snapshot.get("s2")
+    r1 = snapshot.get("r1"); r2 = snapshot.get("r2")
     exp = snapshot.get("expiry")
 
-    # Triggers (with buffers already applied in snapshot if any)
     t_s1 = snapshot.get("t_s1", s1)
     t_s2 = snapshot.get("t_s2", s2)
     t_r1 = snapshot.get("t_r1", r1)
     t_r2 = snapshot.get("t_r2", r2)
 
-    # Decision
     eligible = checks.get("eligible", False)
     bias = _derive_bias(checks)
 
@@ -224,8 +215,8 @@ def _format_oc_now(snapshot: Dict[str, Any], checks: Dict[str, Any]) -> str:
     return msg
 
 # ----------------------------------------------------------------------------
-# Telegram command handlers
-def _refresh_and_compute(force_refresh: bool) -> Tuple[Optional[Dict[str, Any]], Dict[str, Any], str]:
+# Telegram command handlers (async for PTB v20+)
+async def _refresh_and_compute(force_refresh: bool) -> Tuple[Optional[Dict[str, Any]], Dict[str, Any], str]:
     """
     Returns: (snapshot_or_none, checks, note)
     note contains reason if snapshot missing (rate limit etc).
@@ -245,19 +236,17 @@ def _refresh_and_compute(force_refresh: bool) -> Tuple[Optional[Dict[str, Any]],
     else:
         try:
             if force_refresh or not can_reuse or _LAST_OC_SNAPSHOT is None:
-                snap = refresh_once(params)  # expected to return dict with s1/s2/r1/r2/spot/pcr/max_pain/expiry/...
+                snap = refresh_once(params)  # sync function in your codebase
                 if snap:
                     _LAST_OC_SNAPSHOT = snap
                     _LAST_OC_TS = now
             else:
                 snap = _LAST_OC_SNAPSHOT
         except Exception as e:
-            # Use last-good snapshot if any
             note = f"OC refresh failed: {e.__class__.__name__}"
             log.error(f"OC refresh failed in /oc_now: {e}")
             snap = _LAST_OC_SNAPSHOT
 
-    # Compute checks
     checks: Dict[str, Any] = {}
     if snap:
         try:
@@ -271,11 +260,10 @@ def _refresh_and_compute(force_refresh: bool) -> Tuple[Optional[Dict[str, Any]],
     return snap, checks, note
 
 
-# /oc_now → render from last-good (with compute). No forced refresh (to be gentle on OC API).
-def cmd_oc_now(update: Update, context: CallbackContext) -> None:
-    snap, checks, note = _refresh_and_compute(force_refresh=False)
+async def cmd_oc_now(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    snap, checks, note = await _refresh_and_compute(force_refresh=False)
     if not snap:
-        update.message.reply_text(
+        await update.message.reply_text(
             "OC snapshot unavailable (rate-limit/first snapshot). 20–30s बाद फिर से /oc_now भेजें."
         )
         return
@@ -283,41 +271,42 @@ def cmd_oc_now(update: Update, context: CallbackContext) -> None:
     msg = _format_oc_now(snap, checks)
     if note:
         msg = f"{msg}\n\n_note: {note}_"
-    update.message.reply_text(msg)
+    await update.message.reply_text(msg)
 
-# /run oc_now → FORCE refresh + compute + render (operator action)
-def cmd_run(update: Update, context: CallbackContext) -> None:
+
+async def cmd_run(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     text = (update.message.text or "").strip()
     parts = text.split()
     if len(parts) >= 2 and parts[1].lower() == "oc_now":
-        # force refresh path
-        snap, checks, note = _refresh_and_compute(force_refresh=True)
+        snap, checks, note = await _refresh_and_compute(force_refresh=True)
         if not snap:
-            update.message.reply_text("OC snapshot unavailable (rate-limit?). बाद में /run oc_now फिर से करें.")
+            await update.message.reply_text("OC snapshot unavailable (rate-limit?). बाद में /run oc_now फिर से करें.")
             return
         msg = _format_oc_now(snap, checks)
         if note:
             msg = f"{msg}\n\n_note: {note}_"
-        update.message.reply_text(msg)
+        await update.message.reply_text(msg)
         return
 
-    # Delegate other /run commands to ops bridge if available (so your existing oc_auto etc keep working)
     if _HAS_OPS:
         try:
-            return ops_cmds.handle_run_command(update, context)  # type: ignore
+            # ops bridge may still be sync; call directly
+            ops_cmds.handle_run_command(update, context)  # type: ignore
+            return
         except Exception as e:
             log.error(f"ops_cmds.handle_run_command failed: {e}\n{traceback.format_exc()}")
-            update.message.reply_text("Run command failed in ops bridge.")
+            await update.message.reply_text("Run command failed in ops bridge.")
             return
 
-    # Fallback help
-    update.message.reply_text("Use: /run oc_now  |  (other /run commands via ops are not wired here)")
+    await update.message.reply_text("Use: /run oc_now  |  (other /run commands via ops are not wired here)")
 
-def cmd_start(update: Update, context: CallbackContext) -> None:
-    update.message.reply_text("Krishna bot online. Try /oc_now or /run oc_now")
 
-def cmd_help(update: Update, context: CallbackContext) -> None:
-    update.message.reply_text(
+async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await update.message.reply_text("Krishna bot online. Try /oc_now or /run oc_now")
+
+
+async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await update.message.reply_text(
         "Commands:\n"
         "/oc_now — latest OC snapshot + checks\n"
         "/run oc_now — force refresh + checks\n"
@@ -325,22 +314,22 @@ def cmd_help(update: Update, context: CallbackContext) -> None:
     )
 
 # ----------------------------------------------------------------------------
-# Boot
-def init(token: Optional[str] = None) -> Any:
+# Boot (async for PTB v20+)
+async def init(token: Optional[str] = None) -> Application:
     token = token or os.getenv("TELEGRAM_BOT_TOKEN")
     if not token:
         raise RuntimeError("TELEGRAM_BOT_TOKEN missing")
 
-    updater = Updater(token=token, use_context=True)
-    dp = updater.dispatcher
+    app: Application = ApplicationBuilder().token(token).build()
 
-    # Handlers
-    dp.add_handler(CommandHandler("start", cmd_start))
-    dp.add_handler(CommandHandler("help", cmd_help))
-    dp.add_handler(CommandHandler("oc_now", cmd_oc_now))
-    dp.add_handler(CommandHandler("run", cmd_run))
+    app.add_handler(CommandHandler("start", cmd_start))
+    app.add_handler(CommandHandler("help", cmd_help))
+    app.add_handler(CommandHandler("oc_now", cmd_oc_now))
+    app.add_handler(CommandHandler("run", cmd_run))
 
-    # Start polling here (so main just logs)
-    updater.start_polling(timeout=30, clean=True)
+    # Initialize & start application, then start polling (non-blocking)
+    await app.initialize()
+    await app.start()
+    await app.updater.start_polling(drop_pending_updates=True)
     log.info("Telegram polling started")
-    return updater
+    return app
