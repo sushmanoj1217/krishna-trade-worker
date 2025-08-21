@@ -52,16 +52,9 @@ except Exception:
     sg = None  # type: ignore
     _HAS_SG = False
 
-# ---- telegram imports (PTB v13/v20 compatible bootstrap) -------------------
-# We prefer PTB v13 Updater (your logs already show polling OK with it).
+# ---- telegram imports (PTB v13 compatible bootstrap) -----------------------
 from telegram import Update
-from telegram.ext import (
-    Updater,
-    CallbackContext,
-    CommandHandler,
-    MessageHandler,
-    Filters,
-)
+from telegram.ext import Updater, CallbackContext, CommandHandler
 
 # ----------------------------------------------------------------------------
 # Module state
@@ -346,9 +339,6 @@ def init(token: Optional[str] = None) -> Any:
     dp.add_handler(CommandHandler("help", cmd_help))
     dp.add_handler(CommandHandler("oc_now", cmd_oc_now))
     dp.add_handler(CommandHandler("run", cmd_run))
-
-    # a simple echo fallback for debugging (disabled by default)
-    # dp.add_handler(MessageHandler(Filters.text & ~Filters.command, cmd_oc_now))
 
     # Start polling here (so main just logs)
     updater.start_polling(timeout=30, clean=True)
