@@ -2,513 +2,355 @@
 from __future__ import annotations
 
 import os
-import asyncio
-from typing import Optional, Dict, Any, List
+import time
+import traceback
+from typing import Any, Dict, Optional, Tuple
 
-from telegram import Update
-from telegram.constants import ParseMode
-from telegram.ext import (
-    Application,
-    ApplicationBuilder,
-    CommandHandler,
-    MessageHandler,
-    ContextTypes,
-    filters,
-)
-
-# ---- internal imports ----
-from utils.logger import log
-
-# state toggles (with safe fallbacks)
+# ---- logging ---------------------------------------------------------------
 try:
-    from utils.state import (
-        is_oc_auto,
-        set_oc_auto,
-        approvals_required,
-        set_approvals_required,
-    )
+    from utils.logger import log
 except Exception:
-    _OC_AUTO = True
-    _APPROVALS = False
-    def is_oc_auto(): return _OC_AUTO
-    def set_oc_auto(v: bool): globals()["_OC_AUTO"] = bool(v)
-    def approvals_required(): return _APPROVALS
-    def set_approvals_required(v: bool): globals()["_APPROVALS"] = bool(v)
+    import logging
 
-# OC snapshot cache & refresher (safe fallbacks)
-try:
-    from utils.cache import get_snapshot
-except Exception:
-    def get_snapshot(): return None
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+    log = logging.getLogger("telegram_bot")
 
+# ---- project deps ----------------------------------------------------------
+# OC snapshot refresh (last-good cache inside oc_refresh/in cache utils)
 try:
     from analytics.oc_refresh import refresh_once
-except Exception:
-    async def refresh_once(): return None
+except Exception as e:  # pragma: no cover
+    refresh_once = None
+    log.error(f"Import failed: analytics.oc_refresh.refresh_once: {e}")
 
-# Sheets wrapper (safe no-op fallbacks)
+# Params (buffers, bands…)
+try:
+    from utils.params import Params
+except Exception as e:  # pragma: no cover
+    Params = None  # type: ignore
+    log.error(f"Import failed: utils.params.Params: {e}")
+
+# Optional Sheets taps (not required for /oc_now)
 try:
     from integrations import sheets as sh
 except Exception:
-    class _S:
-        def get_all_values(self, *a, **k): return []
-        def now_str(self): 
-            import datetime as _dt
-            return _dt.datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
-        def append_row(self, *a, **k): pass
-        def write_status(self, *a, **k): pass
-        def write_signal_row(self, *a, **k): pass
-        def write_trade_row(self, *a, **k): pass
-        def get_last_signal_dict(self): return {}
-    sh = _S()  # type: ignore
+    sh = None  # type: ignore
 
-# telemetry (optional)
+# Optional ops command bridge (to not break your /run oc_auto etc)
 try:
-    from utils import telemetry
+    from ops import commands as ops_cmds  # expect: handle_run_command(update, context)
+    _HAS_OPS = hasattr(ops_cmds, "handle_run_command")
 except Exception:
-    class _T:
-        def health_dict(self): return {}
-        def version_string(self): return os.getenv("RENDER_GIT_COMMIT","")[:7] or "dev"
-    telemetry = _T()  # type: ignore
+    ops_cmds = None  # type: ignore
+    _HAS_OPS = False
 
-
-# ========= config =========
-BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
-OWNER_ID = os.getenv("TELEGRAM_OWNER_ID", "").strip()
+# Optional signal generator (name-agnostic dynamic call)
 try:
-    OWNER_ID = int(OWNER_ID) if OWNER_ID else None  # type: ignore[assignment]
+    import agents.signal_generator as sg
+    _HAS_SG = True
 except Exception:
-    OWNER_ID = None  # type: ignore[assignment]
-IST = "Asia/Kolkata"
+    sg = None  # type: ignore
+    _HAS_SG = False
 
+# ---- telegram imports (PTB v13/v20 compatible bootstrap) -------------------
+# We prefer PTB v13 Updater (your logs already show polling OK with it).
+from telegram import Update, ParseMode
+from telegram.ext import (
+    Updater,
+    CallbackContext,
+    CommandHandler,
+    MessageHandler,
+    Filters,
+)
 
-# ========= tiny utils =========
-def _now_str() -> str:
+# ----------------------------------------------------------------------------
+# Module state
+_LAST_OC_SNAPSHOT: Optional[Dict[str, Any]] = None
+_LAST_OC_TS: float = 0.0
+_MIN_OC_REUSE_SEC = 8  # allow quick /oc_now right after /run oc_now without spamming OC feed
+
+def _ensure_params() -> Any:
+    """Get merged Params (defaults+overrides)."""
+    if Params is None:
+        class _P:  # minimal fallback
+            symbol = os.getenv("OC_SYMBOL", "NIFTY")
+            buffer_points = None
+        return _P()
     try:
-        from zoneinfo import ZoneInfo
-        import datetime as dt
-        return dt.datetime.now(ZoneInfo(IST)).strftime("%Y-%m-%d %H:%M:%S")
-    except Exception:
-        import datetime as dt
-        return dt.datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
-
-async def _guard(update: Update) -> bool:
-    if OWNER_ID is None:
-        return True
-    uid = update.effective_user.id if update.effective_user else None
-    if uid != OWNER_ID:
-        try:
-            await update.effective_chat.send_message("Not authorized.")
-        except Exception:
-            pass
-        return False
-    return True
-
-def _fmt_num(x) -> str:
-    if x is None or str(x).strip().lower() == "none":
-        return "—"
-    try:
-        return f"{float(x):.2f}"
-    except Exception:
-        return str(x)
-
-def _to_bool(x) -> Optional[bool]:
-    s = str(x).strip().lower()
-    if s in ("1","true","yes","y","✅","ok"): return True
-    if s in ("0","false","no","n","❌"): return False
-    return None
-
-def _rows_as_dicts(rows: List[List[Any]]) -> List[Dict[str, Any]]:
-    if not rows: return []
-    header = [str(h).strip().lower() for h in rows[0]]
-    out: List[Dict[str,Any]] = []
-    for r in rows[1:]:
-        d: Dict[str,Any] = {}
-        for i,v in enumerate(r):
-            key = header[i] if i < len(header) else f"col{i+1}"
-            d[key] = v
-        out.append(d)
-    return out
-
-
-# ========= latest signal fetch (memory-first) =========
-def _latest_signal_dict() -> Dict[str, Any]:
-    """
-    Prefer in-memory captured signal (fast, no Sheets needed).
-    Fall back to Sheets→Signals last row if available.
-    """
-    # 1) memory-first
-    try:
-        mem = {}
-        if hasattr(sh, "get_last_signal_dict"):
-            mem = sh.get_last_signal_dict() or {}
-        if mem:
-            def _tb(x):
-                s = str(x).strip().lower()
-                if s in ("1","true","yes","y","✅","ok"): return True
-                if s in ("0","false","no","n","❌"): return False
-                return None
-            mem_norm = {
-                "signal_id": mem.get("signal_id",""),
-                "ts": mem.get("ts",""),
-                "side": str(mem.get("side","")).upper(),
-                "trigger": mem.get("trigger",""),
-                "near_cross": mem.get("near/cross","") or mem.get("near_cross",""),
-                "eligible": _tb(mem.get("eligible","")),
-                "eligible_reason": mem.get("reason","") or mem.get("notes",""),
-                "c1": _tb(mem.get("c1","")), "c2": _tb(mem.get("c2","")),
-                "c3": _tb(mem.get("c3","")), "c4": _tb(mem.get("c4","")),
-                "c5": _tb(mem.get("c5","")), "c6": _tb(mem.get("c6","")),
-                "mv_pcr_ok": _tb(mem.get("mv_pcr_ok","")),
-                "mv_mp_ok": _tb(mem.get("mv_mp_ok","")),
-                "mv_basis": mem.get("mv_basis",""),
-                "oc_bull_normal": _tb(mem.get("oc_bull_normal","")),
-                "oc_bull_shortcover": _tb(mem.get("oc_bull_shortcover","")),
-                "oc_bear_normal": _tb(mem.get("oc_bear_normal","")),
-                "oc_bear_crash": _tb(mem.get("oc_bear_crash","")),
-                "oc_pattern_basis": mem.get("oc_pattern_basis",""),
-                "notes": mem.get("notes",""),
-            }
-            return mem_norm
+        return Params()
     except Exception as e:
-        log.warning(f"latest_signal memory read failed: {e}")
+        log.error(f"Params init failed: {e}")
+        class _P:  # minimal fallback
+            symbol = os.getenv("OC_SYMBOL", "NIFTY")
+            buffer_points = None
+        return _P()
 
-    # 2) fallback: read from Sheets if available
-    try:
-        rows = sh.get_all_values("Signals")
-    except Exception as e:
-        log.warning(f"signals get_all_values failed: {e}")
-        rows = []
-    if not rows or len(rows) < 2:
-        return {}
-
-    d = _rows_as_dicts(rows)[-1]
-    def _tb(x):
-        s = str(x).strip().lower()
-        if s in ("1","true","yes","y","✅","ok"): return True
-        if s in ("0","false","no","n","❌"): return False
-        return None
-
-    norm = {
-        "signal_id": d.get("signal_id",""),
-        "ts": d.get("ts",""),
-        "side": str(d.get("side","")).upper(),
-        "trigger": d.get("trigger",""),
-        "near_cross": d.get("near/cross","") or d.get("near_cross",""),
-        "eligible": _tb(d.get("eligible","")),
-        "eligible_reason": d.get("reason","") or d.get("notes",""),
-        "c1": _tb(d.get("c1","")), "c2": _tb(d.get("c2","")),
-        "c3": _tb(d.get("c3","")), "c4": _tb(d.get("c4","")),
-        "c5": _tb(d.get("c5","")), "c6": _tb(d.get("c6","")),
-        "mv_pcr_ok": _tb(d.get("mv_pcr_ok","")),
-        "mv_mp_ok": _tb(d.get("mv_mp_ok","")),
-        "mv_basis": d.get("mv_basis",""),
-        "oc_bull_normal": _tb(d.get("oc_bull_normal","")),
-        "oc_bull_shortcover": _tb(d.get("oc_bull_shortcover","")),
-        "oc_bear_normal": _tb(d.get("oc_bear_normal","")),
-        "oc_bear_crash": _tb(d.get("oc_bear_crash","")),
-        "oc_pattern_basis": d.get("oc_pattern_basis",""),
-        "notes": d.get("notes",""),
+# ----------------------------------------------------------------------------
+# Helpers: compute + format
+def _try_compute_checks(snapshot: Dict[str, Any], params: Any) -> Dict[str, Any]:
+    """
+    Try multiple well-known entrypoints in agents.signal_generator, return a normalized dict.
+    If none found or error → return structure with 'unknown' marks (so UI shows gracefully).
+    """
+    result: Dict[str, Any] = {
+        "eligible": False,
+        # checks
+        "c1": None, "c2": None, "c3": None, "c4": None, "c5": None, "c6": None,
+        "c1_reason": "", "c2_reason": "", "c3_reason": "", "c4_reason": "", "c5_reason": "", "c6_reason": "",
+        # MV & OC-pattern
+        "mv_pcr_ok": None, "mv_mp_ok": None, "mv_basis": "",
+        "oc_pattern": "", "oc_pattern_basis": "",
+        # triggers/near-cross
+        "near": "", "cross": "",
+        # decision reason
+        "reason": "",
     }
-    return norm
+    if not _HAS_SG:
+        result["reason"] = "signal_engine_unavailable"
+        return result
+
+    # Try function signatures in decreasing preference
+    candidates = [
+        "evaluate_checks",     # (snapshot, params) -> dict
+        "evaluate",            # (snapshot, params) -> dict OR (signal, dict)
+        "generate_signal",     # (snapshot, params) -> dict
+        "gen_signal",          # (snapshot, params) -> dict
+    ]
+    called = False
+    for name in candidates:
+        fn = getattr(sg, name, None)
+        if not callable(fn):
+            continue
+        try:
+            out = fn(snapshot, params)  # type: ignore
+            called = True
+            # normalize
+            if isinstance(out, tuple) and len(out) == 2 and isinstance(out[1], dict):
+                out = out[1]
+            if isinstance(out, dict):
+                result.update({k: out.get(k, result.get(k)) for k in result.keys()})
+                # sometimes engines return keys like 'checks': {'c1':True,...}
+                if "checks" in out and isinstance(out["checks"], dict):
+                    for ck, v in out["checks"].items():
+                        if ck in result:
+                            result[ck] = v
+                # mv flags alt names
+                for a, b in [("mv_pcr", "mv_pcr_ok"), ("mv_mp", "mv_mp_ok")]:
+                    if a in out and result.get(b) is None:
+                        result[b] = out[a]
+            break
+        except Exception as e:
+            log.error(f"signal_generator.{name} failed: {e}\n{traceback.format_exc()}")
+            result["reason"] = f"{name}_error"
+            called = True
+            break
+
+    if not called:
+        result["reason"] = "no_entrypoint_in_signal_generator"
+
+    return result
 
 
-# ========= /oc_now render =========
-def _render_oc_now(snap, sig: Dict[str,Any]) -> str:
-    # snapshot safe getters
-    g = lambda k, d="?" : getattr(snap, k, d) if snap else d
-    spot, vix, pcr = g("spot"), g("vix"), g("pcr")
-    pcr_bucket = g("pcr_bucket","?")
-    mp, mp_dist, bias, expiry = g("max_pain"), g("max_pain_dist"), g("bias_tag"), g("expiry")
-    s1, s2, r1, r2 = g("s1"), g("s2"), g("r1"), g("r2")
-    buf = g("buffer_points", g("buffer",""))
-    stale = g("stale", False)
+def _fmt_bool(v: Optional[bool]) -> str:
+    if v is True:
+        return "✅"
+    if v is False:
+        return "❌"
+    return "—"
 
+def _fmt_none(v: Any, alt: str = "—") -> str:
+    return alt if v is None else str(v)
+
+def _derive_bias(checks: Dict[str, Any]) -> str:
+    # populate bias from mv/oc-pattern if engine provided
+    tags = []
+    if checks.get("mv_pcr_ok") or checks.get("mv_mp_ok"):
+        tags.append("mv")
+    if checks.get("oc_pattern"):
+        tags.append(checks["oc_pattern"])
+    return " ".join(tags) if tags else "None"
+
+def _format_oc_now(snapshot: Dict[str, Any], checks: Dict[str, Any]) -> str:
+    spot = snapshot.get("spot")
+    vix = snapshot.get("vix")  # often None from Dhan
+    pcr = snapshot.get("pcr")
+    mp = snapshot.get("max_pain")
+    mp_dist = None
     try:
-        btxt = f" (buf {int(buf)})" if buf not in ("","?",None) else ""
+        if spot is not None and mp is not None:
+            mp_dist = round(float(spot) - float(mp), 2)
     except Exception:
-        btxt = ""
+        mp_dist = None
 
-    # Header
-    line1 = f"*Spot* {spot} | *VIX* {_fmt_num(vix)} | *PCR* {_fmt_num(pcr)} [{pcr_bucket}]"
-    line2 = f"*MaxPain* {mp} (Δ {_fmt_num(mp_dist)}) | *Bias* {bias} | *Exp* {expiry}"
-    if stale:
-        line2 += "  ⚠️*STALE*"
+    s1 = snapshot.get("s1")
+    s2 = snapshot.get("s2")
+    r1 = snapshot.get("r1")
+    r2 = snapshot.get("r2")
+    exp = snapshot.get("expiry")
 
-    # Levels & shifted triggers
-    def _num(x):
-        try: return float(x)
-        except Exception: return None
-    def shifter(val, sign):
-        vb = _num(val); bb = _num(buf)
-        if vb is None: return "?"
-        if bb is None: return f"{vb:.2f}"
-        return f"{(vb - bb if sign<0 else vb + bb):.2f}"
-
-    levels = (
-        f"*Levels*\n"
-        f"S1 {s1} / S2 {s2} / R1 {r1} / R2 {r2}{btxt}\n"
-        f"Triggers → S1* {shifter(s1,-1)} | S2* {shifter(s2,-1)} | R1* {shifter(r1,+1)} | R2* {shifter(r2,+1)}"
-    )
-
-    # Six-checks, Trigger, Patterns, MV — from latest signal
-    def flag(x: Optional[bool]) -> str:
-        return "✅" if x is True else ("❌" if x is False else "—")
-
-    c_line = f"*6-Checks* C1 {flag(sig.get('c1'))} · C2 {flag(sig.get('c2'))} · C3 {flag(sig.get('c3'))} · C4 {flag(sig.get('c4'))} · C5 {flag(sig.get('c5'))} · C6 {flag(sig.get('c6'))}"
-    trig_line = ""
-    if sig.get("trigger") or sig.get("near_cross"):
-        trig_line = f"*Trigger:* {sig.get('trigger','?')} · *Status:* {sig.get('near_cross','')}"
-    ocp = "*OC-Pattern:* " + (sig.get("oc_pattern_basis") or _best_pattern(sig))
-    mvb = "*MV:* " + _mv_summary(sig, pcr, mp, mp_dist)
+    # Triggers (with buffers already applied in snapshot if any)
+    t_s1 = snapshot.get("t_s1", s1)
+    t_s2 = snapshot.get("t_s2", s2)
+    t_r1 = snapshot.get("t_r1", r1)
+    t_r2 = snapshot.get("t_r2", r2)
 
     # Decision
-    dec = f"*Decision:* {'Eligible' if sig.get('eligible') else 'Not Eligible'}"
-    if sig.get("eligible_reason"):
-        dec += f" | {sig.get('eligible_reason')}"
-    if sig.get("signal_id"):
-        dec += f"\n*Signal:* `{sig.get('signal_id')}`"
+    eligible = checks.get("eligible", False)
+    bias = _derive_bias(checks)
 
-    parts = [line1, line2, "", levels, trig_line, c_line, ocp, mvb, "", dec]
-    return "\n".join([p for p in parts if p])
+    mv_line = f"MV: PCR {pcr if pcr is not None else '—'} → {_fmt_bool(checks.get('mv_pcr_ok'))}  " \
+              f"MPΔ {mp_dist if mp_dist is not None else '—'} → {_fmt_bool(checks.get('mv_mp_ok'))}"
+    oc_line = f"OC-Pattern: {_fmt_none(checks.get('oc_pattern'))}"
 
-def _best_pattern(sig: Dict[str,Any]) -> str:
-    if sig.get("oc_pattern_basis"): return sig["oc_pattern_basis"]
-    if sig.get("oc_bull_shortcover"): return "bull_shortcover"
-    if sig.get("oc_bull_normal"): return "bull_normal"
-    if sig.get("oc_bear_crash"): return "bear_crash"
-    if sig.get("oc_bear_normal"): return "bear_normal"
-    return ""
+    checks_line = (
+        f"6-Checks "
+        f"C1 {_fmt_bool(checks.get('c1'))} · "
+        f"C2 {_fmt_bool(checks.get('c2'))} · "
+        f"C3 {_fmt_bool(checks.get('c3'))} · "
+        f"C4 {_fmt_bool(checks.get('c4'))} · "
+        f"C5 {_fmt_bool(checks.get('c5'))} · "
+        f"C6 {_fmt_bool(checks.get('c6'))}"
+    )
 
-def _mv_summary(sig: Dict[str,Any], pcr, mp, mp_dist) -> str:
-    pcr_ok = sig.get("mv_pcr_ok")
-    mp_ok  = sig.get("mv_mp_ok")
-    basis  = sig.get("mv_basis","")
-    parts = []
-    parts.append(f"PCR {_fmt_num(pcr)} → {('✅' if pcr_ok else '❌' if pcr_ok is False else '—')}")
-    parts.append(f"MPΔ {_fmt_num(mp_dist)} → {('✅' if mp_ok else '❌' if mp_ok is False else '—')}")
-    if basis: parts.append(f"| {basis}")
-    return " ".join(parts)
+    header = (
+        f"Spot {spot if spot is not None else '—'} | VIX {_fmt_none(vix)} | PCR {_fmt_none(pcr)}\n"
+        f"MaxPain {mp if mp is not None else '—'} (Δ {_fmt_none(mp_dist)}) | Bias {bias} | Exp {exp if exp else '—'}\n"
+    )
+    levels = (
+        f"Levels\n"
+        f"S1 {s1} / S2 {s2} / R1 {r1} / R2 {r2}\n"
+        f"Triggers → S1 {t_s1:.2f} | S2 {t_s2:.2f} | R1 {t_r1:.2f} | R2 {t_r2:.2f}\n"
+    )
 
+    decision = f"Decision: {'Eligible' if eligible else 'Not Eligible'}"
+    reason = checks.get("reason", "")
+    if reason:
+        decision += f" | {reason}"
 
-# ========= commands =========
-async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not await _guard(update): return
-    await update.message.reply_text("Hi! Try /whoami, /oc_now, /run oc_auto status", disable_web_page_preview=True)
+    msg = header + levels + checks_line + "\n" + oc_line + "\n" + mv_line + "\n" + decision
+    return msg
 
-async def whoami_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not await _guard(update): return
-    uid = update.effective_user.id if update.effective_user else "?"
-    await update.message.reply_text(f"user_id={uid} | owner={OWNER_ID if OWNER_ID else 'None'}")
+# ----------------------------------------------------------------------------
+# Telegram command handlers
+def _refresh_and_compute(force_refresh: bool) -> Tuple[Optional[Dict[str, Any]], Dict[str, Any], str]:
+    """
+    Returns: (snapshot_or_none, checks, note)
+    note contains reason if snapshot missing (rate limit etc).
+    """
+    global _LAST_OC_SNAPSHOT, _LAST_OC_TS
 
-async def version_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not await _guard(update): return
-    try: ver = telemetry.version_string()
-    except Exception: ver = os.getenv("RENDER_GIT_COMMIT","")[:7] or "dev"
-    await update.message.reply_text(f"version: {ver}")
+    params = _ensure_params()
+    snap: Optional[Dict[str, Any]] = None
+    note = ""
 
-async def health_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not await _guard(update): return
-    try:
-        h = telemetry.health_dict()
-        line = f"OC ok:{h.get('oc_ok')} fail:{h.get('oc_fail')} 429:{h.get('dhan_429')} | stale={h.get('stale')} ts={h.get('last_ts')}"
-    except Exception:
-        line = "health: ok"
-    await update.message.reply_text(line)
+    now = time.time()
+    can_reuse = (now - _LAST_OC_TS) < _MIN_OC_REUSE_SEC
 
-async def oc_now_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not await _guard(update): return
-    try:
-        # 1) current/last-good snapshot
-        snap = get_snapshot()
-        if not snap or getattr(snap, "stale", False):
-            try:
-                await asyncio.to_thread(refresh_once)
-                snap2 = get_snapshot()
-                if snap2: snap = snap2
-            except Exception as e:
-                log.warning(f"/oc_now refresh_once failed: {e}")
-
-        # 2) latest signal (memory-first → sheets fallback)
-        sig = _latest_signal_dict()
-
-        # 3) nothing at all?
-        if not snap and not sig:
-            await update.message.reply_text(
-                "OC snapshot unavailable (rate-limit/first snapshot). 20–30s बाद फिर से /oc_now भेजें."
-            )
-            return
-
-        text = _render_oc_now(snap, sig)
-        await update.message.reply_text(text, parse_mode=ParseMode.MARKDOWN, disable_web_page_preview=True)
-    except Exception as e:
-        log.error(f"/oc_now failed: {e}", exc_info=True)
-        await update.message.reply_text("Temporary issue in /oc_now. Try again shortly.")
-
-async def run_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not await _guard(update): return
-    if not context.args:
-        await update.message.reply_text(
-            "Usage: /run oc_auto on|off|status | oc_now | approvals on|off|status"
-        )
-        return
-    sub = context.args[0].lower()
-
-    if sub == "oc_auto":
-        if len(context.args) == 1 or context.args[1].lower() == "status":
-            await update.message.reply_text(f"oc_auto={is_oc_auto()}")
-            return
-        val = context.args[1].lower()
-        if val == "on":
-            set_oc_auto(True);  await update.message.reply_text("oc_auto: ON")
-        elif val == "off":
-            set_oc_auto(False); await update.message.reply_text("oc_auto: OFF")
-        else:
-            await update.message.reply_text("Use on|off|status")
-
-    elif sub == "oc_now":
-        await oc_now_cmd(update, context)
-
-    elif sub == "approvals":
-        if len(context.args) == 1 or context.args[1].lower() == "status":
-            await update.message.reply_text(f"approvals_required={approvals_required()}")
-            return
-        on = context.args[1].lower()
-        if on in ("on","off"):
-            set_approvals_required(on == "on")
-            await update.message.reply_text(f"approvals_required={approvals_required()}")
-        else:
-            await update.message.reply_text("Use approvals on|off|status")
-
+    if refresh_once is None:
+        note = "oc_refresh_unavailable"
+        snap = _LAST_OC_SNAPSHOT
     else:
-        await update.message.reply_text("Unknown /run subcommand. Try: oc_auto | oc_now | approvals")
-
-async def approve_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not await _guard(update): return
-    try:
-        from agents import signal_generator as sig
-    except Exception:
-        sig = None
-
-    if not context.args:
         try:
-            if sig and hasattr(sig, "list_pending_ids"):
-                ids = sig.list_pending_ids()
-                await update.message.reply_text("Pending: " + (", ".join(ids) if ids else "None"))
-                return
+            if force_refresh or not can_reuse or _LAST_OC_SNAPSHOT is None:
+                snap = refresh_once(params)  # expected to return dict with s1/s2/r1/r2/spot/pcr/max_pain/expiry/...
+                if snap:
+                    _LAST_OC_SNAPSHOT = snap
+                    _LAST_OC_TS = now
+            else:
+                snap = _LAST_OC_SNAPSHOT
         except Exception as e:
-            log.warning(f"/approve list pending failed: {e}")
-        await update.message.reply_text("Usage: /approve <signal_id>")
-        return
+            # Use last-good snapshot if any
+            note = f"OC refresh failed: {e.__class__.__name__}"
+            log.error(f"OC refresh failed in /oc_now: {e}")
+            snap = _LAST_OC_SNAPSHOT
 
-    sid = context.args[0]
-    ok = False
-    try:
-        if sig and hasattr(sig, "approve"):
-            ok = bool(sig.approve(sid))
-    except Exception as e:
-        log.warning(f"/approve {sid} failed: {e}")
-    await update.message.reply_text(f"approved={ok} for {sid}")
+    # Compute checks
+    checks: Dict[str, Any] = {}
+    if snap:
+        try:
+            checks = _try_compute_checks(snap, params)
+        except Exception as e:
+            log.error(f"try_compute_checks failed: {e}\n{traceback.format_exc()}")
+            checks = {"eligible": False, "reason": "compute_error"}
+    else:
+        checks = {"eligible": False, "reason": "no_snapshot"}
 
-async def deny_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not await _guard(update): return
-    try:
-        from agents import signal_generator as sig
-    except Exception:
-        sig = None
+    return snap, checks, note
 
-    if not context.args:
-        await update.message.reply_text("Usage: /deny <signal_id>")
-        return
 
-    sid = context.args[0]
-    ok = False
-    try:
-        if sig and hasattr(sig, "deny"):
-            ok = bool(sig.deny(sid))
-    except Exception as e:
-        log.warning(f"/deny {sid} failed: {e}")
-    await update.message.reply_text(f"denied={ok} for {sid}")
-
-async def set_levels_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not await _guard(update): return
-    if not context.args:
-        await update.message.reply_text(
-            "Usage: /set_levels buffer <pts> | mpdist <pts> | pcr <bull_high> <bear_low> | target <pts>"
+# /oc_now → render from last-good (with compute). No forced refresh (to be gentle on OC API).
+def cmd_oc_now(update: Update, context: CallbackContext) -> None:
+    snap, checks, note = _refresh_and_compute(force_refresh=False)
+    if not snap:
+        update.message.reply_text(
+            "OC snapshot unavailable (rate-limit/first snapshot). 20–30s बाद फिर से /oc_now भेजें."
         )
         return
 
-    sub = context.args[0].lower()
-    args = context.args[1:]
+    msg = _format_oc_now(snap, checks)
+    if note:
+        msg = f"{msg}\n\n_note: {note}_"
+    update.message.reply_text(msg)
 
-    def _push_override(key: str, value: str):
-        pushed = False
+# /run oc_now → FORCE refresh + compute + render (operator action)
+def cmd_run(update: Update, context: CallbackContext) -> None:
+    text = (update.message.text or "").strip()
+    parts = text.split()
+    if len(parts) >= 2 and parts[1].lower() == "oc_now":
+        # force refresh path
+        snap, checks, note = _refresh_and_compute(force_refresh=True)
+        if not snap:
+            update.message.reply_text("OC snapshot unavailable (rate-limit?). बाद में /run oc_now फिर से करें.")
+            return
+        msg = _format_oc_now(snap, checks)
+        if note:
+            msg = f"{msg}\n\n_note: {note}_"
+        update.message.reply_text(msg)
+        return
+
+    # Delegate other /run commands to ops bridge if available (so your existing oc_auto etc keep working)
+    if _HAS_OPS:
         try:
-            from utils import params as P
-            if hasattr(P, "set_override"):
-                P.set_override(key, value)
-                pushed = True
-        except Exception:
-            pushed = False
-        if not pushed:
-            try:
-                sh.append_row("Params_Override", [_now_str(), key, value])
-            except Exception:
-                pass
-        return pushed
+            return ops_cmds.handle_run_command(update, context)  # type: ignore
+        except Exception as e:
+            log.error(f"ops_cmds.handle_run_command failed: {e}\n{traceback.format_exc()}")
+            update.message.reply_text("Run command failed in ops bridge.")
+            return
 
-    try:
-        if sub == "buffer" and len(args) >= 1:
-            val = args[0]; _push_override("ENTRY_BAND_POINTS", val)
-            await update.message.reply_text(f"buffer override → {val}")
+    # Fallback help
+    update.message.reply_text("Use: /run oc_now  |  (other /run commands via ops are not wired here)")
 
-        elif sub == "mpdist" and len(args) >= 1:
-            val = args[0]; _push_override("MP_SUPPORT_DIST", val)
-            await update.message.reply_text(f"max-pain distance override → {val}")
+def cmd_start(update: Update, context: CallbackContext) -> None:
+    update.message.reply_text("Krishna bot online. Try /oc_now or /run oc_now")
 
-        elif sub == "pcr" and len(args) >= 2:
-            bh, bl = args[0], args[1]
-            _push_override("PCR_BULL_HIGH", bh); _push_override("PCR_BEAR_LOW", bl)
-            await update.message.reply_text(f"PCR bands override → bull_high={bh} bear_low={bl}")
+def cmd_help(update: Update, context: CallbackContext) -> None:
+    update.message.reply_text(
+        "Commands:\n"
+        "/oc_now — latest OC snapshot + checks\n"
+        "/run oc_now — force refresh + checks\n"
+        "/run oc_auto on|off|status — (if ops bridge enabled)\n"
+    )
 
-        elif sub == "target" and len(args) >= 1:
-            val = args[0]; _push_override("MIN_TARGET_POINTS", val)
-            await update.message.reply_text(f"min target points override → {val}")
-
-        else:
-            await update.message.reply_text("Usage: /set_levels buffer <pts> | mpdist <pts> | pcr <bull_high> <bear_low> | target <pts>")
-    except Exception as e:
-        log.error(f"/set_levels failed: {e}", exc_info=True)
-        await update.message.reply_text("set_levels failed")
-
-# free-text approvals
-async def text_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not await _guard(update): return
-    t = (update.message.text or "").strip().lower()
-    if t in ("approve","approved"):
-        await approve_cmd(update, context)
-    elif t in ("deny","denied","reject","rejected"):
-        await deny_cmd(update, context)
-    # else: ignore
-
-# ========= App init =========
-async def init() -> Optional[Application]:
-    token = BOT_TOKEN
+# ----------------------------------------------------------------------------
+# Boot
+def init(token: Optional[str] = None) -> Any:
+    token = token or os.getenv("TELEGRAM_BOT_TOKEN")
     if not token:
-        log.error("Telegram token missing.")
-        return None
+        raise RuntimeError("TELEGRAM_BOT_TOKEN missing")
 
-    app: Application = ApplicationBuilder().token(token).build()
+    updater = Updater(token=token, use_context=True)
+    dp = updater.dispatcher
 
-    app.add_handler(CommandHandler("start", start_cmd))
-    app.add_handler(CommandHandler("whoami", whoami_cmd))
-    app.add_handler(CommandHandler("version", version_cmd))
-    app.add_handler(CommandHandler("health", health_cmd))
-    app.add_handler(CommandHandler("oc_now", oc_now_cmd))
-    app.add_handler(CommandHandler("run", run_cmd))
-    app.add_handler(CommandHandler("approve", approve_cmd))
-    app.add_handler(CommandHandler("deny", deny_cmd))
-    app.add_handler(CommandHandler("set_levels", set_levels_cmd))
-    app.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), text_router))
+    # Handlers
+    dp.add_handler(CommandHandler("start", cmd_start))
+    dp.add_handler(CommandHandler("help", cmd_help))
+    dp.add_handler(CommandHandler("oc_now", cmd_oc_now))
+    dp.add_handler(CommandHandler("run", cmd_run))
 
-    return app
+    # a simple echo fallback for debugging (disabled by default)
+    # dp.add_handler(MessageHandler(Filters.text & ~Filters.command, cmd_oc_now))
+
+    # Start polling here (so main just logs)
+    updater.start_polling(timeout=30, clean=True)
+    log.info("Telegram polling started")
+    return updater
