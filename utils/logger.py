@@ -1,31 +1,24 @@
-import logging, os, sys, time, hashlib
+import logging
+import sys
 
-_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
-
-class DuplicateGuard(logging.Filter):
+class _DupGuardFilter(logging.Filter):
     def __init__(self, window=5):
         super().__init__()
         self.window = window
-        self._seen = {}
+        self.last = []
 
     def filter(self, record: logging.LogRecord) -> bool:
-        msg = f"{record.levelname}:{record.getMessage()}"
-        h = hashlib.md5(msg.encode()).hexdigest()
-        now = time.time()
-        last = self._seen.get(h, 0)
-        self._seen[h] = now
-        return (now - last) > self.window
+        msg = record.getMessage()
+        if self.last and msg == self.last[-1]:
+            return False
+        self.last.append(msg)
+        self.last = self.last[-self.window:]
+        return True
 
-def get_logger(name="krishna"):
-    logger = logging.getLogger(name)
-    if logger.handlers:
-        return logger
-    logger.setLevel(_LEVEL)
-    h = logging.StreamHandler(sys.stdout)
-    fmt = logging.Formatter("%(asctime)s [%(levelname)s] %(message)s")
-    h.setFormatter(fmt)
-    h.addFilter(DuplicateGuard())
-    logger.addHandler(h)
-    return logger
-
-log = get_logger()
+log = logging.getLogger("ktw")
+log.setLevel(logging.INFO)
+h = logging.StreamHandler(sys.stdout)
+fmt = logging.Formatter("%(asctime)s [%(levelname)s] %(message)s")
+h.setFormatter(fmt)
+h.addFilter(_DupGuardFilter(window=8))
+log.addHandler(h)
