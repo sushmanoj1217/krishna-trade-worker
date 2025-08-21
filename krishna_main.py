@@ -1,114 +1,112 @@
-# krishna_main.py
-from __future__ import annotations
-import os, asyncio, signal
-from datetime import datetime, time as dtime
-from zoneinfo import ZoneInfo
-from telegram.error import Conflict, RetryAfter
-from telegram import Update
+import asyncio
+import os
+import signal
+from datetime import datetime, timedelta, timezone
 
 from utils.logger import log
+from utils.time_windows import is_market_open_now, next_market_close_dt_ist, NOW_IST, sleep_until
+from utils.params import Params
 from integrations import sheets as sh
-from telegram_bot import init as init_bot
-from analytics.oc_refresh import refresh_once
-from agents import signal_generator
-from agents.trade_loop import trade_tick, force_flat_all
+from analytics.oc_refresh import day_oc_loop, get_snapshot
+from agents.signal_generator import signal_loop_once
 from agents.tp_sl_watcher import trail_tick
-from utils.state import is_oc_auto
-from utils import telemetry
+from agents.trade_loop import trade_loop_tick
+from telegram_bot import init as init_bot
 
-IST = ZoneInfo("Asia/Kolkata")
-OC_REFRESH_SECS = int(os.getenv("OC_REFRESH_SECS", "10"))
-MARKET_CUTOFF = dtime(15, 15)
+PYTHON_RUNTIME = f"{os.sys.version.split()[0]}"
 
-async def _refresh_once_bg(): return await asyncio.to_thread(refresh_once)
-async def _signal_once_bg():  return await asyncio.to_thread(signal_generator.run_once)
-async def _force_flat_bg(reason: str): await force_flat_all(reason)
+# global toggle managed by /run oc_auto
+OC_AUTO = os.getenv("OC_AUTO_DEFAULT", "true").lower() == "true"
 
 async def day_loop():
+    """
+    Main day loop: refresh OC, generate signals, trade loop, TP/SL watcher, heartbeat.
+    Runs only during market hours; auto-flat at 15:15 IST via watcher.
+    """
     log.info("Day loop started")
-    beats = 0
-    while True:
-        telemetry.mark("loop_beat")
-        if datetime.now(tz=IST).time() >= MARKET_CUTOFF:
-            try: await _force_flat_bg("auto-flat 15:15 IST")
-            except Exception as e: log.error(f"auto-flat failed: {e}")
-            await asyncio.sleep(30); continue
-
-        try: await _refresh_once_bg()
-        except Exception as e: log.error(f"refresh_once err: {e}")
-
-        if is_oc_auto():
-            try: await _signal_once_bg()
-            except Exception as e: log.error(f"signal gen err: {e}")
-            try: await trade_tick()
-            except Exception as e: log.error(f"trade loop err: {e}")
-            try: trail_tick()
-            except Exception as e: log.error(f"tp/sl watcher err: {e}")
-
-        beats += 1
-        if beats % max(1, 30 // max(1, OC_REFRESH_SECS)) == 0:
-            log.info("heartbeat: day_loop alive")
-        await asyncio.sleep(OC_REFRESH_SECS)
-
-async def _start_polling_with_retry(app):
-    # Ensure webhook is cleared; then start polling with Conflict backoff
-    try:
-        await app.bot.delete_webhook(drop_pending_updates=True)
-    except Exception:
-        pass
+    hb = 0
     while True:
         try:
-            if app.updater is not None:
-                await app.updater.start_polling(allowed_updates=Update.ALL_TYPES)
-            log.info("Telegram polling started")
-            return
-        except Conflict as e:
-            log.warning(f"Polling conflict (another instance is polling). Retrying in 10s… {e}")
-            await asyncio.sleep(10)
-        except RetryAfter as e:
-            delay = int(getattr(e, "retry_after", 10)) + 1
-            log.warning(f"RetryAfter from Telegram: sleeping {delay}s")
-            await asyncio.sleep(delay)
+            if is_market_open_now():
+                # 1) refresh OC (snapshot & write sheet inside)
+                await day_oc_loop()
+
+                # 2) signals
+                try:
+                    await signal_loop_once()
+                except Exception as e:
+                    log.error(f"signal gen err: {e}")
+
+                # 3) paper trade loop
+                try:
+                    await trade_loop_tick()
+                except Exception as e:
+                    log.error(f"trade loop err: {e}")
+
+                # 4) trailing & MV exits
+                try:
+                    changed = await trail_tick()
+                    _ = changed
+                except Exception as e:
+                    log.error(f"tp/sl watcher err: {e}")
+            else:
+                await asyncio.sleep(5)
+
+            # heartbeat
+            hb += 1
+            if hb % 3 == 0:
+                log.info("heartbeat: day_loop alive")
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            log.error(f"day_loop crash-protect: {e}")
+        await asyncio.sleep(2)
 
 async def main():
+    log.info(f"Python runtime: {PYTHON_RUNTIME}")
+    # Sheets tabs
     try:
-        sh.ensure_tabs()
+        await sh.ensure_tabs()
         log.info("✅ Sheets tabs ensured")
     except Exception as e:
         log.error(f"Sheets ensure_tabs failed: {e}")
 
+    # Telegram
     app = None
-    if os.getenv("DISABLE_TELEGRAM", "0") != "1":
+    try:
         app = await init_bot()
-        if app:
-            await app.initialize()
-            await app.start()
-            await _start_polling_with_retry(app)
-            log.info("Telegram bot started")
-        else:
-            log.warning("Telegram bot disabled or failed to init")
-    else:
-        log.warning("DISABLE_TELEGRAM=1 → skipping Telegram bot init")
+        log.info("Telegram polling started")
+    except Exception as e:
+        log.error(f"Telegram Application init failed: {e}")
 
-    loop_task = asyncio.create_task(day_loop())
+    # start concurrent tasks
+    tasks = []
+    if app:
+        tasks.append(asyncio.create_task(app.run_polling(close_loop=False)))
+        log.info("Telegram bot started")
 
+    tasks.append(asyncio.create_task(day_loop()))
+
+    # graceful stop on SIGTERM
+    loop = asyncio.get_running_loop()
     stop_event = asyncio.Event()
-    def _stop(*_): stop_event.set()
-    for s in (signal.SIGINT, signal.SIGTERM):
-        try: asyncio.get_running_loop().add_signal_handler(s, _stop)
-        except NotImplementedError: pass
+
+    def _sigterm():
+        stop_event.set()
+
+    loop.add_signal_handler(signal.SIGTERM, _sigterm)
 
     await stop_event.wait()
-    loop_task.cancel()
+    log.info("Stopping...")
+    for t in tasks:
+        t.cancel()
+    await asyncio.gather(*tasks, return_exceptions=True)
     if app:
-        try:
-            if app.updater is not None:
-                await app.updater.stop()
-            await app.stop()
-            await app.shutdown()
-        except Exception:
-            pass
+        await app.stop()
+        await app.shutdown()
 
 if __name__ == "__main__":
-    log.info(f"Python runtime: {os.sys.version}")
-    asyncio.run(main())
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        pass
