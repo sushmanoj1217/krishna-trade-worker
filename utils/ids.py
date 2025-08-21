@@ -1,11 +1,14 @@
-from datetime import datetime
-import random, string
+import random
+import string
+from datetime import datetime, timezone
 
-def _rand(n=4):
-    return ''.join(random.choices(string.ascii_uppercase + string.digits, k=n))
+def _rand4() -> str:
+    return "".join(random.choices(string.ascii_uppercase + string.digits, k=4))
 
-def signal_id() -> str:
-    return f"SIG-{datetime.now().strftime('%Y%m%d-%H%M%S')}-{_rand()}"
+def new_signal_id(now=None) -> str:
+    now = now or datetime.now(timezone.utc)
+    return f"SIG-{now.strftime('%Y%m%d-%H%M%S')}-{_rand4()}"
 
-def trade_id() -> str:
-    return f"TRD-{datetime.now().strftime('%Y%m%d-%H%M%S')}-{_rand()}"
+def new_trade_id(now=None) -> str:
+    now = now or datetime.now(timezone.utc)
+    return f"TRD-{now.strftime('%Y%m%d-%H%M%S')}-{_rand4()}"
