@@ -1,38 +1,45 @@
 # providers/dhan_oc.py
 # ------------------------------------------------------------
-# Hard-bound Dhan OC provider:
-#   - Calls your integration:  DHAN_PROVIDER_MODULE.DHAN_PROVIDER_FUNC
-#   - Your case: async fetch_levels(p: utils.params.Params) -> Dict
-#   - Builds a Params-like object from env (duck-typing) + injects Dhan creds
-#   - Cadence cache + 429 cooldown
-#   - Normalizes snapshot (adds source='provider', ts=now)
+# Direct Dhan Option-Chain provider (no intermediate integration).
+# Uses official v2 endpoints with required headers:
+#   - 'access-token': <JWT>
+#   - 'client-id'   : <your client id>
+# Docs: https://dhanhq.co/docs/v2/option-chain/
 #
-# Required env (set your real values):
-#   OC_SYMBOL=NIFTY|BANKNIFTY|FINNIFTY       (default NIFTY)
+# Env (required):
+#   DHAN_CLIENT_ID=1107963947
+#   DHAN_ACCESS_TOKEN=<your long JWT>
+#   OC_SYMBOL=NIFTY|BANKNIFTY|FINNIFTY (default NIFTY)
 #   DHAN_UNDERLYING_SEG=IDX_I
-#   DHAN_UNDERLYING_SCRIP=13                 (or DHAN_UNDERLYING_SCRIP_MAP="NIFTY=13,BANKNIFTY=25,FINNIFTY=27")
-#   DHAN_CLIENT_ID=YOUR_DHAN_CLIENT_ID       <-- IMPORTANT
-#   DHAN_ACCESS_TOKEN=YOUR_ACCESS_TOKEN      <-- IMPORTANT
-#
-# Bind your integration explicitly:
-#   DHAN_PROVIDER_MODULE=integrations.option_chain_dhan
-#   DHAN_PROVIDER_FUNC=fetch_levels
+#   DHAN_UNDERLYING_SCRIP=13   (or DHAN_UNDERLYING_SCRIP_MAP="NIFTY=13,BANKNIFTY=25,FINNIFTY=27")
 #
 # Optional:
 #   OC_REFRESH_SECS=12
 #   DHAN_429_COOLDOWN_SEC=30
+#
+# Public API (discovered by analytics.oc_refresh):
+#   async refresh_once() -> {"status","reason","snapshot"}
+# Snapshot keys:
+#   symbol, expiry, spot, s1,s2,r1,r2, pcr, max_pain,
+#   ce_oi_delta, pe_oi_delta, mv, ts, asof, age_sec, source="provider"
 # ------------------------------------------------------------
 from __future__ import annotations
 
-import os, time, importlib, inspect, logging
-from types import SimpleNamespace
-from typing import Any, Dict, Optional
+import os, time, json, logging, math
+from typing import Any, Dict, Optional, Tuple
 
 log = logging.getLogger(__name__)
 
+# Try requests; fallback to urllib
+try:
+    import requests  # type: ignore
+except Exception:
+    requests = None  # type: ignore
+import urllib.request, urllib.error
+
 _last_fetch_ts: Optional[int] = None
 _last_snapshot: Optional[Dict[str, Any]] = None
-_cooldown_until: int = 0
+_cooldown_until: int = 0  # for 429
 
 # ---------------- utils ----------------
 def _env(name: str, default: Optional[str] = None) -> Optional[str]:
@@ -54,7 +61,7 @@ def _parse_map(s: Optional[str]) -> Dict[str, str]:
     if not s: return out
     for part in s.split(","):
         part = part.strip()
-        if not part or "=" not in part:
+        if not part or "=" not in part: 
             continue
         k, v = part.split("=", 1)
         out[k.strip().upper()] = v.strip()
@@ -70,192 +77,235 @@ def _get_security_id(sym: str) -> Optional[str]:
     mp = _parse_map(_env("DHAN_UNDERLYING_SCRIP_MAP"))
     return mp.get(sym)
 
-# ---------------- Params builder ----------------
-def _build_params() -> Any:
-    """
-    Build a Params-like object. Inject BOTH creds and synonyms:
-    - client-id/access-token into p.headers for direct HTTP use
-    - and also as attributes (client_id, dhanClientId, access_token, accessToken)
-      so your integration can pick whichever it expects.
-    """
-    sym = _get_symbol()
-    seg = _env("DHAN_UNDERLYING_SEG", "IDX_I")
-    sid = _get_security_id(sym)
-    cadence = int(_env("OC_REFRESH_SECS", "12") or "12")
+def _strike_step(sym: str) -> int:
+    return 100 if sym == "BANKNIFTY" else 50
 
-    client_id  = _env("DHAN_CLIENT_ID") or _env("CLIENT_ID")
-    access_tok = _env("DHAN_ACCESS_TOKEN") or _env("ACCESS_TOKEN") or _env("TOKEN")
+def _round_down(x: float, step: int) -> float:
+    return math.floor(x / step) * step
 
-    # Create Params or a namespace
-    try:
-        from utils.params import Params  # type: ignore
-        try:
-            p = Params()
-        except Exception:
-            try:
-                p = Params(symbol=sym, segment=seg, security_id=sid, oc_refresh_secs=cadence)  # type: ignore
-            except Exception:
-                p = SimpleNamespace()
-    except Exception:
-        p = SimpleNamespace()
+def _mv_from(pcr: Optional[float], max_pain: Optional[float], spot: Optional[float]) -> str:
+    score = 0
+    if isinstance(pcr, (int,float)):
+        score += 1 if float(pcr) >= 1.0 else -1
+    if isinstance(max_pain, (int,float)) and isinstance(spot, (int,float)):
+        score += 1 if float(max_pain) > float(spot) else -1
+    if score > 0: return "bullish"
+    if score < 0: return "bearish"
+    return ""
 
-    # Core trade params
-    for k, v in {
-        "symbol": sym,
-        "oc_symbol": sym,
-        "underlying_symbol": sym,
-        "segment": seg,
-        "underlying_segment": seg,
-        "security_id": sid,
-        "underlying_scrip": sid,
-        "scrip": sid,
-        "oc_refresh_secs": cadence,
-        "refresh_secs": cadence,
-    }.items():
-        try: setattr(p, k, v)
-        except Exception: pass
+# ---------------- HTTP helpers ----------------
+_BASE = "https://api.dhan.co/v2"
+_UA = _env("DHAN_UA", "Mozilla/5.0")
 
-    # Dhan credentials — provide MANY synonyms + headers
-    for k, v in {
-        "client_id": client_id,
-        "dhan_client_id": client_id,
-        "clientId": client_id,
-        "dhanClientId": client_id,
-        "access_token": access_tok,
-        "accessToken": access_tok,
-        "token": access_tok,
-    }.items():
-        try: setattr(p, k, v)
-        except Exception: pass
-
-    # Standard headers used by Dhan v2 REST:
-    #   'client-id': <client id>, 'access-token': <jwt>
-    hdrs = {
-        "client-id": client_id or "",
-        "access-token": access_tok or "",
+def _headers() -> Dict[str,str]:
+    cid = _env("DHAN_CLIENT_ID")
+    tok = _env("DHAN_ACCESS_TOKEN")
+    if not cid or not tok:
+        raise RuntimeError("Dhan creds missing: set DHAN_CLIENT_ID and DHAN_ACCESS_TOKEN")
+    return {
         "Content-Type": "application/json",
+        "access-token": tok,
+        "client-id": cid,
+        "User-Agent": _UA,
     }
-    try: setattr(p, "headers", hdrs)
-    except Exception: pass
 
-    return p
+def _post(url: str, body: Dict[str, Any]) -> Tuple[int, bytes]:
+    h = _headers()
+    data = json.dumps(body).encode("utf-8")
 
-# ---------------- Normalization ----------------
-def _looks_like_snapshot(d: Any) -> bool:
-    if not isinstance(d, dict): return False
-    k = {str(x).lower() for x in d.keys()}
-    if {"symbol","expiry","spot"} <= k: return True
-    if "spot" in k and ({"s1","s2","r1","r2"} & k): return True
-    if "levels" in k and "spot" in k: return True
-    return False
+    # Simple 429 cooldown
+    global _cooldown_until
+    now = _now()
+    if now < _cooldown_until:
+        raise RuntimeError(f"429 cooldown active {(_cooldown_until-now)}s")
 
-def _normalize_snapshot(raw: Dict[str, Any]) -> Dict[str, Any]:
-    out: Dict[str, Any] = dict(raw)
-
-    lv = out.get("levels")
-    if isinstance(lv, dict):
-        def pick(*names):
-            for n in names:
-                if n in lv: return lv[n]
-                if isinstance(n, str) and n.upper() in lv: return lv[n.upper()]
-            return None
-        out.setdefault("s1", _to_float(pick("s1","S1")))
-        out.setdefault("s2", _to_float(pick("s2","S2")))
-        out.setdefault("r1", _to_float(pick("r1","R1")))
-        out.setdefault("r2", _to_float(pick("r2","R2")))
-
-    for key in ("spot","s1","s2","r1","r2","pcr","max_pain","ce_oi_delta","pe_oi_delta"):
-        if key in out:
-            out[key] = _to_float(out.get(key))
-
-    if not out.get("expiry"):
-        exp = out.get("exp") or out.get("expiry_date") or out.get("expy") or ""
-        out["expiry"] = exp
-
-    if out.get("mv") is None:
-        pcr = out.get("pcr"); mp = out.get("max_pain"); spot = out.get("spot")
-        mv = ""
+    if requests is not None:
+        for attempt in range(2):
+            r = requests.post(url, headers=h, data=data, timeout=12)
+            if r.status_code == 429:
+                _cooldown_until = _now() + int(_env("DHAN_429_COOLDOWN_SEC","30") or "30")
+                raise RuntimeError("429 Too Many Requests")
+            if r.status_code >= 400:
+                return r.status_code, r.content
+            return r.status_code, r.content
+    else:
+        req = urllib.request.Request(url, data=data, headers=h, method="POST")
         try:
-            score = 0
-            if isinstance(pcr, (int,float)):
-                score += 1 if float(pcr) >= 1.0 else -1
-            if isinstance(mp, (int,float)) and isinstance(spot, (int,float)):
-                score += 1 if float(mp) > float(spot) else -1
-            if score > 0: mv = "bullish"
-            elif score < 0: mv = "bearish"
+            with urllib.request.urlopen(req, timeout=12) as resp:
+                return resp.getcode(), resp.read()
+        except urllib.error.HTTPError as e:
+            if e.code == 429:
+                _cooldown_until = _now() + int(_env("DHAN_429_COOLDOWN_SEC","30") or "30")
+                raise RuntimeError("429 Too Many Requests")
+            return e.code, e.read()
+    return 599, b""
+
+# ---------------- Dhan OC fetch ----------------
+def _pick_expiry(sym: str, seg: str, sid: str) -> str:
+    # POST /optionchain/expirylist
+    code, body = _post(f"{_BASE}/optionchain/expirylist", {
+        "UnderlyingScrip": int(sid),
+        "UnderlyingSeg": seg
+    })
+    try:
+        js = json.loads(body.decode("utf-8"))
+    except Exception:
+        js = {"status":"failed","Data":{"999":"JSON decode error"}}
+
+    if code != 200 or js.get("status") != "success":
+        raise RuntimeError(f"expirylist failed: HTTP {code} body={js}")
+
+    arr = js.get("data") or []
+    if not arr:
+        raise RuntimeError("expirylist empty")
+
+    # choose nearest >= today; else first
+    today = time.strftime("%Y-%m-%d", time.gmtime(_now()+19800))
+    exp = sorted(arr)[0]
+    for e in sorted(arr):
+        if e >= today:
+            exp = e
+            break
+    return exp
+
+def _fetch_chain(sym: str, seg: str, sid: str, exp: str) -> Dict[str, Any]:
+    # POST /optionchain
+    code, body = _post(f"{_BASE}/optionchain", {
+        "UnderlyingScrip": int(sid),
+        "UnderlyingSeg": seg,
+        "Expiry": exp
+    })
+    try:
+        js = json.loads(body.decode("utf-8"))
+    except Exception:
+        js = {"status":"failed","Data":{"999":"JSON decode error"}}
+
+    if code != 200:
+        raise RuntimeError(f"optionchain HTTP {code}: {js}")
+    if js.get("status") != "success":
+        # Dhan error shape often: {"Data":{"810":"ClientId is invalid"},"status":"failed"}
+        raise RuntimeError(json.dumps(js))
+
+    data = js.get("data") or {}
+    return data
+
+def _compute_from_chain(sym: str, data: Dict[str, Any], exp: str) -> Dict[str, Any]:
+    spot = _to_float(data.get("last_price"))
+    oc = data.get("oc") or {}
+    if not isinstance(oc, dict):
+        oc = {}
+
+    tot_ce_oi = tot_pe_oi = 0.0
+    tot_ce_prev = tot_pe_prev = 0.0
+    strike_sum_map = {}  # strike -> CE_OI + PE_OI
+
+    for k, v in oc.items():
+        try:
+            strike = float(k)
         except Exception:
-            pass
-        out["mv"] = mv
+            strike = _to_float(k)
+        if not isinstance(v, dict):
+            continue
+        ce = v.get("ce") or {}
+        pe = v.get("pe") or {}
 
-    out.setdefault("symbol", _get_symbol())
-    out["source"] = "provider"
-    out.setdefault("ts", _now())
-    return out
+        ce_oi = _to_float(ce.get("oi")) or 0.0
+        pe_oi = _to_float(pe.get("oi")) or 0.0
+        ce_prev = _to_float(ce.get("previous_oi")) or 0.0
+        pe_prev = _to_float(pe.get("previous_oi")) or 0.0
 
-# ---------------- Resolver & caller ----------------
-def _resolve_callable():
-    mod_name = _env("DHAN_PROVIDER_MODULE", "integrations.option_chain_dhan")
-    func_name = _env("DHAN_PROVIDER_FUNC", "fetch_levels")
-    m = importlib.import_module(mod_name)
-    fn = getattr(m, func_name)
-    if not callable(fn):
-        raise RuntimeError(f"{mod_name}.{func_name} is not callable")
-    return fn, f"{mod_name}.{func_name}", inspect.iscoroutinefunction(fn)
+        tot_ce_oi += ce_oi; tot_pe_oi += pe_oi
+        tot_ce_prev += ce_prev; tot_pe_prev += pe_prev
 
-async def _invoke(fn, *args, **kwargs):
-    res = fn(*args, **kwargs)
-    if inspect.isawaitable(res):
-        res = await res
-    return res
+        if strike is not None:
+            strike_sum_map[float(strike)] = (ce_oi + pe_oi)
+
+    pcr = None
+    if tot_ce_oi > 0:
+        pcr = tot_pe_oi / tot_ce_oi
+
+    ce_d = None
+    pe_d = None
+    if tot_ce_prev > 0 or tot_pe_prev > 0:
+        ce_d = (tot_ce_oi - tot_ce_prev)
+        pe_d = (tot_pe_oi - tot_pe_prev)
+
+    max_pain = None
+    if strike_sum_map:
+        max_pain = max(strike_sum_map.items(), key=lambda kv: kv[1])[0]
+
+    # Simple levels around spot
+    step = _strike_step(sym)
+    if not isinstance(spot, (int,float)) or spot is None:
+        # fallback: use max_pain as center
+        center = max_pain if isinstance(max_pain,(int,float)) else 0.0
+    else:
+        center = float(spot)
+    base = _round_down(center, step)
+    s1 = base
+    s2 = base - 2*step
+    r1 = base + step
+    r2 = base + 2*step
+
+    mv = _mv_from(pcr, max_pain, spot)
+
+    ts = _now()
+    asof = time.strftime("%Y-%m-%d %H:%M:%S IST", time.gmtime(ts + 19800))
+
+    snap = {
+        "symbol": sym,
+        "expiry": exp,
+        "spot": spot,
+        "s1": float(s1), "s2": float(s2), "r1": float(r1), "r2": float(r2),
+        "pcr": pcr,
+        "max_pain": max_pain,
+        "ce_oi_delta": ce_d,
+        "pe_oi_delta": pe_d,
+        "mv": mv,
+        "ts": ts,
+        "asof": asof,
+        "age_sec": 0,
+        "source": "provider",
+        "stale": False,
+        "stale_reason": [],
+    }
+    return snap
 
 # ---------------- Public API ----------------
 async def refresh_once() -> Dict[str, Any]:
     """
-    Cadence cache; 429 cooldown; call your Dhan integration with a Params-like object.
+    Cadence cache + Dhan 1 req / 3 sec guard.
     Returns: {"status": "...", "reason": "...", "snapshot": {...}}
     """
     global _last_fetch_ts, _last_snapshot, _cooldown_until
 
     now = _now()
+    # 429 cooldown (if any)
     if now < _cooldown_until:
         if _last_snapshot:
-            return {"status":"cooldown", "reason":"429_cooldown", "snapshot":_last_snapshot}
+            return {"status":"cooldown","reason":"429_cooldown","snapshot":_last_snapshot}
         raise RuntimeError(f"429 cooldown; wait {(_cooldown_until-now)}s")
 
-    cadence = int(_env("OC_REFRESH_SECS", "12") or "12")
+    # cadence
+    cadence = int(_env("OC_REFRESH_SECS","12") or "12")
     if _last_fetch_ts and _last_snapshot and now - _last_fetch_ts < max(3, cadence):
-        return {"status":"cached", "reason":"", "snapshot":_last_snapshot}
+        return {"status":"cached","reason":"","snapshot":_last_snapshot}
 
-    fn, fqname, is_async = _resolve_callable()
-    p = _build_params()
+    sym = _get_symbol()
+    seg = _env("DHAN_UNDERLYING_SEG","IDX_I")
+    sid = _get_security_id(sym)
+    if not sid:
+        raise RuntimeError("Missing DHAN_UNDERLYING_SCRIP (or map) for symbol "+sym)
 
-    # quick guard: ensure creds exist
-    hdrs = getattr(p, "headers", {})
-    if not hdrs.get("client-id") or not hdrs.get("access-token"):
-        raise RuntimeError("Dhan creds missing: set DHAN_CLIENT_ID and DHAN_ACCESS_TOKEN in env")
+    # 1) pick expiry (expirylist)
+    exp = _pick_expiry(sym, seg, sid)
 
-    try:
-        ret = await _invoke(fn, p)
-    except Exception as e:
-        msg = str(e).lower()
-        if any(tok in msg for tok in ["429", "too many requests", "rate limit"]):
-            cd = int(_env("DHAN_429_COOLDOWN_SEC", "30") or "30")
-            _cooldown_until = now + max(10, min(120, cd))
-            if _last_snapshot:
-                return {"status":"cooldown", "reason":"429_cooldown", "snapshot":_last_snapshot}
-        # bubble up so oc_refresh can fallback to sheets
-        raise
+    # 2) fetch chain
+    data = _fetch_chain(sym, seg, sid, exp)
 
-    if isinstance(ret, dict) and ("snapshot" in ret and isinstance(ret["snapshot"], dict)):
-        snap = _normalize_snapshot(ret["snapshot"])
-    elif isinstance(ret, dict):
-        snap = _normalize_snapshot(ret)
-    else:
-        try:
-            snap = _normalize_snapshot(getattr(ret, "snapshot"))
-        except Exception:
-            raise RuntimeError(f"{fqname} did not return a snapshot-like dict")
+    # 3) compute snapshot
+    snap = _compute_from_chain(sym, data, exp)
 
     _last_fetch_ts = now
     _last_snapshot = snap
-    return {"status":"ok", "reason":"", "snapshot":snap}
+    return {"status":"ok","reason":"","snapshot":snap}
