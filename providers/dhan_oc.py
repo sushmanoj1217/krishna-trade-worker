@@ -1,14 +1,11 @@
 # providers/dhan_oc.py
 # ------------------------------------------------------------
 # Direct Dhan Option-Chain provider (no intermediate integration).
-# Uses official v2 endpoints with required headers:
-#   - 'access-token': <JWT>
-#   - 'client-id'   : <your client id>
-# Docs: https://dhanhq.co/docs/v2/option-chain/
+# Uses v2 endpoints with headers:
+#   'access-token': <JWT>, 'client-id': <Client ID>
 #
 # Env (required):
-#   DHAN_CLIENT_ID=1107963947
-#   DHAN_ACCESS_TOKEN=<your long JWT>
+#   DHAN_CLIENT_ID, DHAN_ACCESS_TOKEN
 #   OC_SYMBOL=NIFTY|BANKNIFTY|FINNIFTY (default NIFTY)
 #   DHAN_UNDERLYING_SEG=IDX_I
 #   DHAN_UNDERLYING_SCRIP=13   (or DHAN_UNDERLYING_SCRIP_MAP="NIFTY=13,BANKNIFTY=25,FINNIFTY=27")
@@ -30,7 +27,6 @@ from typing import Any, Dict, Optional, Tuple
 
 log = logging.getLogger(__name__)
 
-# Try requests; fallback to urllib
 try:
     import requests  # type: ignore
 except Exception:
@@ -39,7 +35,7 @@ import urllib.request, urllib.error
 
 _last_fetch_ts: Optional[int] = None
 _last_snapshot: Optional[Dict[str, Any]] = None
-_cooldown_until: int = 0  # for 429
+_cooldown_until: int = 0
 
 # ---------------- utils ----------------
 def _env(name: str, default: Optional[str] = None) -> Optional[str]:
@@ -83,14 +79,27 @@ def _strike_step(sym: str) -> int:
 def _round_down(x: float, step: int) -> float:
     return math.floor(x / step) * step
 
-def _mv_from(pcr: Optional[float], max_pain: Optional[float], spot: Optional[float]) -> str:
+def _mv_from(pcr: Optional[float], max_pain: Optional[float], spot: Optional[float],
+             ce_d: Optional[float], pe_d: Optional[float]) -> str:
+    """Primary: PCR (>=1 bullish) + MP (>spot bullish); Tie-break: OIΔ (PEΔ>CEΔ ⇒ bullish)."""
     score = 0
-    if isinstance(pcr, (int,float)):
-        score += 1 if float(pcr) >= 1.0 else -1
-    if isinstance(max_pain, (int,float)) and isinstance(spot, (int,float)):
-        score += 1 if float(max_pain) > float(spot) else -1
-    if score > 0: return "bullish"
-    if score < 0: return "bearish"
+    try:
+        if isinstance(pcr, (int,float)):
+            score += 1 if float(pcr) >= 1.0 else -1
+    except Exception:
+        pass
+    try:
+        if isinstance(max_pain, (int,float)) and isinstance(spot, (int,float)):
+            score += 1 if float(max_pain) > float(spot) else -1
+    except Exception:
+        pass
+    if score > 0: 
+        return "bullish"
+    if score < 0: 
+        return "bearish"
+    # tie → use OI deltas if available
+    if isinstance(ce_d, (int,float)) and isinstance(pe_d, (int,float)) and ce_d != pe_d:
+        return "bullish" if pe_d > ce_d else "bearish"
     return ""
 
 # ---------------- HTTP helpers ----------------
@@ -113,7 +122,6 @@ def _post(url: str, body: Dict[str, Any]) -> Tuple[int, bytes]:
     h = _headers()
     data = json.dumps(body).encode("utf-8")
 
-    # Simple 429 cooldown
     global _cooldown_until
     now = _now()
     if now < _cooldown_until:
@@ -142,7 +150,6 @@ def _post(url: str, body: Dict[str, Any]) -> Tuple[int, bytes]:
 
 # ---------------- Dhan OC fetch ----------------
 def _pick_expiry(sym: str, seg: str, sid: str) -> str:
-    # POST /optionchain/expirylist
     code, body = _post(f"{_BASE}/optionchain/expirylist", {
         "UnderlyingScrip": int(sid),
         "UnderlyingSeg": seg
@@ -151,15 +158,11 @@ def _pick_expiry(sym: str, seg: str, sid: str) -> str:
         js = json.loads(body.decode("utf-8"))
     except Exception:
         js = {"status":"failed","Data":{"999":"JSON decode error"}}
-
     if code != 200 or js.get("status") != "success":
         raise RuntimeError(f"expirylist failed: HTTP {code} body={js}")
-
     arr = js.get("data") or []
     if not arr:
         raise RuntimeError("expirylist empty")
-
-    # choose nearest >= today; else first
     today = time.strftime("%Y-%m-%d", time.gmtime(_now()+19800))
     exp = sorted(arr)[0]
     for e in sorted(arr):
@@ -169,7 +172,6 @@ def _pick_expiry(sym: str, seg: str, sid: str) -> str:
     return exp
 
 def _fetch_chain(sym: str, seg: str, sid: str, exp: str) -> Dict[str, Any]:
-    # POST /optionchain
     code, body = _post(f"{_BASE}/optionchain", {
         "UnderlyingScrip": int(sid),
         "UnderlyingSeg": seg,
@@ -179,15 +181,11 @@ def _fetch_chain(sym: str, seg: str, sid: str, exp: str) -> Dict[str, Any]:
         js = json.loads(body.decode("utf-8"))
     except Exception:
         js = {"status":"failed","Data":{"999":"JSON decode error"}}
-
     if code != 200:
         raise RuntimeError(f"optionchain HTTP {code}: {js}")
     if js.get("status") != "success":
-        # Dhan error shape often: {"Data":{"810":"ClientId is invalid"},"status":"failed"}
         raise RuntimeError(json.dumps(js))
-
-    data = js.get("data") or {}
-    return data
+    return js.get("data") or {}
 
 def _compute_from_chain(sym: str, data: Dict[str, Any], exp: str) -> Dict[str, Any]:
     spot = _to_float(data.get("last_price"))
@@ -197,7 +195,7 @@ def _compute_from_chain(sym: str, data: Dict[str, Any], exp: str) -> Dict[str, A
 
     tot_ce_oi = tot_pe_oi = 0.0
     tot_ce_prev = tot_pe_prev = 0.0
-    strike_sum_map = {}  # strike -> CE_OI + PE_OI
+    strike_sum_map = {}
 
     for k, v in oc.items():
         try:
@@ -208,7 +206,6 @@ def _compute_from_chain(sym: str, data: Dict[str, Any], exp: str) -> Dict[str, A
             continue
         ce = v.get("ce") or {}
         pe = v.get("pe") or {}
-
         ce_oi = _to_float(ce.get("oi")) or 0.0
         pe_oi = _to_float(pe.get("oi")) or 0.0
         ce_prev = _to_float(ce.get("previous_oi")) or 0.0
@@ -234,20 +231,15 @@ def _compute_from_chain(sym: str, data: Dict[str, Any], exp: str) -> Dict[str, A
     if strike_sum_map:
         max_pain = max(strike_sum_map.items(), key=lambda kv: kv[1])[0]
 
-    # Simple levels around spot
     step = _strike_step(sym)
-    if not isinstance(spot, (int,float)) or spot is None:
-        # fallback: use max_pain as center
-        center = max_pain if isinstance(max_pain,(int,float)) else 0.0
-    else:
-        center = float(spot)
+    center = float(spot) if isinstance(spot,(int,float)) and spot is not None else float(max_pain or 0.0)
     base = _round_down(center, step)
     s1 = base
     s2 = base - 2*step
     r1 = base + step
     r2 = base + 2*step
 
-    mv = _mv_from(pcr, max_pain, spot)
+    mv = _mv_from(pcr, max_pain, spot, ce_d, pe_d)
 
     ts = _now()
     asof = time.strftime("%Y-%m-%d %H:%M:%S IST", time.gmtime(ts + 19800))
@@ -273,20 +265,14 @@ def _compute_from_chain(sym: str, data: Dict[str, Any], exp: str) -> Dict[str, A
 
 # ---------------- Public API ----------------
 async def refresh_once() -> Dict[str, Any]:
-    """
-    Cadence cache + Dhan 1 req / 3 sec guard.
-    Returns: {"status": "...", "reason": "...", "snapshot": {...}}
-    """
     global _last_fetch_ts, _last_snapshot, _cooldown_until
 
     now = _now()
-    # 429 cooldown (if any)
     if now < _cooldown_until:
         if _last_snapshot:
             return {"status":"cooldown","reason":"429_cooldown","snapshot":_last_snapshot}
         raise RuntimeError(f"429 cooldown; wait {(_cooldown_until-now)}s")
 
-    # cadence
     cadence = int(_env("OC_REFRESH_SECS","12") or "12")
     if _last_fetch_ts and _last_snapshot and now - _last_fetch_ts < max(3, cadence):
         return {"status":"cached","reason":"","snapshot":_last_snapshot}
@@ -297,13 +283,8 @@ async def refresh_once() -> Dict[str, Any]:
     if not sid:
         raise RuntimeError("Missing DHAN_UNDERLYING_SCRIP (or map) for symbol "+sym)
 
-    # 1) pick expiry (expirylist)
     exp = _pick_expiry(sym, seg, sid)
-
-    # 2) fetch chain
     data = _fetch_chain(sym, seg, sid, exp)
-
-    # 3) compute snapshot
     snap = _compute_from_chain(sym, data, exp)
 
     _last_fetch_ts = now
