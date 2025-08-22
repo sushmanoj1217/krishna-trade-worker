@@ -11,6 +11,7 @@
 #       a) many alias delta cols (oi_delta/oi change/oi chg/Δ etc.)
 #       b) else from absolute OI vs previous row (many aliases)
 #       c) else sign-only proxy via dPCR (prev→curr) or MV tag
+#       d) FINAL fallback: sign-only proxy via **current PCR** (NEW)
 # ------------------------------------------------------------
 from __future__ import annotations
 import importlib, inspect, logging, re
@@ -144,30 +145,19 @@ def _open_ws():
 # normalize keys (remove spaces/punct, map greek Δ -> delta)
 def _norm_key(k: str) -> str:
     s = str(k).lower()
-    s = s.replace("Δ", "delta")
-    s = s.replace("∆", "delta")
+    s = s.replace("Δ", "delta").replace("∆", "delta")
     s = re.sub(r"[\s\-\.\(\)\[\]/]+", "_", s)  # spaces/punct -> underscore
     s = re.sub(r"__+", "_", s).strip("_")
     return s
-
 def _to_float(x):
     try:
         if x in (None, "", "—"): return None
         return float(str(x).replace(",", "").strip())
     except Exception:
         return None
-
 def _norm_row_anynums(d: Dict[str, Any]) -> Dict[str, Any]:
-    """Normalize keys; keep values as-is (we'll _to_float on demand)."""
     return {_norm_key(k): v for k, v in d.items()}
 
-def _get_num(row: Dict[str, Any], key: str) -> Optional[float]:
-    return _to_float(row.get(key))
-
-def _match_any(s: str, toks: tuple[str, ...]) -> bool:
-    return all(tok in s for tok in toks)
-
-# alias scanners
 _CE_TOKS = ("ce",)
 _PE_TOKS = ("pe",)
 _CALL_TOKS = ("call",)
@@ -175,21 +165,17 @@ _PUT_TOKS = ("put",)
 _OI_TOKS = ("oi", "openinterest", "open_interest")
 _DELTA_TOKS = ("delta", "chg", "change", "d")  # 'd' last resort (with oi)
 def _is_delta_key(norm: str, side: str) -> bool:
-    # side: "ce" or "pe"
     side_ok = (side in norm) or (side == "ce" and any(t in norm for t in _CALL_TOKS)) or (side == "pe" and any(t in norm for t in _PUT_TOKS))
     if not side_ok: return False
     if not any(t in norm for t in _OI_TOKS): return False
-    # must have a delta token
     if not any(t in norm for t in _DELTA_TOKS): return False
     return True
 def _is_abs_oi_key(norm: str, side: str) -> bool:
     side_ok = (side in norm) or (side == "ce" and any(t in norm for t in _CALL_TOKS)) or (side == "pe" and any(t in norm for t in _PUT_TOKS))
     if not side_ok: return False
     if not any(t in norm for t in _OI_TOKS): return False
-    # should NOT look like delta
     if any(t in norm for t in _DELTA_TOKS): return False
     return True
-
 def _pick_oi_delta_any(row: Dict[str, Any], prev: Optional[Dict[str, Any]], side: str) -> Optional[float]:
     # 1) explicit delta-like columns
     for k, v in row.items():
@@ -291,11 +277,20 @@ def _build_from_sheet() -> Optional[dict]:
 
     # If STILL missing, proxy from MV
     if ce_d is None and pe_d is None and mv_tag:
-        # bullish -> CE down, PE up; bearish -> CE up, PE down
         sign = 1.0 if mv_tag == "bullish" else (-1.0 if mv_tag == "bearish" else 0.0)
         if sign != 0.0:
             ce_d = -1.0 * sign
-            pe_d = 1.0 * sign
+            pe_d =  1.0 * sign
+
+    # FINAL fallback: proxy directly from current PCR (NEW)
+    if ce_d is None and pe_d is None and isinstance(pcr, (int,float)) and pcr != 1.0:
+        if pcr > 1.0:
+            # More puts → PEΔ positive, CEΔ negative
+            pe_d =  1.0
+            ce_d = -1.0
+        else:
+            pe_d = -1.0
+            ce_d =  1.0
 
     snap = {
         "symbol": sym,
