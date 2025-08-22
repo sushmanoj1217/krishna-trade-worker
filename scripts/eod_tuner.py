@@ -18,7 +18,7 @@
 
 from __future__ import annotations
 
-import os, json, time, logging, statistics
+import os, json, time, logging, statistics, re
 from typing import Any, Dict, List, Tuple, Optional
 
 try:
@@ -138,6 +138,36 @@ def _base(sym: str, key: str, fallback: float) -> float:
         return float(BASE[s][key])
     return float(fallback)
 
+# ---------------- date parsing helpers ----------------
+_DATE_REs = [
+    # 2025-08-22 14:05:26, 2025-08-22
+    re.compile(r"(\d{4})[-/](\d{2})[-/](\d{2})"),
+    # 22/08/2025 or 22-08-2025
+    re.compile(r"(\d{2})[-/](\d{2})[-/](\d{4})"),
+    # 22-08-25
+    re.compile(r"(\d{2})[-/](\d{2})[-/](\d{2})"),
+]
+
+def _parse_date_str(s: str) -> Optional[str]:
+    if not s: return None
+    txt = s.strip()
+    for pat in _DATE_REs:
+        m = pat.search(txt)
+        if not m: 
+            continue
+        g = m.groups()
+        if len(g)==3 and len(g[0])==4:
+            y,mo,da = g
+            return f"{int(y):04d}-{int(mo):02d}-{int(da):02d}"
+        if len(g)==3 and len(g[2])==4:
+            da,mo,y = g
+            return f"{int(y):04d}-{int(mo):02d}-{int(da):02d}"
+        if len(g)==3 and len(g[2])==2:
+            da,mo,y2 = g
+            y = 2000 + int(y2)
+            return f"{int(y):04d}-{int(mo):02d}-{int(da):02d}"
+    return None
+
 # ---------------- core stats ----------------
 def _last_n_dates(records: List[Dict[str,Any]], n: int, sym: str) -> List[str]:
     seen = []
@@ -146,13 +176,28 @@ def _last_n_dates(records: List[Dict[str,Any]], n: int, sym: str) -> List[str]:
         rs = str(r.get("symbol") or r.get("Symbol") or "").upper()
         if rs and rs != S:
             continue
-        d = str(r.get("date") or r.get("Date") or "").strip()
-        if not d: continue
+        d = (r.get("date") or r.get("Date") or "")
+        d = str(d).strip()
+        if not d:
+            continue
         if d not in seen:
             seen.append(d)
-    return seen[-n:] if len(seen) >= n else seen
+    if seen:
+        return seen[-n:] if len(seen) >= n else seen
+    # Fallback: no date columns at all -> use ALL bucket
+    return ["ALL"]
 
 def _filter_by(records: List[Dict[str,Any]], sym: str, dates: List[str]) -> List[Dict[str,Any]]:
+    if dates == ["ALL"]:
+        # don't filter by date; only by symbol (if present)
+        out = []
+        S = sym.upper()
+        for r in records:
+            rs = str(r.get("symbol") or r.get("Symbol") or "").upper()
+            if rs and rs != S:
+                continue
+            out.append(r)
+        return out
     out = []
     D = set(dates)
     S = sym.upper()
@@ -170,14 +215,14 @@ def _stats(records: List[Dict[str,Any]]) -> Dict[str,Any]:
     wins = []; losses = []
     reasons = []
     for r in records:
-        p = _num(r.get("pnl_points") or r.get("PNL") or r.get("Net PnL") or r.get("NetPNL"))
+        p = _num(r.get("pnl_points") or r.get("PNL") or r.get("Net PnL") or r.get("NetPNL") or r.get("Profit") or r.get("Net P&L"))
         if p is None: continue
         pnls.append(p)
         if p >= 0:
             wins.append(p)
         else:
             losses.append(-p)
-        er = str(r.get("exit_reason") or r.get("ExitReason") or r.get("Exit Reason") or "").strip().upper()
+        er = str(r.get("exit_reason") or r.get("ExitReason") or r.get("Exit Reason") or r.get("reason") or r.get("Reason") or "").strip().upper()
         if er:
             reasons.append(er)
     n = len(pnls)
@@ -220,7 +265,7 @@ def _tune_for_symbol(sym: str, perf: List[Dict[str,Any]], lookback_days: int, mi
     steps = STEP.get(sym.upper(), STEP["NIFTY"])
     notes = []
 
-    TRADES_PER_DAY = n / max(1, len(dates))
+    TRADES_PER_DAY = n / max(1, len(dates) if dates != ["ALL"] else 1)
     if wr < 40.0 and avg_loss >= 0.6*TP:
         BUF = BUF + steps["BUF_UP"]
         SL = max(0.8*SL, SL - 0.05*TP)
@@ -258,11 +303,17 @@ def _tune_for_symbol(sym: str, perf: List[Dict[str,Any]], lookback_days: int, mi
         notes=summary + " | " + "; ".join(notes)
     )
 
-# -------------- dupe-safe Performance readers --------------
+# -------------- dupe/variant-safe Performance readers --------------
 ALT_PERF_NAMES = ["Performance","performance","PERFORMANCE","Perf","Trades","TRADES"]
 
+DATE_CANDS   = ["date","Date","trade_date","Trade Date","entry_time","Entry Time","open_time","Open Time",
+                "entry_ts","EntryTS","exit_time","Exit Time","close_time","Close Time","timestamp","Timestamp","time","Time"]
+SYMBOL_CANDS = ["symbol","Symbol","underlying","Underlying","index","Index","instrument","Instrument","ticker","Ticker","base","Base"]
+PNL_CANDS    = ["pnl_points","PNL","Net PnL","NetPNL","Profit","Net P&L"]
+EXIT_CANDS   = ["exit_reason","ExitReason","Exit Reason","reason","Reason"]
+
 def _dupe_safe_from_ws(ws) -> List[Dict[str,Any]]:
-    """Handle non-unique headers by manual mapping to standard keys."""
+    """Handle non-unique headers by manual mapping + robust date/symbol fallback."""
     vals = ws.get_all_values()
     if not vals or len(vals) < 2:
         return []
@@ -277,39 +328,79 @@ def _dupe_safe_from_ws(ws) -> List[Dict[str,Any]]:
                     return i
         return None
 
-    idx_date  = _find_idx(["date","Date","trade_date","Trade Date"])
-    idx_sym   = _find_idx(["symbol","Symbol"])
-    idx_pnl   = _find_idx(["pnl_points","PNL","Net PnL","NetPNL","Profit","Net P&L"])
-    idx_exit  = _find_idx(["exit_reason","ExitReason","Exit Reason","reason","Reason"])
+    idx_date  = _find_idx(DATE_CANDS)
+    idx_sym   = _find_idx(SYMBOL_CANDS)
+    idx_pnl   = _find_idx(PNL_CANDS)
+    idx_exit  = _find_idx(EXIT_CANDS)
 
     out: List[Dict[str,Any]] = []
     for r in rows:
-        if not any(x.strip() for x in r if isinstance(x,str)):
+        if not any((x.strip() if isinstance(x,str) else "") for x in r):
             continue
         rec: Dict[str,Any] = {}
-        if idx_date is not None and idx_date < len(r):   rec["date"] = r[idx_date]
-        if idx_sym  is not None and idx_sym  < len(r):   rec["symbol"] = r[idx_sym]
-        if idx_pnl  is not None and idx_pnl  < len(r):   rec["pnl_points"] = r[idx_pnl]
-        if idx_exit is not None and idx_exit < len(r):   rec["exit_reason"] = r[idx_exit]
-        # keep raw too for safety (some sheets may use original headers):
+
+        # 1) PNL
+        if idx_pnl is not None and idx_pnl < len(r):
+            rec["pnl_points"] = r[idx_pnl]
+
+        # 2) SYMBOL (fallback to env)
+        sym_val = None
+        if idx_sym is not None and idx_sym < len(r):
+            sym_val = r[idx_sym]
+        if not sym_val:
+            sym_val = _env("OC_SYMBOL","NIFTY")
+        rec["symbol"] = (str(sym_val or "")).strip().upper()
+
+        # 3) DATE — try direct; else try from any time column; else today
+        date_val = None
+        if idx_date is not None and idx_date < len(r):
+            date_val = _parse_date_str(str(r[idx_date]))
+        if not date_val:
+            # scan other time-like columns in same row
+            for i, h in enumerate(header):
+                hn = (h or "").strip()
+                if not hn: 
+                    continue
+                if any(k in hn.lower() for k in ["time","date","timestamp","ts"]):
+                    date_val = _parse_date_str(str(r[i] if i < len(r) else ""))
+                    if date_val:
+                        break
+        if not date_val:
+            # extreme fallback: today IST (keeps tuner functional)
+            date_val = _today_ist_str()
+        rec["date"] = date_val
+
+        # 4) exit reason (optional)
+        if idx_exit is not None and idx_exit < len(r):
+            rec["exit_reason"] = r[idx_exit]
+
+        # keep raw too for safety:
         for i,h in enumerate(header):
             key = (h or f"col{i+1}").strip()
             if key and i < len(r):
                 rec[key] = r[i]
         out.append(rec)
-    log.info("Performance dupe-safe parsed rows=%d (date/symbol/pnl/exit columns idx=%s/%s/%s/%s)", len(out), idx_date, idx_sym, idx_pnl, idx_exit)
+
+    log.info("Performance dupe-safe parsed rows=%d (idx: date=%s, symbol=%s, pnl=%s, exit=%s)", 
+             len(out), idx_date, idx_sym, idx_pnl, idx_exit)
     return out
 
 def _read_performance_from_name(name: str) -> List[Dict[str,Any]]:
     ws = _open_ws_read_must(name)
     try:
         rows = ws.get_all_records() or []
-        log.info("Performance sheet='%s' rows=%d", name, len(rows))
-        return rows
+        if rows:
+            log.info("Performance sheet='%s' rows=%d (records)", name, len(rows))
+            return rows
+        else:
+            # if empty by records, try dupe-safe map from values
+            log.info("Performance sheet='%s' empty via get_all_records() → trying dupe-safe", name)
+            return _dupe_safe_from_ws(ws)
     except Exception as e:
         if "header" in str(e).lower() and "unique" in str(e).lower():
             log.warning("Sheet '%s' header not unique → using dupe-safe reader", name)
             return _dupe_safe_from_ws(ws)
+        # any other error: re-raise
         raise
 
 def _read_performance() -> List[Dict[str,Any]]:
@@ -325,10 +416,13 @@ def _read_performance() -> List[Dict[str,Any]]:
         ws = _open_ws_read_optional(alt)
         if ws:
             try:
-                # try normal
                 rows = ws.get_all_records() or []
-                log.info("Performance fallback sheet='%s' rows=%d", alt, len(rows))
-                return rows
+                if rows:
+                    log.info("Performance fallback sheet='%s' rows=%d (records)", alt, len(rows))
+                    return rows
+                else:
+                    log.info("Performance fallback sheet='%s' empty via records → dupe-safe", alt)
+                    return _dupe_safe_from_ws(ws)
             except Exception as e:
                 if "header" in str(e).lower() and "unique" in str(e).lower():
                     log.warning("Fallback sheet '%s' header not unique → using dupe-safe reader", alt)
