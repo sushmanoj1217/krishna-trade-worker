@@ -7,8 +7,10 @@
 # This version:
 #   - Provider snapshot पर HOLD/daily_cap flags merge करता है (env/sheet)
 #   - MV हमेशा derive करता है (PCR/MaxPain; tie-break via OIΔ)
-#   - Summary हमेशा भरता है (HOLD/CAP/STALE guards + MV/OIΔ संगति)
+#   - Summary हमेशा भरता है और **aliases** भी देता है:
+#       summary, summary_text, summary_line, summary_str, final_summary
 #   - Sheets fallback safe; expiry < today (IST) या age > OC_MAX_SNAPSHOT_AGE_SEC ⇒ STALE
+#   - snapshot["c5_reason"] = "OK" / "HOLD" / "DailyCap"
 # ------------------------------------------------------------
 from __future__ import annotations
 import importlib, inspect, logging, re, time, json, os
@@ -175,7 +177,7 @@ def _build_summary(s: Dict[str, Any]) -> str:
     if not mv:
         mv = _derive_mv(pcr, mp, spot, ce_d, pe_d)
 
-    # Check OIΔ alignment (our C3 proxy)
+    # OIΔ alignment (our C3 proxy)
     c3_ok = None
     if isinstance(ce_d,(int,float)) and isinstance(pe_d,(int,float)):
         if mv == "bearish":
@@ -191,7 +193,6 @@ def _build_summary(s: Dict[str, Any]) -> str:
         elif mv == "bullish":
             c2_ok = (pcr >= 1.0 and mp >= spot)
 
-    # Decision & suggestion
     side = None; level = None
     if mv == "bearish":
         side, level = "CE", "S1*"
@@ -205,13 +206,16 @@ def _build_summary(s: Dict[str, Any]) -> str:
     if mv and (c2_ok is True) and (c3_ok is True):
         return f"✅ Eligible — {side} @ {level}"
     if mv:
-        # Some signal known but not aligned
         if fails:
             return f"❌ Not eligible — failed: {', '.join(fails)}"
-        # partial info
         return f"⏳ Bias: {mv} — waiting for OIΔ/PCR alignment"
-    # No MV either
     return "❔ Insufficient data — waiting for live feed"
+
+def _apply_summary_aliases(s: Dict[str, Any]) -> None:
+    """Write the same summary into multiple commonly-seen keys so any renderer picks it up."""
+    txt = s.get("summary") or ""
+    for k in ("summary_text", "summary_line", "summary_str", "final_summary"):
+        s[k] = txt
 
 # ---------------- Sheets fallback builder ----------------
 def _open_oc_ws():
@@ -298,7 +302,7 @@ def _build_from_sheet() -> Optional[dict]:
     }
     _ensure_mv(snap)
     snap["summary"] = _build_summary(snap)
-    # convenience: explicit C5 text for renderers that want it
+    _apply_summary_aliases(snap)
     snap["c5_reason"] = "HOLD" if snap["hold"] else ("DailyCap" if snap["daily_cap_hit"] else "OK")
     return snap
 
@@ -384,8 +388,9 @@ async def refresh_once(*args, **kwargs) -> dict:
                 snap.setdefault("stale", False)
                 snap.setdefault("stale_reason", [])
 
-                # Build summary and explicit C5 text
+                # Build summary + aliases + explicit C5 text
                 snap["summary"] = _build_summary(snap)
+                _apply_summary_aliases(snap)
                 snap["c5_reason"] = "HOLD" if snap["hold"] else ("DailyCap" if snap["daily_cap_hit"] else "OK")
         except Exception as e:
             status, reason = "provider_error", str(e)
