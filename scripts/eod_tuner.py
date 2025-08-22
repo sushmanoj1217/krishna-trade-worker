@@ -108,11 +108,22 @@ def _append_params_row(row: Dict[str, Any]) -> None:
     ws.append_row(vals, value_input_option="RAW")
 
 # -------- tolerant numeric/string helpers --------
+_NUM_RE = re.compile(r"[-+]?\d+(?:\.\d+)?")
+
 def _num(x) -> Optional[float]:
+    """
+    Parse a numeric value from messy strings like '₹1,234.5', '+35 pts', ' - 8 '.
+    Returns float or None.
+    """
+    if x in (None, "", "—"):
+        return None
+    s = str(x)
+    s = s.replace(",", " ").strip()
+    m = _NUM_RE.search(s)
+    if not m:
+        return None
     try:
-        if x in (None,"","—"): return None
-        s = str(x).replace(",","").strip()
-        return float(s)
+        return float(m.group(0))
     except Exception:
         return None
 
@@ -140,12 +151,9 @@ def _base(sym: str, key: str, fallback: float) -> float:
 
 # ---------------- date parsing helpers ----------------
 _DATE_REs = [
-    # 2025-08-22 14:05:26, 2025-08-22
-    re.compile(r"(\d{4})[-/](\d{2})[-/](\d{2})"),
-    # 22/08/2025 or 22-08-2025
-    re.compile(r"(\d{2})[-/](\d{2})[-/](\d{4})"),
-    # 22-08-25
-    re.compile(r"(\d{2})[-/](\d{2})[-/](\d{2})"),
+    re.compile(r"(\d{4})[-/](\d{2})[-/](\d{2})"),         # 2025-08-22 or 2025/08/22
+    re.compile(r"(\d{2})[-/](\d{2})[-/](\d{4})"),         # 22/08/2025 or 22-08-2025
+    re.compile(r"(\d{2})[-/](\d{2})[-/](\d{2})"),         # 22-08-25
 ]
 
 def _parse_date_str(s: str) -> Optional[str]:
@@ -153,7 +161,7 @@ def _parse_date_str(s: str) -> Optional[str]:
     txt = s.strip()
     for pat in _DATE_REs:
         m = pat.search(txt)
-        if not m: 
+        if not m:
             continue
         g = m.groups()
         if len(g)==3 and len(g[0])==4:
@@ -189,7 +197,6 @@ def _last_n_dates(records: List[Dict[str,Any]], n: int, sym: str) -> List[str]:
 
 def _filter_by(records: List[Dict[str,Any]], sym: str, dates: List[str]) -> List[Dict[str,Any]]:
     if dates == ["ALL"]:
-        # don't filter by date; only by symbol (if present)
         out = []
         S = sym.upper()
         for r in records:
@@ -216,7 +223,8 @@ def _stats(records: List[Dict[str,Any]]) -> Dict[str,Any]:
     reasons = []
     for r in records:
         p = _num(r.get("pnl_points") or r.get("PNL") or r.get("Net PnL") or r.get("NetPNL") or r.get("Profit") or r.get("Net P&L"))
-        if p is None: continue
+        if p is None: 
+            continue
         pnls.append(p)
         if p >= 0:
             wins.append(p)
@@ -356,17 +364,15 @@ def _dupe_safe_from_ws(ws) -> List[Dict[str,Any]]:
         if idx_date is not None and idx_date < len(r):
             date_val = _parse_date_str(str(r[idx_date]))
         if not date_val:
-            # scan other time-like columns in same row
             for i, h in enumerate(header):
                 hn = (h or "").strip()
-                if not hn: 
+                if not hn:
                     continue
                 if any(k in hn.lower() for k in ["time","date","timestamp","ts"]):
                     date_val = _parse_date_str(str(r[i] if i < len(r) else ""))
                     if date_val:
                         break
         if not date_val:
-            # extreme fallback: today IST (keeps tuner functional)
             date_val = _today_ist_str()
         rec["date"] = date_val
 
@@ -393,25 +399,21 @@ def _read_performance_from_name(name: str) -> List[Dict[str,Any]]:
             log.info("Performance sheet='%s' rows=%d (records)", name, len(rows))
             return rows
         else:
-            # if empty by records, try dupe-safe map from values
             log.info("Performance sheet='%s' empty via get_all_records() → trying dupe-safe", name)
             return _dupe_safe_from_ws(ws)
     except Exception as e:
         if "header" in str(e).lower() and "unique" in str(e).lower():
             log.warning("Sheet '%s' header not unique → using dupe-safe reader", name)
             return _dupe_safe_from_ws(ws)
-        # any other error: re-raise
         raise
 
 def _read_performance() -> List[Dict[str,Any]]:
     pref = _env("PERFORMANCE_SHEET_NAME","Performance")
-    # Try preferred name
     try:
         return _read_performance_from_name(pref)
     except Exception as e:
         log.warning("Preferred sheet '%s' not usable (%s). Trying fallbacks...", pref, e)
 
-    # Try fallbacks
     for alt in [n for n in ALT_PERF_NAMES if n != pref]:
         ws = _open_ws_read_optional(alt)
         if ws:
@@ -430,13 +432,13 @@ def _read_performance() -> List[Dict[str,Any]]:
                 else:
                     log.warning("Fallback sheet '%s' read error: %s", alt, e)
 
-    # final: show helpful info
     sh, sid = _open_spreadsheet()
     names = [w.title for w in sh.worksheets()]
     raise RuntimeError(f"Performance sheet not found/usable. Tried: {[pref]+[n for n in ALT_PERF_NAMES if n!=pref]}. "
                        f"Available in {sid}: {names}. Set PERFORMANCE_SHEET_NAME=... if needed.")
 
-# ---------------- main ----------------
+# ---------------- tuning ---------------- (unchanged above in this block)
+
 def run():
     symbols_csv = _env("EOD_TUNE_SYMBOLS") or _env("OC_SYMBOL","NIFTY")
     symbols = [s.strip().upper() for s in symbols_csv.split(",") if s.strip()]
