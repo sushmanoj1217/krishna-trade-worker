@@ -1,26 +1,17 @@
 # scripts/eod_tuner.py
 # -----------------------------------------------------------------------------
-# EOD Tuner: Read recent Performance, compute light heuristics, and append
-# next-day parameters into "Params_Override" sheet.
+# EOD Tuner: Read recent Performance, compute heuristics, and append
+# next-day parameters into "Params_Override".
 #
-# Inputs (ENV):
-#   EOD_TUNE_SYMBOLS        = "NIFTY,BANKNIFTY" (default: OC_SYMBOL or NIFTY)
-#   EOD_LOOKBACK_DAYS       = 10         # distinct trade-dates to look back
-#   EOD_MIN_TRADES          = 8          # minimum trades in lookback to tune
-#   EOD_TUNER_DRY_RUN       = 0/1        # 1 => don't write, only log
-#   EOD_TUNER_DEBUG         = 0/1        # 1 => log raw→parsed PNL for first few rows
-#   PERFORMANCE_SHEET_NAME  = Performance (override if needed)
-#
-# Sheets env:
-#   GOOGLE_SA_JSON, GSHEET_TRADES_SPREADSHEET_ID
-#
-# Output Sheet: Params_Override (wide row per run)
+# ENV:
+#   EOD_TUNE_SYMBOLS, EOD_LOOKBACK_DAYS, EOD_MIN_TRADES, EOD_TUNER_DRY_RUN
+#   EOD_TUNER_DEBUG=1  -> raw→parsed PNL + fallback source logs
+#   PERFORMANCE_SHEET_NAME, GOOGLE_SA_JSON, GSHEET_TRADES_SPREADSHEET_ID
 # -----------------------------------------------------------------------------
 
 from __future__ import annotations
-
 import os, json, time, logging, statistics, re
-from typing import Any, Dict, List, Tuple, Optional
+from typing import Any, Dict, List, Optional
 
 try:
     import gspread  # type: ignore
@@ -64,7 +55,6 @@ def _open_spreadsheet():
     return sh, sid
 
 def _open_ws_write(name: str):
-    """For writing: create if missing."""
     sh, sid = _open_spreadsheet()
     try:
         return sh.worksheet(name)
@@ -73,7 +63,6 @@ def _open_ws_write(name: str):
         return sh.add_worksheet(title=name, rows=1000, cols=40)
 
 def _open_ws_read_must(name: str):
-    """For reading: DO NOT create silently. Raise with helpful info."""
     sh, sid = _open_spreadsheet()
     try:
         return sh.worksheet(name)
@@ -109,36 +98,22 @@ def _append_params_row(row: Dict[str, Any]) -> None:
     ws.append_row(vals, value_input_option="RAW")
 
 # -------- tolerant numeric/string helpers --------
-# handle unicode minus: U+2212 (−), en dash (–), em dash (—)
-_MINUSES = ["\u2212", "–", "—"]
-
-_NUM_RE = re.compile(r"[-+]?\d+(?:\.\d+)?")
+_MINUSES = ["\u2212", "–", "—"]   # unicode minus/dashes
+_NUM_RE  = re.compile(r"[-+]?\d+(?:\.\d+)?")
 
 def _num(x) -> Optional[float]:
-    """
-    Parse a numeric value from messy strings like:
-    '₹1,234.5', '+35pts', ' - 8 ', '(12.5)', '−14', '—3.2'
-    Returns float (with sign) or None.
-    """
+    """Parse numbers from messy strings: '₹1,234.5', '+35pts', '(12.5)', '−14' etc."""
     if x in (None, "", "—"):
         return None
     s = str(x)
-
-    # normalize unicode minus to ASCII hyphen
     for uni in _MINUSES:
         s = s.replace(uni, "-")
-
-    # remove thousand separators (commas/spaces)
-    s = s.replace(",", "")
-    s = s.strip()
-
-    # handle accounting negatives in parentheses
+    s = s.replace(",", "").strip()
     neg = False
     if "(" in s and ")" in s:
         inside = s[s.find("(")+1 : s.rfind(")")]
         s = inside
         neg = True
-
     m = _NUM_RE.search(s)
     if not m:
         return None
@@ -166,185 +141,26 @@ STEP = {
     "FINNIFTY":  dict(BUF_UP=3.0, BUF_DN=3.0, TP_UP=7.0),
 }
 
-def _base(sym: str, key: str, fallback: float) -> float:
-    s = (sym or "").upper()
-    if s in BASE and key in BASE[s]:
-        return float(BASE[s][key])
-    return float(fallback)
-
 # ---------------- date parsing helpers ----------------
 _DATE_REs = [
-    re.compile(r"(\d{4})[-/](\d{2})[-/](\d{2})"),         # 2025-08-22 or 2025/08/22
-    re.compile(r"(\d{2})[-/](\d{2})[-/](\d{4})"),         # 22/08/2025 or 22-08-2025
-    re.compile(r"(\d{2})[-/](\d{2})[-/](\d{2})"),         # 22-08-25
+    re.compile(r"(\d{4})[-/](\d{2})[-/](\d{2})"),
+    re.compile(r"(\d{2})[-/](\d{2})[-/](\d{4})"),
+    re.compile(r"(\d{2})[-/](\d{2})[-/](\d{2})"),
 ]
-
 def _parse_date_str(s: str) -> Optional[str]:
     if not s: return None
     txt = s.strip()
     for pat in _DATE_REs:
         m = pat.search(txt)
-        if not m:
-            continue
+        if not m: continue
         g = m.groups()
         if len(g)==3 and len(g[0])==4:
-            y,mo,da = g
-            return f"{int(y):04d}-{int(mo):02d}-{int(da):02d}"
+            y,mo,da = g;  return f"{int(y):04d}-{int(mo):02d}-{int(da):02d}"
         if len(g)==3 and len(g[2])==4:
-            da,mo,y = g
-            return f"{int(y):04d}-{int(mo):02d}-{int(da):02d}"
+            da,mo,y = g;  return f"{int(y):04d}-{int(mo):02d}-{int(da):02d}"
         if len(g)==3 and len(g[2])==2:
-            da,mo,y2 = g
-            y = 2000 + int(y2)
-            return f"{int(y):04d}-{int(mo):02d}-{int(da):02d}"
+            da,mo,y2 = g; y = 2000 + int(y2); return f"{int(y):04d}-{int(mo):02d}-{int(da):02d}"
     return None
-
-# ---------------- core stats ----------------
-def _last_n_dates(records: List[Dict[str,Any]], n: int, sym: str) -> List[str]:
-    seen = []
-    S = sym.upper()
-    for r in records:
-        rs = str(r.get("symbol") or r.get("Symbol") or "").upper()
-        if rs and rs != S:
-            continue
-        d = (r.get("date") or r.get("Date") or "")
-        d = str(d).strip()
-        if not d:
-            continue
-        if d not in seen:
-            seen.append(d)
-    if seen:
-        return seen[-n:] if len(seen) >= n else seen
-    # Fallback: no date columns at all -> use ALL bucket
-    return ["ALL"]
-
-def _filter_by(records: List[Dict[str,Any]], sym: str, dates: List[str]) -> List[Dict[str,Any]]:
-    if dates == ["ALL"]:
-        out = []
-        S = sym.upper()
-        for r in records:
-            rs = str(r.get("symbol") or r.get("Symbol") or "").upper()
-            if rs and rs != S:
-                continue
-            out.append(r)
-        return out
-    out = []
-    D = set(dates)
-    S = sym.upper()
-    for r in records:
-        rs = str(r.get("symbol") or r.get("Symbol") or "").upper()
-        if rs and rs != S:
-            continue
-        d = str(r.get("date") or r.get("Date") or "").strip()
-        if d in D:
-            out.append(r)
-    return out
-
-def _stats(records: List[Dict[str,Any]]) -> Dict[str,Any]:
-    debug = _env("EOD_TUNER_DEBUG","0") in {"1","true","on","yes"}
-    pnls = []
-    wins = []; losses = []
-    reasons = []
-    dbg_shown = 0
-    for r in records:
-        raw_p = (r.get("pnl_points") or r.get("PNL") or r.get("Net PnL") or r.get("NetPNL") or r.get("Profit") or r.get("Net P&L"))
-        p = _num(raw_p)
-        if debug and dbg_shown < 6:
-            log.info("[DBG] PNL raw=%r → parsed=%r", raw_p, p)
-            dbg_shown += 1
-        if p is None:
-            continue
-        pnls.append(p)
-        if p >= 0:
-            wins.append(p)
-        else:
-            losses.append(-p)
-        er = str(r.get("exit_reason") or r.get("ExitReason") or r.get("Exit Reason") or r.get("reason") or r.get("Reason") or "").strip().upper()
-        if er:
-            reasons.append(er)
-    n = len(pnls)
-    wr = (len(wins)/n*100.0) if n>0 else 0.0
-    avg_win = (sum(wins)/len(wins)) if wins else 0.0
-    avg_loss = (sum(losses)/len(losses)) if losses else 0.0
-    med_win = statistics.median(wins) if wins else 0.0
-    med_loss = statistics.median(losses) if losses else 0.0
-    mv_rev_cnt = sum(1 for x in reasons if "MV" in x)
-    tp_cnt = sum(1 for x in reasons if "TP" in x)
-    sl_cnt = sum(1 for x in reasons if x=="SL")
-    return dict(
-        n=n, wr=wr, avg_win=avg_win, avg_loss=avg_loss,
-        med_win=med_win, med_loss=med_loss,
-        mv_rev_cnt=mv_rev_cnt, tp_cnt=tp_cnt, sl_cnt=sl_cnt
-    )
-
-# ---------------- tuning ----------------
-BASE_STEP = {
-    "NIFTY":     dict(BUF_UP=2.0, BUF_DN=2.0, TP_UP=5.0),
-    "BANKNIFTY": dict(BUF_UP=5.0, BUF_DN=5.0, TP_UP=10.0),
-    "FINNIFTY":  dict(BUF_UP=3.0, BUF_DN=3.0, TP_UP=7.0),
-}
-
-def _tune_for_symbol(sym: str, perf: List[Dict[str,Any]], lookback_days: int, min_trades: int) -> Optional[Dict[str,Any]]:
-    BUF = _sym_env(sym, "LEVEL_BUFFER", BASE.get(sym.upper(), BASE["NIFTY"])["BUF"])
-    BAND= _sym_env(sym, "ENTRY_BAND",  BASE.get(sym.upper(), BASE["NIFTY"])["BAND"])
-    TGT = _sym_env(sym, "TARGET_MIN_POINTS", BASE.get(sym.upper(), BASE["NIFTY"])["TGT"])
-    TP  = _sym_env(sym, "TP_POINTS",  BASE.get(sym.upper(), BASE["NIFTY"])["TP"])
-    SL  = _sym_env(sym, "SL_POINTS",  BASE.get(sym.upper(), BASE["NIFTY"])["SL"])
-    TR  = _sym_env(sym, "TRAIL_TRIGGER_POINTS", BASE.get(sym.upper(), BASE["NIFTY"])["TR_TR"])
-    TOF = _sym_env(sym, "TRAIL_OFFSET_POINTS",  BASE.get(sym.upper(), BASE["NIFTY"])["TR_OFF"])
-    MVN = float(_env("MV_REV_CONFIRM","2") or "2")
-
-    dates = _last_n_dates(perf, lookback_days, sym)
-    rows = _filter_by(perf, sym, dates)
-    if len(rows) < min_trades:
-        log.info("[%s] Not enough trades in lookback (have %d, need %d) → skip tuning.", sym, len(rows), min_trades)
-        return None
-
-    st = _stats(rows)
-    wr = st["wr"]; avg_win = st["avg_win"]; avg_loss = st["avg_loss"]
-    med_win = st["med_win"]; med_loss = st["med_loss"]
-    n = st["n"]; mv_rev_cnt = st["mv_rev_cnt"]; tp_cnt = st["tp_cnt"]; sl_cnt = st["sl_cnt"]
-
-    steps = BASE_STEP.get(sym.upper(), BASE_STEP["NIFTY"])
-    notes = []
-
-    TRADES_PER_DAY = n / max(1, len(dates) if dates != ["ALL"] else 1)
-    if wr < 40.0 and avg_loss >= 0.6*TP:
-        BUF = BUF + steps["BUF_UP"]
-        SL = max(0.8*SL, SL - 0.05*TP)
-        notes.append("WR<40 & loss>=0.6*TP → BUF↑, SL tighten")
-    elif TRADES_PER_DAY < 0.6 and wr >= 50.0:
-        BUF = max(1.0, BUF - steps["BUF_DN"])
-        notes.append("Low trades/day & WR≥50 → BUF↓")
-
-    if wr > 55.0 and avg_win >= 0.7*TP:
-        TP = TP + steps["TP_UP"]
-        notes.append("WR>55 & avg_win≥0.7*TP → TP↑")
-
-    if med_win > 0:
-        TR = min(TP - 5.0, max(0.5*SL, 0.6*med_win))
-        TOF = max(0.4*TR, min(0.6*TR, TR - 5.0))
-        notes.append("Trail tuned from median win")
-
-    SL = min(SL, 0.7*TP)
-    SL = max(SL, 0.4*TP)
-
-    def rnd(x: float) -> float:
-        return round(float(x), 2)
-    BUF, BAND, TGT, TP, SL, TR, TOF, MVN = map(rnd, [BUF, BAND, TGT, TP, SL, TR, TOF, MVN])
-
-    summary = f"n={n}, wr={wr:.1f}%, avgW={avg_win:.1f}, avgL={avg_loss:.1f}, medW={med_win:.1f}, medL={med_loss:.1f}, mvRev={mv_rev_cnt}, tp={tp_cnt}, sl={sl_cnt}"
-    if not notes:
-        notes.append("no major change")
-    return dict(
-        symbol=sym.upper(),
-        LEVEL_BUFFER=BUF, ENTRY_BAND=BAND, TARGET_MIN_POINTS=TGT,
-        TP_POINTS=TP, SL_POINTS=SL,
-        TRAIL_TRIGGER_POINTS=TR, TRAIL_OFFSET_POINTS=TOF,
-        MV_REV_CONFIRM=MVN,
-        lookback_days=lookback_days,
-        notes=summary + " | " + "; ".join(notes)
-    )
 
 # -------------- dupe/variant-safe Performance readers --------------
 ALT_PERF_NAMES = ["Performance","performance","PERFORMANCE","Perf","Trades","TRADES"]
@@ -356,7 +172,7 @@ PNL_CANDS    = ["pnl_points","PNL","Net PnL","NetPNL","Profit","Net P&L"]
 EXIT_CANDS   = ["exit_reason","ExitReason","Exit Reason","reason","Reason"]
 
 def _dupe_safe_from_ws(ws) -> List[Dict[str,Any]]:
-    """Handle non-unique headers by manual mapping + robust date/symbol fallback."""
+    """Non-unique headers safe reader: maps row to dict, keeps raw columns too."""
     vals = ws.get_all_values()
     if not vals or len(vals) < 2:
         return []
@@ -382,44 +198,38 @@ def _dupe_safe_from_ws(ws) -> List[Dict[str,Any]]:
             continue
         rec: Dict[str,Any] = {}
 
-        # 1) PNL
-        if idx_pnl is not None and idx_pnl < len(r):
-            rec["pnl_points"] = r[idx_pnl]
+        # Primary mapped fields if present:
+        if idx_pnl  is not None and idx_pnl  < len(r): rec["pnl_points"]  = r[idx_pnl]
+        if idx_sym  is not None and idx_sym  < len(r): rec["symbol"]      = (r[idx_sym] or "").strip().upper()
+        if idx_date is not None and idx_date < len(r): 
+            rec["date"] = _parse_date_str(str(r[idx_date]))
 
-        # 2) SYMBOL (fallback to env)
-        sym_val = None
-        if idx_sym is not None and idx_sym < len(r):
-            sym_val = r[idx_sym]
-        if not sym_val:
-            sym_val = _env("OC_SYMBOL","NIFTY")
-        rec["symbol"] = (str(sym_val or "")).strip().upper()
-
-        # 3) DATE — try direct; else try from any time column; else today
-        date_val = None
-        if idx_date is not None and idx_date < len(r):
-            date_val = _parse_date_str(str(r[idx_date]))
-        if not date_val:
-            for i, h in enumerate(header):
+        # date fallback: scan any time-like col
+        if not rec.get("date"):
+            for i,h in enumerate(header):
                 hn = (h or "").strip()
-                if not hn:
+                if not hn: 
                     continue
                 if any(k in hn.lower() for k in ["time","date","timestamp","ts"]):
-                    date_val = _parse_date_str(str(r[i] if i < len(r) else ""))
-                    if date_val:
+                    rec["date"] = _parse_date_str(str(r[i] if i < len(r) else ""))
+                    if rec["date"]:
                         break
-        if not date_val:
-            date_val = _today_ist_str()
-        rec["date"] = date_val
+        if not rec.get("date"):
+            rec["date"] = _today_ist_str()
 
-        # 4) exit reason (optional)
+        # symbol fallback: env
+        if not rec.get("symbol"):
+            rec["symbol"] = (_env("OC_SYMBOL","NIFTY") or "NIFTY").upper()
+
         if idx_exit is not None and idx_exit < len(r):
             rec["exit_reason"] = r[idx_exit]
 
-        # keep raw too for safety:
+        # Keep all raw columns for later PNL fallback scan
         for i,h in enumerate(header):
             key = (h or f"col{i+1}").strip()
             if key and i < len(r):
                 rec[key] = r[i]
+
         out.append(rec)
 
     log.info("Performance dupe-safe parsed rows=%d (idx: date=%s, symbol=%s, pnl=%s, exit=%s)", 
@@ -472,13 +282,164 @@ def _read_performance() -> List[Dict[str,Any]]:
     raise RuntimeError(f"Performance sheet not found/usable. Tried: {[pref]+[n for n in ALT_PERF_NAMES if n!=pref]}. "
                        f"Available in {sid}: {names}. Set PERFORMANCE_SHEET_NAME=... if needed.")
 
-# ---------------- tuning ----------------
+# ---------------- PNL fallback & stats ----------------
+_PNL_KEY_HINT = re.compile(r"(pnl|p&l|profit|points?)", re.I)
+_BAD_COL_HINT = re.compile(r"(date|time|qty|quantity|ltp|price|spot|level|s1|s2|r1|r2|mp|pcr|ce|pe|oi|open|close|entry|exit)", re.I)
 
+def _find_pnl_in_row(row: Dict[str,Any]) -> tuple[Optional[float], Optional[str]]:
+    """Try multiple ways to find a PNL number in a row dict."""
+    # 1) explicit keys
+    for k in ["pnl_points","PNL","Net PnL","NetPNL","Profit","Net P&L"]:
+        if k in row:
+            p = _num(row.get(k))
+            if p is not None:
+                return p, k
+    # 2) any header containing pnl/p&l/profit/points
+    for k,v in row.items():
+        if isinstance(k,str) and _PNL_KEY_HINT.search(k):
+            p = _num(v)
+            if p is not None:
+                return p, k
+    # 3) last resort: scan all columns for first reasonable numeric that isn't obviously a bad column
+    for k,v in row.items():
+        if isinstance(k,str) and _BAD_COL_HINT.search(k):
+            continue
+        p = _num(v)
+        if p is not None:
+            return p, k
+    return None, None
+
+def _stats(records: List[Dict[str,Any]]) -> Dict[str,Any]:
+    debug = _env("EOD_TUNER_DEBUG","0") in {"1","true","on","yes"}
+    pnls = []; wins = []; losses = []; reasons = []
+    dbg_shown = 0
+    for r in records:
+        p, src = _find_pnl_in_row(r)
+        if debug and dbg_shown < 8:
+            log.info("[DBG] PNL pick: src=%r raw=%r → parsed=%r", src, (r.get(src) if src else None), p)
+            dbg_shown += 1
+        if p is None:
+            continue
+        pnls.append(p)
+        if p >= 0: wins.append(p)
+        else:      losses.append(-p)
+        er = str(r.get("exit_reason") or r.get("ExitReason") or r.get("Exit Reason") or r.get("reason") or r.get("Reason") or "").strip().upper()
+        if er: reasons.append(er)
+
+    n = len(pnls)
+    wr = (len(wins)/n*100.0) if n>0 else 0.0
+    avg_win = (sum(wins)/len(wins)) if wins else 0.0
+    avg_loss = (sum(losses)/len(losses)) if losses else 0.0
+    med_win = statistics.median(wins) if wins else 0.0
+    med_loss = statistics.median(losses) if losses else 0.0
+    mv_rev_cnt = sum(1 for x in reasons if "MV" in x)
+    tp_cnt = sum(1 for x in reasons if "TP" in x)
+    sl_cnt = sum(1 for x in reasons if x=="SL")
+    return dict(n=n, wr=wr, avg_win=avg_win, avg_loss=avg_loss,
+                med_win=med_win, med_loss=med_loss,
+                mv_rev_cnt=mv_rev_cnt, tp_cnt=tp_cnt, sl_cnt=sl_cnt)
+
+# ---------------- tuning ----------------
+def _base(sym: str, key: str, fallback: float) -> float:
+    s = (sym or "").upper()
+    if s in BASE and key in BASE[s]:
+        return float(BASE[s][key])
+    return float(fallback)
+
+def _tune_for_symbol(sym: str, perf: List[Dict[str,Any]], lookback_days: int, min_trades: int) -> Optional[Dict[str,Any]]:
+    BUF = _sym_env(sym, "LEVEL_BUFFER", _base(sym, "BUF", 12.0))
+    BAND= _sym_env(sym, "ENTRY_BAND", _base(sym, "BAND", 3.0))
+    TGT = _sym_env(sym, "TARGET_MIN_POINTS", _base(sym, "TGT", 30.0))
+    TP  = _sym_env(sym, "TP_POINTS", _base(sym, "TP", 40.0))
+    SL  = _sym_env(sym, "SL_POINTS", _base(sym, "SL", 20.0))
+    TR  = _sym_env(sym, "TRAIL_TRIGGER_POINTS", _base(sym, "TR_TR", 25.0))
+    TOF = _sym_env(sym, "TRAIL_OFFSET_POINTS",  _base(sym, "TR_OFF", 15.0))
+    MVN = float(_env("MV_REV_CONFIRM","2") or "2")
+
+    # Dates filter (kept simple; if no dates, uses ALL)
+    def _last_n_dates(records: List[Dict[str,Any]], n: int, sym: str) -> List[str]:
+        seen = []
+        S = sym.upper()
+        for r in records:
+            rs = str(r.get("symbol") or r.get("Symbol") or "").upper()
+            if rs and rs != S: continue
+            d = str(r.get("date") or r.get("Date") or "").strip()
+            if not d: continue
+            if d not in seen: seen.append(d)
+        return (seen[-n:] if len(seen) >= n else seen) or ["ALL"]
+
+    def _filter_by(records: List[Dict[str,Any]], sym: str, dates: List[str]) -> List[Dict[str,Any]]:
+        if dates == ["ALL"]:
+            out = []
+            S = sym.upper()
+            for r in records:
+                rs = str(r.get("symbol") or r.get("Symbol") or "").upper()
+                if rs and rs != S: continue
+                out.append(r)
+            return out
+        out = []
+        D = set(dates); S = sym.upper()
+        for r in records:
+            rs = str(r.get("symbol") or r.get("Symbol") or "").upper()
+            if rs and rs != S: continue
+            d = str(r.get("date") or r.get("Date") or "").strip()
+            if d in D: out.append(r)
+        return out
+
+    dates = _last_n_dates(perf, int(float(_env("EOD_LOOKBACK_DAYS","10"))), sym)
+    rows = _filter_by(perf, sym, dates)
+    st = _stats(rows)
+    if st["n"] < int(float(_env("EOD_MIN_TRADES","8"))):
+        log.info("[%s] Not enough trades in lookback (have %d, need %d) → skip tuning.",
+                 sym, st["n"], int(float(_env("EOD_MIN_TRADES","8"))))
+        return None
+
+    wr, avg_win, avg_loss = st["wr"], st["avg_win"], st["avg_loss"]
+    med_win, med_loss = st["med_win"], st["med_loss"]
+    n = st["n"]; mv_rev_cnt = st["mv_rev_cnt"]; tp_cnt = st["tp_cnt"]; sl_cnt = st["sl_cnt"]
+
+    steps = STEP.get(sym.upper(), STEP["NIFTY"])
+    notes = []
+
+    TRADES_PER_DAY = n / max(1, len(dates) if dates != ["ALL"] else 1)
+    if wr < 40.0 and avg_loss >= 0.6*TP:
+        BUF = BUF + steps["BUF_UP"]
+        SL = max(0.8*SL, SL - 0.05*TP)
+        notes.append("WR<40 & loss>=0.6*TP → BUF↑, SL tighten")
+    elif TRADES_PER_DAY < 0.6 and wr >= 50.0:
+        BUF = max(1.0, BUF - steps["BUF_DN"])
+        notes.append("Low trades/day & WR≥50 → BUF↓")
+
+    if wr > 55.0 and avg_win >= 0.7*TP:
+        TP = TP + steps["TP_UP"]
+        notes.append("WR>55 & avg_win≥0.7*TP → TP↑")
+
+    if med_win > 0:
+        TR = min(TP - 5.0, max(0.5*SL, 0.6*med_win))
+        TOF = max(0.4*TR, min(0.6*TR, TR - 5.0))
+        notes.append("Trail tuned from median win")
+
+    SL = min(SL, 0.7*TP)
+    SL = max(SL, 0.4*TP)
+
+    def rnd(x: float) -> float: return round(float(x), 2)
+    BUF,BAND,TGT,TP,SL,TR,TOF,MVN = map(rnd,[BUF,BAND,TGT,TP,SL,TR,TOF,MVN])
+
+    summary = (f"n={n}, wr={wr:.1f}%, avgW={avg_win:.1f}, avgL={avg_loss:.1f}, "
+               f"medW={med_win:.1f}, medL={med_loss:.1f}, mvRev={mv_rev_cnt}, tp={tp_cnt}, sl={sl_cnt}")
+    if not notes: notes.append("no major change")
+    return dict(symbol=sym.upper(),
+                LEVEL_BUFFER=BUF, ENTRY_BAND=BAND, TARGET_MIN_POINTS=TGT,
+                TP_POINTS=TP, SL_POINTS=SL,
+                TRAIL_TRIGGER_POINTS=TR, TRAIL_OFFSET_POINTS=TOF,
+                MV_REV_CONFIRM=MVN,
+                lookback_days=int(float(_env("EOD_LOOKBACK_DAYS","10"))),
+                notes=summary + " | " + "; ".join(notes))
+
+# ---------------- main ----------------
 def run():
     symbols_csv = _env("EOD_TUNE_SYMBOLS") or _env("OC_SYMBOL","NIFTY")
     symbols = [s.strip().upper() for s in symbols_csv.split(",") if s.strip()]
-    lookback = int(float(_env("EOD_LOOKBACK_DAYS","10")))
-    min_trades = int(float(_env("EOD_MIN_TRADES","8")))
     dry = (_env("EOD_TUNER_DRY_RUN","0") in {"1","true","on","yes"})
 
     perf = _read_performance()
@@ -488,33 +449,24 @@ def run():
     today = _today_ist_str()
     wrote = 0
     for sym in symbols:
-        rec = _tune_for_symbol(sym, perf, lookback, min_trades)
+        rec = _tune_for_symbol(sym, perf, int(float(_env("EOD_LOOKBACK_DAYS","10"))),
+                               int(float(_env("EOD_MIN_TRADES","8"))))
         if not rec:
             log.info("[%s] Skipped (insufficient data).", sym)
             continue
-        row = {
-            "date": today, "symbol": sym,
-            "LEVEL_BUFFER": rec["LEVEL_BUFFER"],
-            "ENTRY_BAND": rec["ENTRY_BAND"],
-            "TARGET_MIN_POINTS": rec["TARGET_MIN_POINTS"],
-            "TP_POINTS": rec["TP_POINTS"],
-            "SL_POINTS": rec["SL_POINTS"],
-            "TRAIL_TRIGGER_POINTS": rec["TRAIL_TRIGGER_POINTS"],
-            "TRAIL_OFFSET_POINTS": rec["TRAIL_OFFSET_POINTS"],
-            "MV_REV_CONFIRM": rec["MV_REV_CONFIRM"],
-            "lookback_days": rec["lookback_days"],
-            "src": "tuner-v1",
-            "notes": rec["notes"],
-        }
+        row = {"date": today, "symbol": sym,
+               "LEVEL_BUFFER": rec["LEVEL_BUFFER"], "ENTRY_BAND": rec["ENTRY_BAND"],
+               "TARGET_MIN_POINTS": rec["TARGET_MIN_POINTS"], "TP_POINTS": rec["TP_POINTS"],
+               "SL_POINTS": rec["SL_POINTS"], "TRAIL_TRIGGER_POINTS": rec["TRAIL_TRIGGER_POINTS"],
+               "TRAIL_OFFSET_POINTS": rec["TRAIL_OFFSET_POINTS"], "MV_REV_CONFIRM": rec["MV_REV_CONFIRM"],
+               "lookback_days": rec["lookback_days"], "src": "tuner-v1", "notes": rec["notes"]}
         log.info("[%s] EOD params: %s", sym, json.dumps(row, ensure_ascii=False))
         if not dry:
-            _append_params_row(row)
-            wrote += 1
+            _append_params_row(row); wrote += 1
         else:
             log.info("[DRY_RUN] Not writing to Params_Override")
 
     log.info("EOD Tuner done. rows_written=%d dry_run=%s", wrote, str(dry))
-    return
 
 if __name__ == "__main__":
     run()
