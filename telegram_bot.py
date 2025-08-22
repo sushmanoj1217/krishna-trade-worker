@@ -2,21 +2,16 @@
 # ------------------------------------------------------------------------------------
 # PTB v20+ compatible bot wiring
 # - init() -> Application (do NOT start polling here; main controls single-poller)
-# - /oc_now renders snapshot with ALWAYS-FILLED Summary
-# - Keeps message style close to your current output
+# - /oc_now renders snapshot with ALWAYS-FILLED Summary (labels aligned with Checks)
 #
 # Env:
 #   TELEGRAM_BOT_TOKEN=...
-#   LEVEL_BUFFER=12            # optional, default 12
-#   OC_MAX_SNAPSHOT_AGE_SEC=300  # optional, affects stale display via oc_refresh
-#
-# Depends on:
-#   analytics.oc_refresh (our earlier patched module)
+#   LEVEL_BUFFER=12
+#   OC_MAX_SNAPSHOT_AGE_SEC=300
 # ------------------------------------------------------------------------------------
 from __future__ import annotations
 
 import os
-import math
 import logging
 from typing import Any, Dict, Optional
 
@@ -50,7 +45,6 @@ def _signfmt(x: Optional[float]) -> str:
     try:
         xf = float(x)
         s = "+" if xf >= 0 else ""
-        # show as integer if huge
         if abs(xf) >= 1_000_000:
             return f"{s}{int(xf):,}"
         return f"{s}{xf:.2f}"
@@ -102,36 +96,36 @@ def _fallback_summary(s: Dict[str, Any]) -> str:
     if not mv:
         mv = _derive_mv(pcr, mp, spot, ce_d, pe_d)
 
-    # Proxy gates
+    # OIΔ alignment (C3)
     c3_ok = None
     if isinstance(ce_d,(int,float)) and isinstance(pe_d,(int,float)):
         if mv == "bearish": c3_ok = (ce_d > 0 and (pe_d is None or pe_d <= 0))
         elif mv == "bullish": c3_ok = (pe_d > 0 and (ce_d is None or ce_d <= 0))
 
-    c2_ok = None
+    # PCR/MP (C4)
+    c4_ok = None
     if isinstance(pcr,(int,float)) and isinstance(mp,(int,float)) and isinstance(spot,(int,float)):
-        if mv == "bearish": c2_ok = (pcr < 1.0 and mp <= spot)
-        elif mv == "bullish": c2_ok = (pcr >= 1.0 and mp >= spot)
+        if mv == "bearish": c4_ok = (pcr < 1.0 and mp <= spot)
+        elif mv == "bullish": c4_ok = (pcr >= 1.0 and mp >= spot)
 
     side, level = (None, None)
     if mv == "bearish": side, level = "CE", "S1*"
     elif mv == "bullish": side, level = "PE", "R1*"
 
     fails = []
-    if c2_ok is False: fails.append("C2")
+    if c4_ok is False: fails.append("C4")
     if c3_ok is False: fails.append("C3")
 
-    if mv and (c2_ok is True) and (c3_ok is True):
+    if mv and (c4_ok is True) and (c3_ok is True):
         return f"✅ Eligible — {side} @ {level}"
     if mv:
-        return f"❌ Not eligible — failed: {', '.join(fails) or 'gates'}"
+        return f"❌ Not eligible — failed: {', '.join(sorted(fails)) or 'gates'}"
     return "❔ Insufficient data — waiting for live feed"
 
 # ---------- /oc_now ----------
 async def oc_now(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     from analytics import oc_refresh  # import here to avoid circulars
     try:
-        # Kick a refresh so we have latest snapshot
         await oc_refresh.refresh_once()
     except Exception as e:
         log.warning("oc_now: refresh_once error: %s", e)
@@ -156,15 +150,14 @@ async def oc_now(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     buf  = _to_float(_env("LEVEL_BUFFER","12"))
 
     # shifted
-    def _shift(v, b): 
+    def _shift(v, b):
         return None if v is None or b is None else (float(v) - float(b) if v in (s1, s2) else float(v) + float(b))
-    s1s = _shift(s1, buf)  # S1 - buf
-    s2s = _shift(s2, buf)  # S2 - buf
-    r1s = _shift(r1, buf)  # R1 + buf
-    r2s = _shift(r2, buf)  # R2 + buf
+    s1s = _shift(s1, buf)
+    s2s = _shift(s2, buf)
+    r1s = _shift(r1, buf)
+    r2s = _shift(r2, buf)
 
-    # Checks (lightweight, mirrors your style)
-    # C1: NEAR (within buffer) and not crossed
+    # Checks
     c1_ok = None
     if spot is not None and buf is not None and s1 is not None and r1 is not None:
         near_s1 = abs(spot - s1) <= buf
@@ -172,11 +165,9 @@ async def oc_now(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         crossed = (spot <= s1s) or (spot >= r1s) if (s1s is not None and r1s is not None) else False
         c1_ok = (near_s1 or near_r1) and not crossed
 
-    # C2: MV tag presence (bearish/bullish)
     c2_ok = bool(mv)
     c2_reason = f"MV={mv}" if mv else "MV missing"
 
-    # C3: OIΔ alignment
     c3_ok = None
     if ce_d is not None and pe_d is not None and mv:
         if mv == "bearish":
@@ -184,7 +175,6 @@ async def oc_now(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         elif mv == "bullish":
             c3_ok = (pe_d > 0 and ce_d <= 0)
 
-    # C4: PCR & MP vs spot
     mp_ok = None
     if mp is not None and spot is not None and mv:
         mp_ok = (mp <= spot) if mv == "bearish" else (mp >= spot)
@@ -192,15 +182,11 @@ async def oc_now(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if pcr is not None and mv:
         pcr_ok = (pcr < 1.0) if mv == "bearish" else (pcr >= 1.0)
 
-    # C5: system gates
     hold = bool(snap.get("hold")); cap = bool(snap.get("daily_cap_hit"))
     c5_ok = not (hold or cap)
     c5_reason = "HOLD" if hold else ("DailyCap" if cap else "OK")
-
-    # C6: new session/first-time marker (we'll keep as 'new' for continuity)
     c6_ok = True
 
-    # Summary: pick from snapshot, else fallback
     summary = _pick_summary(snap)
     if not summary:
         summary = _fallback_summary({
@@ -210,7 +196,6 @@ async def oc_now(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             "ce_oi_delta": ce_d, "pe_oi_delta": pe_d
         })
 
-    # Build message
     lines = []
     lines.append("OC Snapshot")
     lines.append(f"Symbol: {sym}  |  Exp: {exp}  |  Spot: { _fmt(spot) }")
@@ -218,16 +203,13 @@ async def oc_now(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     lines.append(f"Shifted: S1 `{ _fmt(s1s) }`  S2 { _fmt(s2s) }  R1 `{ _fmt(r1s) }`  R2 { _fmt(r2s) }")
     tail = f"Buffer: { _fmt(buf) }  |  MV: {mv or '—'}  |  PCR: { _fmt(pcr) }  |  MP: { _fmt(mp) }"
     lines.append(tail)
-    stale_tag = ""
-    if stale:
-        stale_tag = "  |  ⚠️ STALE"
+    stale_tag = "  |  ⚠️ STALE" if stale else ""
     lines.append(f"Source: {src}  |  As-of: {asof}  |  Age: {int(age or 0)}s{stale_tag}")
     lines.append("")
     lines.append("Checks")
     lines.append(f"- C1: { _boolmark(c1_ok) } NEAR, not crossed")
     lines.append(f"- C2: { _boolmark(c2_ok) } {c2_reason}")
     lines.append(f"- C3: { _boolmark(c3_ok) } CEΔ={_signfmt(ce_d)} / PEΔ={_signfmt(pe_d)}")
-    # C4 detail with per-part ticks
     pcr_tick = "✓" if pcr_ok else "×" if pcr_ok is not None else "—"
     mp_tick  = "✓" if mp_ok else "×" if mp_ok is not None else "—"
     lines.append(f"- C4: { _boolmark((pcr_ok is True) and (mp_ok is True)) } PCR={_fmt(pcr)} {pcr_tick} | MP={_fmt(mp)} vs spot {_fmt(spot)} {mp_tick}")
@@ -246,12 +228,6 @@ def init() -> Application:
         raise RuntimeError("TELEGRAM_BOT_TOKEN missing")
 
     app = ApplicationBuilder().token(token).build()
-
-    # Register commands
     app.add_handler(CommandHandler("oc_now", oc_now))
-
-    # NOTE: other /run commands remain wired in your main if registered elsewhere.
-    # We keep this file focused on reliable /oc_now rendering with always-present Summary.
-
     log.info("/oc_now handler registered")
     return app
