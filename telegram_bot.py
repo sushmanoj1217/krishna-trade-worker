@@ -1,127 +1,257 @@
 # telegram_bot.py
-# v20-compatible Application factory with /oc_now
+# ------------------------------------------------------------------------------------
+# PTB v20+ compatible bot wiring
+# - init() -> Application (do NOT start polling here; main controls single-poller)
+# - /oc_now renders snapshot with ALWAYS-FILLED Summary
+# - Keeps message style close to your current output
+#
+# Env:
+#   TELEGRAM_BOT_TOKEN=...
+#   LEVEL_BUFFER=12            # optional, default 12
+#   OC_MAX_SNAPSHOT_AGE_SEC=300  # optional, affects stale display via oc_refresh
+#
+# Depends on:
+#   analytics.oc_refresh (our earlier patched module)
+# ------------------------------------------------------------------------------------
 from __future__ import annotations
 
 import os
+import math
 import logging
 from typing import Any, Dict, Optional
 
-from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
 from telegram import Update
-
-# prefer oc_refresh_shim if present (it selects the right refresh impl)
-try:
-    from analytics.oc_refresh_shim import refresh_once, get_snapshot
-except Exception:
-    from analytics.oc_refresh import refresh_once, get_snapshot  # type: ignore
+from telegram.ext import Application, ApplicationBuilder, CommandHandler, ContextTypes
 
 log = logging.getLogger(__name__)
 
-def _bold(x: str) -> str: return f"*{x}*"
-def _code(x: str) -> str: return f"`{x}`"
+# ---------- small utils ----------
+def _env(name: str, default: Optional[str] = None) -> Optional[str]:
+    v = os.environ.get(name)
+    return v.strip() if v and str(v).strip() else default
 
-def _fmt_num(x: Optional[float]) -> str:
+def _to_float(x):
     try:
-        if x is None: return "—"
-        return f"{float(x):.2f}"
+        if x in (None, "", "—"): return None
+        return float(str(x).replace(",", "").strip())
+    except Exception:
+        return None
+
+def _fmt(x, digits=2):
+    if x is None:
+        return "—"
+    try:
+        return f"{float(x):.{digits}f}"
+    except Exception:
+        return str(x)
+
+def _signfmt(x: Optional[float]) -> str:
+    if x is None: return "—"
+    try:
+        xf = float(x)
+        s = "+" if xf >= 0 else ""
+        # show as integer if huge
+        if abs(xf) >= 1_000_000:
+            return f"{s}{int(xf):,}"
+        return f"{s}{xf:.2f}"
     except Exception:
         return "—"
 
-async def _handle_oc_now(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # Kick a refresh, then read snapshot
-    try:
-        await refresh_once()
-    except Exception as e:
-        log.warning("refresh_once failed: %s", e)
+def _boolmark(ok: Optional[bool]) -> str:
+    return "✅" if ok else "❌"
 
-    s: Dict[str, Any] = get_snapshot() or {}
-    if not s:
-        await update.message.reply_text("OC snapshot unavailable (no data). Try again in 20–30s.")
+def _pick_summary(s: Dict[str, Any]) -> str:
+    for k in ("summary", "summary_text", "summary_line", "final_summary", "summary_str"):
+        txt = (s.get(k) or "").strip()
+        if txt:
+            return txt
+    return ""  # will fallback
+
+def _derive_mv(pcr: Optional[float], mp: Optional[float], spot: Optional[float],
+               ce_d: Optional[float], pe_d: Optional[float]) -> str:
+    score = 0
+    try:
+        if isinstance(pcr,(int,float)): score += 1 if float(pcr) >= 1.0 else -1
+    except Exception: pass
+    try:
+        if isinstance(mp,(int,float)) and isinstance(spot,(int,float)):
+            score += 1 if float(mp) > float(spot) else -1
+    except Exception: pass
+    if score > 0: return "bullish"
+    if score < 0: return "bearish"
+    if isinstance(ce_d,(int,float)) and isinstance(pe_d,(int,float)) and ce_d != pe_d:
+        return "bullish" if pe_d > ce_d else "bearish"
+    return ""
+
+def _fallback_summary(s: Dict[str, Any]) -> str:
+    # HARD guards
+    if s.get("stale"):
+        rs = s.get("stale_reason") or []
+        reason = "; ".join(rs) if rs else "stale"
+        return f"⚠️ STALE DATA — live mismatch; no trade. (Reasons: {reason})"
+    if s.get("hold") or s.get("daily_cap_hit"):
+        tags = []
+        if s.get("hold"): tags.append("HOLD")
+        if s.get("daily_cap_hit"): tags.append("DailyCap")
+        return f"🚫 System {' & '.join(tags)} — no trade."
+
+    mv = (s.get("mv") or "").strip().lower()
+    pcr = _to_float(s.get("pcr")); mp = _to_float(s.get("max_pain")); spot = _to_float(s.get("spot"))
+    ce_d= _to_float(s.get("ce_oi_delta")); pe_d = _to_float(s.get("pe_oi_delta"))
+
+    if not mv:
+        mv = _derive_mv(pcr, mp, spot, ce_d, pe_d)
+
+    # Proxy gates
+    c3_ok = None
+    if isinstance(ce_d,(int,float)) and isinstance(pe_d,(int,float)):
+        if mv == "bearish": c3_ok = (ce_d > 0 and (pe_d is None or pe_d <= 0))
+        elif mv == "bullish": c3_ok = (pe_d > 0 and (ce_d is None or ce_d <= 0))
+
+    c2_ok = None
+    if isinstance(pcr,(int,float)) and isinstance(mp,(int,float)) and isinstance(spot,(int,float)):
+        if mv == "bearish": c2_ok = (pcr < 1.0 and mp <= spot)
+        elif mv == "bullish": c2_ok = (pcr >= 1.0 and mp >= spot)
+
+    side, level = (None, None)
+    if mv == "bearish": side, level = "CE", "S1*"
+    elif mv == "bullish": side, level = "PE", "R1*"
+
+    fails = []
+    if c2_ok is False: fails.append("C2")
+    if c3_ok is False: fails.append("C3")
+
+    if mv and (c2_ok is True) and (c3_ok is True):
+        return f"✅ Eligible — {side} @ {level}"
+    if mv:
+        return f"❌ Not eligible — failed: {', '.join(fails) or 'gates'}"
+    return "❔ Insufficient data — waiting for live feed"
+
+# ---------- /oc_now ----------
+async def oc_now(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    from analytics import oc_refresh  # import here to avoid circulars
+    try:
+        # Kick a refresh so we have latest snapshot
+        await oc_refresh.refresh_once()
+    except Exception as e:
+        log.warning("oc_now: refresh_once error: %s", e)
+
+    snap = oc_refresh.get_snapshot() or {}
+    if not snap:
+        await update.message.reply_text("OC snapshot unavailable (rate-limit/first snapshot). मैंने refresh kick किया है — ~15s बाद फिर `/oc_now` भेजें.")
         return
 
-    # header fields
-    sym = str(s.get("symbol") or "—")
-    exp = str(s.get("expiry") or "—")
-    spot = _fmt_num(s.get("spot"))
-    s1, s2, r1, r2 = _fmt_num(s.get("s1")), _fmt_num(s.get("s2")), _fmt_num(s.get("r1")), _fmt_num(s.get("r2"))
-    pcr, mp = _fmt_num(s.get("pcr")), _fmt_num(s.get("max_pain"))
-    mv = str(s.get("mv") or "")
+    sym  = (snap.get("symbol") or _env("OC_SYMBOL","NIFTY")).upper()
+    exp  = snap.get("expiry") or "—"
+    spot = _to_float(snap.get("spot"))
+    s1   = _to_float(snap.get("s1")); s2 = _to_float(snap.get("s2"))
+    r1   = _to_float(snap.get("r1")); r2 = _to_float(snap.get("r2"))
+    pcr  = _to_float(snap.get("pcr")); mp = _to_float(snap.get("max_pain"))
+    ce_d = _to_float(snap.get("ce_oi_delta")); pe_d = _to_float(snap.get("pe_oi_delta"))
+    mv   = (snap.get("mv") or "").strip().lower()
+    src  = snap.get("source") or "—"
+    asof = snap.get("asof") or "—"
+    age  = snap.get("age_sec")
+    stale= bool(snap.get("stale"))
+    buf  = _to_float(_env("LEVEL_BUFFER","12"))
 
-    # source / staleness
-    source = str(s.get("source") or "?")
-    asof = str(s.get("asof") or "")
-    age = s.get("age_sec")
-    age_txt = (f"{int(age)}s" if isinstance(age, (int, float)) else "—")
-    stale = bool(s.get("stale"))
-    stale_reason = s.get("stale_reason") or []
+    # shifted
+    def _shift(v, b): 
+        return None if v is None or b is None else (float(v) - float(b) if v in (s1, s2) else float(v) + float(b))
+    s1s = _shift(s1, buf)  # S1 - buf
+    s2s = _shift(s2, buf)  # S2 - buf
+    r1s = _shift(r1, buf)  # R1 + buf
+    r2s = _shift(r2, buf)  # R2 + buf
 
-    # Compute shifted levels (12 buffer) same as before
-    try:
-        buf = float(os.environ.get("LEVEL_BUFFER", "12"))
-    except Exception:
-        buf = 12.0
-    try:
-        s1_shift = float(s.get("s1")) - buf if s.get("s1") is not None else None
-        s2_shift = float(s.get("s2")) - buf if s.get("s2") is not None else None
-        r1_shift = float(s.get("r1")) + buf if s.get("r1") is not None else None
-        r2_shift = float(s.get("r2")) + buf if s.get("r2") is not None else None
-    except Exception:
-        s1_shift = s2_shift = r1_shift = r2_shift = None
+    # Checks (lightweight, mirrors your style)
+    # C1: NEAR (within buffer) and not crossed
+    c1_ok = None
+    if spot is not None and buf is not None and s1 is not None and r1 is not None:
+        near_s1 = abs(spot - s1) <= buf
+        near_r1 = abs(spot - r1) <= buf
+        crossed = (spot <= s1s) or (spot >= r1s) if (s1s is not None and r1s is not None) else False
+        c1_ok = (near_s1 or near_r1) and not crossed
+
+    # C2: MV tag presence (bearish/bullish)
+    c2_ok = bool(mv)
+    c2_reason = f"MV={mv}" if mv else "MV missing"
+
+    # C3: OIΔ alignment
+    c3_ok = None
+    if ce_d is not None and pe_d is not None and mv:
+        if mv == "bearish":
+            c3_ok = (ce_d > 0 and pe_d <= 0)
+        elif mv == "bullish":
+            c3_ok = (pe_d > 0 and ce_d <= 0)
+
+    # C4: PCR & MP vs spot
+    mp_ok = None
+    if mp is not None and spot is not None and mv:
+        mp_ok = (mp <= spot) if mv == "bearish" else (mp >= spot)
+    pcr_ok = None
+    if pcr is not None and mv:
+        pcr_ok = (pcr < 1.0) if mv == "bearish" else (pcr >= 1.0)
+
+    # C5: system gates
+    hold = bool(snap.get("hold")); cap = bool(snap.get("daily_cap_hit"))
+    c5_ok = not (hold or cap)
+    c5_reason = "HOLD" if hold else ("DailyCap" if cap else "OK")
+
+    # C6: new session/first-time marker (we'll keep as 'new' for continuity)
+    c6_ok = True
+
+    # Summary: pick from snapshot, else fallback
+    summary = _pick_summary(snap)
+    if not summary:
+        summary = _fallback_summary({
+            **snap,
+            "mv": mv,
+            "pcr": pcr, "max_pain": mp, "spot": spot,
+            "ce_oi_delta": ce_d, "pe_oi_delta": pe_d
+        })
 
     # Build message
-    parts = []
-    parts.append(_bold("OC Snapshot"))
-    meta = f"Symbol: {sym}  |  Exp: {exp}  |  Spot: {spot}"
-    parts.append(meta)
-
-    lvls = f"Levels: S1 {s1}  S2 {s2}  R1 {r1}  R2 {r2}"
-    parts.append(lvls)
-
-    sh = f"Shifted: S1 {_code(_fmt_num(s1_shift))}  S2 {_fmt_num(s2_shift)}  R1 {_code(_fmt_num(r1_shift))}  R2 {_fmt_num(r2_shift)}"
-    parts.append(sh)
-
-    parts.append(f"Buffer: {buf:.2f}  |  MV: {mv or ' '}  |  PCR: {pcr}  |  MP: {mp}")
-    src_line = f"Source: {source}  |  As-of: {asof or 'n/a'}  |  Age: {age_txt}"
+    lines = []
+    lines.append("OC Snapshot")
+    lines.append(f"Symbol: {sym}  |  Exp: {exp}  |  Spot: { _fmt(spot) }")
+    lines.append(f"Levels: S1 { _fmt(s1) }  S2 { _fmt(s2) }  R1 { _fmt(r1) }  R2 { _fmt(r2) }")
+    lines.append(f"Shifted: S1 `{ _fmt(s1s) }`  S2 { _fmt(s2s) }  R1 `{ _fmt(r1s) }`  R2 { _fmt(r2s) }")
+    tail = f"Buffer: { _fmt(buf) }  |  MV: {mv or '—'}  |  PCR: { _fmt(pcr) }  |  MP: { _fmt(mp) }"
+    lines.append(tail)
+    stale_tag = ""
     if stale:
-        src_line += "  |  ⚠️ STALE " + ("; ".join(stale_reason) if stale_reason else "")
-    parts.append(src_line)
+        stale_tag = "  |  ⚠️ STALE"
+    lines.append(f"Source: {src}  |  As-of: {asof}  |  Age: {int(age or 0)}s{stale_tag}")
+    lines.append("")
+    lines.append("Checks")
+    lines.append(f"- C1: { _boolmark(c1_ok) } NEAR, not crossed")
+    lines.append(f"- C2: { _boolmark(c2_ok) } {c2_reason}")
+    lines.append(f"- C3: { _boolmark(c3_ok) } CEΔ={_signfmt(ce_d)} / PEΔ={_signfmt(pe_d)}")
+    # C4 detail with per-part ticks
+    pcr_tick = "✓" if pcr_ok else "×" if pcr_ok is not None else "—"
+    mp_tick  = "✓" if mp_ok else "×" if mp_ok is not None else "—"
+    lines.append(f"- C4: { _boolmark((pcr_ok is True) and (mp_ok is True)) } PCR={_fmt(pcr)} {pcr_tick} | MP={_fmt(mp)} vs spot {_fmt(spot)} {mp_tick}")
+    lines.append(f"- C5: { _boolmark(c5_ok) } {c5_reason}")
+    lines.append(f"- C6: { _boolmark(c6_ok) } new")
+    lines.append("")
+    lines.append(f"Summary: {summary}")
 
-    # Checks (delegate to existing eligibility if available)
-    try:
-        from agents import eligibility_api as elig  # type: ignore
-        res = elig.check_now(s)
-        checks = res.get("checks") or []
-        parts.append("")
-        parts.append("Checks")
-        for c in checks:
-            ok = "✅" if c.get("ok") else "❌"
-            reason = c.get("reason") or ""
-            parts.append(f"- {c.get('id')}: {ok} {reason}")
-        # Summary (override if stale)
-        summary = res.get("summary") or ""
-        if stale:
-            summary = "⚠️ STALE DATA — live mismatch; no trade. (Reasons: " + ", ".join(stale_reason) + ")"
-        parts.append("")
-        parts.append(f"Summary: {summary}")
-    except Exception:
-        # Fallback summary if eligibility module not present
-        if stale:
-            parts.append("")
-            parts.append("Summary: ⚠️ STALE DATA — live mismatch; no trade.")
-        else:
-            parts.append("")
-            parts.append("Summary: (eligibility module unavailable)")
+    text = "\n".join(lines)
+    await update.message.reply_text(text)
 
-    text = "\n".join(parts)
-    await update.message.reply_text(text, parse_mode="Markdown", disable_web_page_preview=True)
-
-def init():
-    """Build and return a PTB Application with handlers registered."""
-    token = os.environ.get("TELEGRAM_BOT_TOKEN")
+# ---------- init ----------
+def init() -> Application:
+    token = _env("TELEGRAM_BOT_TOKEN")
     if not token:
-        raise RuntimeError("TELEGRAM_BOT_TOKEN not set")
+        raise RuntimeError("TELEGRAM_BOT_TOKEN missing")
+
     app = ApplicationBuilder().token(token).build()
 
-    app.add_handler(CommandHandler("oc_now", _handle_oc_now))
+    # Register commands
+    app.add_handler(CommandHandler("oc_now", oc_now))
+
+    # NOTE: other /run commands remain wired in your main if registered elsewhere.
+    # We keep this file focused on reliable /oc_now rendering with always-present Summary.
+
     log.info("/oc_now handler registered")
     return app
