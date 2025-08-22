@@ -8,6 +8,7 @@
 #   EOD_LOOKBACK_DAYS       = 10         # distinct trade-dates to look back
 #   EOD_MIN_TRADES          = 8          # minimum trades in lookback to tune
 #   EOD_TUNER_DRY_RUN       = 0/1        # 1 => don't write, only log
+#   EOD_TUNER_DEBUG         = 0/1        # 1 => log raw→parsed PNL for first few rows
 #   PERFORMANCE_SHEET_NAME  = Performance (override if needed)
 #
 # Sheets env:
@@ -108,22 +109,44 @@ def _append_params_row(row: Dict[str, Any]) -> None:
     ws.append_row(vals, value_input_option="RAW")
 
 # -------- tolerant numeric/string helpers --------
+# handle unicode minus: U+2212 (−), en dash (–), em dash (—)
+_MINUSES = ["\u2212", "–", "—"]
+
 _NUM_RE = re.compile(r"[-+]?\d+(?:\.\d+)?")
 
 def _num(x) -> Optional[float]:
     """
-    Parse a numeric value from messy strings like '₹1,234.5', '+35 pts', ' - 8 '.
-    Returns float or None.
+    Parse a numeric value from messy strings like:
+    '₹1,234.5', '+35pts', ' - 8 ', '(12.5)', '−14', '—3.2'
+    Returns float (with sign) or None.
     """
     if x in (None, "", "—"):
         return None
     s = str(x)
-    s = s.replace(",", " ").strip()
+
+    # normalize unicode minus to ASCII hyphen
+    for uni in _MINUSES:
+        s = s.replace(uni, "-")
+
+    # remove thousand separators (commas/spaces)
+    s = s.replace(",", "")
+    s = s.strip()
+
+    # handle accounting negatives in parentheses
+    neg = False
+    if "(" in s and ")" in s:
+        inside = s[s.find("(")+1 : s.rfind(")")]
+        s = inside
+        neg = True
+
     m = _NUM_RE.search(s)
     if not m:
         return None
     try:
-        return float(m.group(0))
+        val = float(m.group(0))
+        if neg:
+            val = -abs(val)
+        return val
     except Exception:
         return None
 
@@ -218,12 +241,18 @@ def _filter_by(records: List[Dict[str,Any]], sym: str, dates: List[str]) -> List
     return out
 
 def _stats(records: List[Dict[str,Any]]) -> Dict[str,Any]:
+    debug = _env("EOD_TUNER_DEBUG","0") in {"1","true","on","yes"}
     pnls = []
     wins = []; losses = []
     reasons = []
+    dbg_shown = 0
     for r in records:
-        p = _num(r.get("pnl_points") or r.get("PNL") or r.get("Net PnL") or r.get("NetPNL") or r.get("Profit") or r.get("Net P&L"))
-        if p is None: 
+        raw_p = (r.get("pnl_points") or r.get("PNL") or r.get("Net PnL") or r.get("NetPNL") or r.get("Profit") or r.get("Net P&L"))
+        p = _num(raw_p)
+        if debug and dbg_shown < 6:
+            log.info("[DBG] PNL raw=%r → parsed=%r", raw_p, p)
+            dbg_shown += 1
+        if p is None:
             continue
         pnls.append(p)
         if p >= 0:
@@ -249,14 +278,20 @@ def _stats(records: List[Dict[str,Any]]) -> Dict[str,Any]:
     )
 
 # ---------------- tuning ----------------
+BASE_STEP = {
+    "NIFTY":     dict(BUF_UP=2.0, BUF_DN=2.0, TP_UP=5.0),
+    "BANKNIFTY": dict(BUF_UP=5.0, BUF_DN=5.0, TP_UP=10.0),
+    "FINNIFTY":  dict(BUF_UP=3.0, BUF_DN=3.0, TP_UP=7.0),
+}
+
 def _tune_for_symbol(sym: str, perf: List[Dict[str,Any]], lookback_days: int, min_trades: int) -> Optional[Dict[str,Any]]:
-    BUF = _sym_env(sym, "LEVEL_BUFFER", _base(sym, "BUF", 12.0))
-    BAND= _sym_env(sym, "ENTRY_BAND", _base(sym, "BAND", 3.0))
-    TGT = _sym_env(sym, "TARGET_MIN_POINTS", _base(sym, "TGT", 30.0))
-    TP  = _sym_env(sym, "TP_POINTS", _base(sym, "TP", 40.0))
-    SL  = _sym_env(sym, "SL_POINTS", _base(sym, "SL", 20.0))
-    TR  = _sym_env(sym, "TRAIL_TRIGGER_POINTS", _base(sym, "TR_TR", 25.0))
-    TOF = _sym_env(sym, "TRAIL_OFFSET_POINTS",  _base(sym, "TR_OFF", 15.0))
+    BUF = _sym_env(sym, "LEVEL_BUFFER", BASE.get(sym.upper(), BASE["NIFTY"])["BUF"])
+    BAND= _sym_env(sym, "ENTRY_BAND",  BASE.get(sym.upper(), BASE["NIFTY"])["BAND"])
+    TGT = _sym_env(sym, "TARGET_MIN_POINTS", BASE.get(sym.upper(), BASE["NIFTY"])["TGT"])
+    TP  = _sym_env(sym, "TP_POINTS",  BASE.get(sym.upper(), BASE["NIFTY"])["TP"])
+    SL  = _sym_env(sym, "SL_POINTS",  BASE.get(sym.upper(), BASE["NIFTY"])["SL"])
+    TR  = _sym_env(sym, "TRAIL_TRIGGER_POINTS", BASE.get(sym.upper(), BASE["NIFTY"])["TR_TR"])
+    TOF = _sym_env(sym, "TRAIL_OFFSET_POINTS",  BASE.get(sym.upper(), BASE["NIFTY"])["TR_OFF"])
     MVN = float(_env("MV_REV_CONFIRM","2") or "2")
 
     dates = _last_n_dates(perf, lookback_days, sym)
@@ -270,7 +305,7 @@ def _tune_for_symbol(sym: str, perf: List[Dict[str,Any]], lookback_days: int, mi
     med_win = st["med_win"]; med_loss = st["med_loss"]
     n = st["n"]; mv_rev_cnt = st["mv_rev_cnt"]; tp_cnt = st["tp_cnt"]; sl_cnt = st["sl_cnt"]
 
-    steps = STEP.get(sym.upper(), STEP["NIFTY"])
+    steps = BASE_STEP.get(sym.upper(), BASE_STEP["NIFTY"])
     notes = []
 
     TRADES_PER_DAY = n / max(1, len(dates) if dates != ["ALL"] else 1)
@@ -437,7 +472,7 @@ def _read_performance() -> List[Dict[str,Any]]:
     raise RuntimeError(f"Performance sheet not found/usable. Tried: {[pref]+[n for n in ALT_PERF_NAMES if n!=pref]}. "
                        f"Available in {sid}: {names}. Set PERFORMANCE_SHEET_NAME=... if needed.")
 
-# ---------------- tuning ---------------- (unchanged above in this block)
+# ---------------- tuning ----------------
 
 def run():
     symbols_csv = _env("EOD_TUNE_SYMBOLS") or _env("OC_SYMBOL","NIFTY")
