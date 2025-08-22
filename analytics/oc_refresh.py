@@ -11,7 +11,8 @@
 #       a) many alias delta cols (oi_delta/oi change/oi chg/Δ etc.)
 #       b) else from absolute OI vs previous row (many aliases)
 #       c) else sign-only proxy via dPCR (prev→curr) or MV tag
-#       d) FINAL fallback: sign-only proxy via **current PCR** (NEW)
+#       d) FINAL fallback: sign-only proxy via **current PCR**
+#   - NEW: read HOLD / DAILY_CAP_HIT from Params_Override sheet or env overrides
 # ------------------------------------------------------------
 from __future__ import annotations
 import importlib, inspect, logging, re
@@ -123,11 +124,11 @@ def _call_variants(fn: Callable, is_async: bool):
         return res
     return _runner()
 
-# -------- Sheets fallback + aggressive alias handling --------
+# -------- Sheets helpers + aggressive alias handling --------
 def _env(name: str) -> Optional[str]:
     v = os.environ.get(name)
     return v.strip() if v and v.strip() else None
-def _open_ws():
+def _open_by_key():
     if gspread is None:
         raise RuntimeError("gspread not installed")
     raw = _env("GOOGLE_SA_JSON")
@@ -136,7 +137,15 @@ def _open_ws():
         raise RuntimeError("Sheets env missing")
     sa = json.loads(raw)
     gc = gspread.service_account_from_dict(sa)
-    sh = gc.open_by_key(sid)
+    return gc.open_by_key(sid)
+def _open_ws(name: str):
+    sh = _open_by_key()
+    try:
+        return sh.worksheet(name)
+    except Exception:
+        raise
+def _open_oc_ws():
+    sh = _open_by_key()
     try:
         return sh.worksheet("OC_Live")
     except Exception:
@@ -223,9 +232,71 @@ def _derive_mv(pcr: Optional[float], max_pain: Optional[float], spot: Optional[f
         if dpcr > 0: return "bearish"
     return ""
 
+def _truthy(x: Any) -> Optional[bool]:
+    if x is None: return None
+    s = str(x).strip().lower()
+    if s in {"1","true","yes","y","on","t"}: return True
+    if s in {"0","false","no","n","off","f"}: return False
+    return None
+
+def _read_override_flags() -> Dict[str, bool]:
+    """Env overrides for HOLD / DAILY_CAP_HIT."""
+    hold = None
+    for k in ("HOLD_OVERRIDE","SYSTEM_HOLD","HOLD"):
+        v = _env(k)
+        tv = _truthy(v) if v is not None else None
+        if tv is not None:
+            hold = tv
+            break
+    # daily cap via env (optional)
+    cap = None
+    for k in ("DAILY_CAP_HIT","DAILY_CAP","CAP_HIT"):
+        v = _env(k)
+        tv = _truthy(v) if v is not None else None
+        if tv is not None:
+            cap = tv
+            break
+    return {"hold": bool(hold) if hold is not None else False,
+            "daily_cap_hit": bool(cap) if cap is not None else False,
+            "hold_set": hold is not None, "cap_set": cap is not None}
+
+def _read_params_override() -> Dict[str, bool]:
+    """Read Params_Override sheet (last non-empty row) for flags."""
+    out = {"hold": False, "daily_cap_hit": False}
+    try:
+        ws = _open_ws("Params_Override")
+    except Exception:
+        return out
+    try:
+        rows = ws.get_all_records()  # list[dict]
+    except Exception:
+        return out
+    if not rows:
+        return out
+    last = rows[-1]
+    # normalize keys
+    last_norm = { _norm_key(k): v for k, v in last.items() }
+
+    hold_keys = ("hold","system_hold","manual_hold")
+    cap_keys = ("daily_cap_hit","daily_cap","cap_hit")
+    # parse truthy/falsy
+    for k in hold_keys:
+        if k in last_norm:
+            tv = _truthy(last_norm[k])
+            if tv is not None:
+                out["hold"] = tv
+                break
+    for k in cap_keys:
+        if k in last_norm:
+            tv = _truthy(last_norm[k])
+            if tv is not None:
+                out["daily_cap_hit"] = tv
+                break
+    return out
+
 def _open_ws_and_rows() -> Optional[list[dict]]:
     try:
-        ws = _open_ws()
+        ws = _open_oc_ws()
         return ws.get_all_records()
     except Exception as e:
         _log.warning("oc_refresh: sheets read failed: %s", e)
@@ -282,15 +353,18 @@ def _build_from_sheet() -> Optional[dict]:
             ce_d = -1.0 * sign
             pe_d =  1.0 * sign
 
-    # FINAL fallback: proxy directly from current PCR (NEW)
+    # FINAL fallback: proxy directly from current PCR
     if ce_d is None and pe_d is None and isinstance(pcr, (int,float)) and pcr != 1.0:
         if pcr > 1.0:
-            # More puts → PEΔ positive, CEΔ negative
-            pe_d =  1.0
-            ce_d = -1.0
+            pe_d =  1.0; ce_d = -1.0
         else:
-            pe_d = -1.0
-            ce_d =  1.0
+            pe_d = -1.0; ce_d =  1.0
+
+    # Flags: Params_Override + env overrides
+    flags_sheet = _read_params_override()
+    flags_env = _read_override_flags()
+    hold = flags_env["hold"] if flags_env.get("hold_set") else flags_sheet.get("hold", False)
+    daily_cap_hit = flags_env["daily_cap_hit"] if flags_env.get("cap_set") else flags_sheet.get("daily_cap_hit", False)
 
     snap = {
         "symbol": sym,
@@ -300,6 +374,9 @@ def _build_from_sheet() -> Optional[dict]:
         "pcr": pcr, "max_pain": mp,
         "ce_oi_delta": ce_d, "pe_oi_delta": pe_d,
         "mv": mv_tag,
+        # NEW flags consumed by eligibility_api C5 gate:
+        "hold": bool(hold),
+        "daily_cap_hit": bool(daily_cap_hit),
         "source": "sheets",
         "ts": int(time.time()),
     }
