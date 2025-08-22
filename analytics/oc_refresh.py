@@ -5,19 +5,18 @@
 #   - get_snapshot() -> dict|None
 #   - set_snapshot(snap: dict) -> None
 #
-# How it works:
-# 1) Discovers a provider function in common modules (Dhan/OC sources)
-#    like fetch_levels / refresh / get_oc_snapshot etc., and calls it
-#    with flexible args: (), (None,), ({},) -- whichever matches.
-# 2) Extracts a snapshot (dict) from the return (dict / tuple / object).
-# 3) Stores it in module-global _SNAPSHOT.
-# 4) If no provider or it fails, falls back to Google Sheets "OC_Live"
-#    last row (headers-based) to build a snapshot.
+# Works in two stages:
+# 1) Tries to call a provider in known modules (Dhan/OC sources)
+#    with flexible args and extracts a snapshot.
+# 2) If provider missing/fails, falls back to Google Sheets:
+#    builds snapshot from the last row of "OC_Live" (else "Snapshots"),
+#    and DERIVES missing fields:
+#       - mv (bullish/bearish/empty) from PCR + MaxPain vs Spot
+#       - ce_oi_delta / pe_oi_delta from delta columns OR by diffing
+#         current vs previous row CE_OI/PE_OI (if present)
 #
 # Env used:
-#   - GOOGLE_SA_JSON (service account JSON)
-#   - GSHEET_TRADES_SPREADSHEET_ID (sheet id)
-#   - OC_SYMBOL (for defaults)
+#   GOOGLE_SA_JSON, GSHEET_TRADES_SPREADSHEET_ID, OC_SYMBOL
 # ------------------------------------------------------------
 from __future__ import annotations
 import importlib
@@ -160,9 +159,8 @@ def _call_variants(fn: Callable, is_async: bool):
                     res = fn(*a, **k)
                 return res
             except TypeError:
-                # try next variant (arg mismatch)
                 continue
-        # last resort: call without caring (may still work)
+        # last resort
         res = fn()
         if inspect.isawaitable(res):
             res = await res
@@ -175,7 +173,7 @@ def _env(name: str) -> Optional[str]:
     return v if v and v.strip() else None
 
 def _open_status_ws():
-    """Open spreadsheet and return 'OC_Live' worksheet if present."""
+    """Open spreadsheet and return 'OC_Live' worksheet if present (else 'Snapshots')."""
     if gspread is None:
         raise RuntimeError("gspread not installed")
     raw = _env("GOOGLE_SA_JSON")
@@ -188,12 +186,13 @@ def _open_status_ws():
     try:
         ws = sh.worksheet("OC_Live")
     except Exception:
-        # fallback to Snapshots
         ws = sh.worksheet("Snapshots")
     return ws
 
 _NUMERIC_COLS = {
-    "spot","s1","s2","r1","r2","pcr","max_pain","ce_oi_delta","pe_oi_delta",
+    "spot","s1","s2","r1","r2","pcr","max_pain",
+    "ce_oi_delta","pe_oi_delta","ce_oi_change","pe_oi_change",
+    "ce_oi","pe_oi",
 }
 
 def _to_float(x):
@@ -203,37 +202,86 @@ def _to_float(x):
     except Exception:
         return None
 
+def _row_norm(d: Dict[str, Any]) -> Dict[str, Any]:
+    out: Dict[str, Any] = {}
+    for k, v in d.items():
+        key = str(k).strip().lower()
+        out[key] = _to_float(v) if key in _NUMERIC_COLS else v
+    return out
+
+def _derive_mv(pcr: Optional[float], max_pain: Optional[float], spot: Optional[float]) -> str:
+    """
+    Simple, robust MV derivation when explicit tag missing:
+    +1 if PCR>=1.0, -1 if PCR<=1.0
+    +1 if MP>spot, -1 if MP<spot
+    score>0 -> bullish, score<0 -> bearish, else "".
+    """
+    score = 0
+    if isinstance(pcr, (int,float)):
+        if pcr >= 1.0: score += 1
+        elif pcr <= 1.0: score -= 1
+    if isinstance(max_pain, (int,float)) and isinstance(spot, (int,float)):
+        if max_pain > spot: score += 1
+        elif max_pain < spot: score -= 1
+    if score > 0: return "bullish"
+    if score < 0: return "bearish"
+    return ""
+
+def _pick_oi_delta(curr: Dict[str, Any], prev: Optional[Dict[str, Any]], ce_or_pe: str) -> Optional[float]:
+    """
+    Try multiple ways to get OI delta for CE/PE:
+      1) explicit delta columns: ce_oi_delta / ce_oi_change (and pe_…)
+      2) compute from current ce_oi minus prev ce_oi (if both present)
+    """
+    ce_or_pe = ce_or_pe.lower()
+    # explicit delta
+    for key in (f"{ce_or_pe}_oi_delta", f"{ce_or_pe}_oi_change", f"{ce_or_pe}_oiΔ"):
+        if key in curr and curr[key] is not None:
+            return float(curr[key])
+    # compute from absolute OI vs previous row
+    curr_abs = curr.get(f"{ce_or_pe}_oi")
+    prev_abs = prev.get(f"{ce_or_pe}_oi") if prev else None
+    if curr_abs is not None and prev_abs is not None:
+        try:
+            return float(curr_abs) - float(prev_abs)
+        except Exception:
+            pass
+    return None
+
 def _build_from_sheet() -> Optional[dict]:
     try:
         ws = _open_status_ws()
-        vals = ws.get_all_records()  # list of dicts with header mapping
-        if not vals:
+        rows = ws.get_all_records()  # list of dicts with header mapping
+        if not rows:
             return None
-        row = vals[-1]
-        # normalize keys
-        row_norm: Dict[str, Any] = {}
-        for k, v in row.items():
-            key = str(k).strip().lower()
-            if key in _NUMERIC_COLS:
-                row_norm[key] = _to_float(v)
-            else:
-                row_norm[key] = v
-        # expected fields
-        sym = (row_norm.get("symbol") or row_norm.get("sym") or _env("OC_SYMBOL") or "").upper()
-        exp = row_norm.get("expiry") or row_norm.get("exp") or ""
+        last = _row_norm(rows[-1])
+        prev = _row_norm(rows[-2]) if len(rows) >= 2 else None
+
+        sym = (last.get("symbol") or last.get("sym") or _env("OC_SYMBOL") or "").upper()
+        exp = last.get("expiry") or last.get("exp") or ""
+
+        # derive deltas if missing
+        ce_delta = _pick_oi_delta(last, prev, "ce")
+        pe_delta = _pick_oi_delta(last, prev, "pe")
+
+        # mv: prefer tag from sheet; else derive from PCR/MP/spot
+        mv_tag = (last.get("mv") or last.get("move") or last.get("trend") or "").strip().lower()
+        if not mv_tag:
+            mv_tag = _derive_mv(last.get("pcr"), last.get("max_pain"), last.get("spot"))
+
         snap = {
             "symbol": sym,
             "expiry": exp,
-            "spot": row_norm.get("spot"),
-            "s1": row_norm.get("s1"),
-            "s2": row_norm.get("s2"),
-            "r1": row_norm.get("r1"),
-            "r2": row_norm.get("r2"),
-            "pcr": row_norm.get("pcr"),
-            "max_pain": row_norm.get("max_pain"),
-            "ce_oi_delta": row_norm.get("ce_oi_delta"),
-            "pe_oi_delta": row_norm.get("pe_oi_delta"),
-            "mv": row_norm.get("mv") or row_norm.get("move") or row_norm.get("trend"),
+            "spot": last.get("spot"),
+            "s1": last.get("s1"),
+            "s2": last.get("s2"),
+            "r1": last.get("r1"),
+            "r2": last.get("r2"),
+            "pcr": last.get("pcr"),
+            "max_pain": last.get("max_pain"),
+            "ce_oi_delta": ce_delta,
+            "pe_oi_delta": pe_delta,
+            "mv": mv_tag,
             "source": "sheets",
             "ts": int(time.time()),
         }
