@@ -8,7 +8,7 @@
 #   EOD_LOOKBACK_DAYS       = 10         # distinct trade-dates to look back
 #   EOD_MIN_TRADES          = 8          # minimum trades in lookback to tune
 #   EOD_TUNER_DRY_RUN       = 0/1        # 1 => don't write, only log
-#   PERFORMANCE_SHEET_NAME  = Performance (override if your sheet is named differently)
+#   PERFORMANCE_SHEET_NAME  = Performance (override if needed)
 #
 # Sheets env:
 #   GOOGLE_SA_JSON, GSHEET_TRADES_SPREADSHEET_ID
@@ -177,7 +177,7 @@ def _stats(records: List[Dict[str,Any]]) -> Dict[str,Any]:
             wins.append(p)
         else:
             losses.append(-p)
-        er = str(r.get("exit_reason") or r.get("ExitReason") or "").strip().upper()
+        er = str(r.get("exit_reason") or r.get("ExitReason") or r.get("Exit Reason") or "").strip().upper()
         if er:
             reasons.append(er)
     n = len(pnls)
@@ -258,32 +258,88 @@ def _tune_for_symbol(sym: str, perf: List[Dict[str,Any]], lookback_days: int, mi
         notes=summary + " | " + "; ".join(notes)
     )
 
-# ---------------- read Performance (no auto-create) ----------------
+# -------------- dupe-safe Performance readers --------------
 ALT_PERF_NAMES = ["Performance","performance","PERFORMANCE","Perf","Trades","TRADES"]
 
-def _read_performance() -> List[Dict[str,Any]]:
-    name = _env("PERFORMANCE_SHEET_NAME","Performance")
-    # first try explicit name (must-exist)
+def _dupe_safe_from_ws(ws) -> List[Dict[str,Any]]:
+    """Handle non-unique headers by manual mapping to standard keys."""
+    vals = ws.get_all_values()
+    if not vals or len(vals) < 2:
+        return []
+    header = [ (c or "").strip() for c in vals[0] ]
+    rows = vals[1:]
+
+    def _find_idx(cands: List[str]) -> Optional[int]:
+        for cand in cands:
+            cl = cand.strip().lower()
+            for i,h in enumerate(header):
+                if (h or "").strip().lower() == cl:
+                    return i
+        return None
+
+    idx_date  = _find_idx(["date","Date","trade_date","Trade Date"])
+    idx_sym   = _find_idx(["symbol","Symbol"])
+    idx_pnl   = _find_idx(["pnl_points","PNL","Net PnL","NetPNL","Profit","Net P&L"])
+    idx_exit  = _find_idx(["exit_reason","ExitReason","Exit Reason","reason","Reason"])
+
+    out: List[Dict[str,Any]] = []
+    for r in rows:
+        if not any(x.strip() for x in r if isinstance(x,str)):
+            continue
+        rec: Dict[str,Any] = {}
+        if idx_date is not None and idx_date < len(r):   rec["date"] = r[idx_date]
+        if idx_sym  is not None and idx_sym  < len(r):   rec["symbol"] = r[idx_sym]
+        if idx_pnl  is not None and idx_pnl  < len(r):   rec["pnl_points"] = r[idx_pnl]
+        if idx_exit is not None and idx_exit < len(r):   rec["exit_reason"] = r[idx_exit]
+        # keep raw too for safety (some sheets may use original headers):
+        for i,h in enumerate(header):
+            key = (h or f"col{i+1}").strip()
+            if key and i < len(r):
+                rec[key] = r[i]
+        out.append(rec)
+    log.info("Performance dupe-safe parsed rows=%d (date/symbol/pnl/exit columns idx=%s/%s/%s/%s)", len(out), idx_date, idx_sym, idx_pnl, idx_exit)
+    return out
+
+def _read_performance_from_name(name: str) -> List[Dict[str,Any]]:
+    ws = _open_ws_read_must(name)
     try:
-        ws = _open_ws_read_must(name)
         rows = ws.get_all_records() or []
         log.info("Performance sheet='%s' rows=%d", name, len(rows))
         return rows
     except Exception as e:
-        log.warning("Preferred sheet '%s' not found (%s). Trying fallbacks...", name, e)
+        if "header" in str(e).lower() and "unique" in str(e).lower():
+            log.warning("Sheet '%s' header not unique → using dupe-safe reader", name)
+            return _dupe_safe_from_ws(ws)
+        raise
 
-    # try fallbacks without creating
-    for alt in [n for n in ALT_PERF_NAMES if n != name]:
+def _read_performance() -> List[Dict[str,Any]]:
+    pref = _env("PERFORMANCE_SHEET_NAME","Performance")
+    # Try preferred name
+    try:
+        return _read_performance_from_name(pref)
+    except Exception as e:
+        log.warning("Preferred sheet '%s' not usable (%s). Trying fallbacks...", pref, e)
+
+    # Try fallbacks
+    for alt in [n for n in ALT_PERF_NAMES if n != pref]:
         ws = _open_ws_read_optional(alt)
         if ws:
-            rows = ws.get_all_records() or []
-            log.info("Performance fallback sheet='%s' rows=%d", alt, len(rows))
-            return rows
+            try:
+                # try normal
+                rows = ws.get_all_records() or []
+                log.info("Performance fallback sheet='%s' rows=%d", alt, len(rows))
+                return rows
+            except Exception as e:
+                if "header" in str(e).lower() and "unique" in str(e).lower():
+                    log.warning("Fallback sheet '%s' header not unique → using dupe-safe reader", alt)
+                    return _dupe_safe_from_ws(ws)
+                else:
+                    log.warning("Fallback sheet '%s' read error: %s", alt, e)
 
     # final: show helpful info
     sh, sid = _open_spreadsheet()
     names = [w.title for w in sh.worksheets()]
-    raise RuntimeError(f"Performance sheet not found. Tried: {[name]+[n for n in ALT_PERF_NAMES if n!=name]}. "
+    raise RuntimeError(f"Performance sheet not found/usable. Tried: {[pref]+[n for n in ALT_PERF_NAMES if n!=pref]}. "
                        f"Available in {sid}: {names}. Set PERFORMANCE_SHEET_NAME=... if needed.")
 
 # ---------------- main ----------------
