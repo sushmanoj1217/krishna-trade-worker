@@ -1,38 +1,65 @@
-# telegram_bot.py  — handlers-only (no auto start)
+# telegram_bot.py — handlers-only module (no auto start)
 from __future__ import annotations
+
 import os
 import logging
-from telegram.ext import ApplicationBuilder, CommandHandler
+from typing import Optional
 
-# /oc_now handler register import
+from telegram.ext import Application, ApplicationBuilder, CommandHandler
+
+# Optional: /oc_now handler
 try:
-    from skills.examples.oc_now import register as register_oc_now
+    from skills.examples.oc_now import register as register_oc_now  # (app) -> None
 except Exception:
-    register_oc_now = None
+    register_oc_now = None  # type: ignore
 
 BOT_TOKEN_ENV = "TELEGRAM_BOT_TOKEN"
 _log = logging.getLogger(__name__)
 
-def build_application():
+
+def _require_token() -> str:
     token = os.environ.get(BOT_TOKEN_ENV)
     if not token:
-        raise RuntimeError(f"{BOT_TOKEN_ENV} not set")
+        raise RuntimeError(f"{BOT_TOKEN_ENV} not set in environment")
+    return token
+
+
+def register_handlers(app: Application) -> None:
+    """Attach core and optional handlers to the Application."""
+    # /ping
+    async def ping(update, context):
+        await update.message.reply_text("pong")
+
+    app.add_handler(CommandHandler("ping", ping))
+
+    # /oc_now (if module present)
+    if register_oc_now:
+        try:
+            register_oc_now(app)
+            _log.info("/oc_now handler registered")
+        except Exception as e:
+            _log.warning("Failed to register /oc_now: %s", e)
+    else:
+        _log.warning("skills.examples.oc_now not available; /oc_now not registered")
+
+
+def build_application() -> Application:
+    """Back-compat builder (same as init). Does NOT start polling."""
+    token = _require_token()
     app = ApplicationBuilder().token(token).build()
     register_handlers(app)
     return app
 
-def register_handlers(app):
-    async def ping(update, context):
-        await update.message.reply_text("pong")
-    app.add_handler(CommandHandler("ping", ping))
 
-    # 👇 यहीं “वो एक लाइन” का असली प्रभाव है
-    if register_oc_now:
-        register_oc_now(app)
-        _log.info("/oc_now handler registered")
-    else:
-        _log.warning("skills.examples.oc_now not available; /oc_now not registered")
+def init() -> Application:
+    """
+    Entry expected by krishna_main.py:
+    Builds and returns a configured Application.
+    Does NOT call run_polling/start_polling — main file controls that.
+    """
+    return build_application()
 
-# यहां से polling **start नहीं** करते — krishna_main.py से ही होगा
+
+# Safety: don’t auto-start from this module
 if __name__ == "__main__":
-    print("handlers-only module; start polling from krishna_main.py")
+    print("telegram_bot.py is handlers-only. Start polling from krishna_main.py")
