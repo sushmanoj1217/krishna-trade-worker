@@ -1,268 +1,284 @@
-import os
-import asyncio
-from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
-
-from utils.logger import log
-from utils.params import Params
-from utils.cache import set_snapshot, get_snapshot as _get_snapshot
-from integrations.option_chain_dhan import fetch_levels
-from integrations import sheets as sh
-
-@dataclass
-class OCSnapshot:
-    ts: datetime
-    spot: float
-    s1: float
-    s2: float
-    r1: float
-    r2: float
-    expiry: str
-    vix: float | None
-    pcr: float | None
-    max_pain: float
-    bias: str | None
-    stale: bool = False
-
-COOLDOWN = {"until": None}
-
-def get_snapshot() -> OCSnapshot | None:
-    return _get_snapshot()
-
-async def day_oc_loop():
-    """Refresh OC snapshot; write to OC_Live; respect rate-limit cooldown."""
-    now = datetime.now(timezone.utc)
-    until = COOLDOWN.get("until")
-    if until and now < until:
-        # don't spam; if no cache, log error
-        if not _get_snapshot():
-            raise RuntimeError("In cooldown and no OC cache available")
-        await asyncio.sleep(1)
-        return
-
-    p = Params.from_env()
-    try:
-        oc = await fetch_levels(p)
-        snap = OCSnapshot(
-            ts=datetime.now(timezone.utc),
-            spot=oc["spot"],
-            s1=oc["s1"], s2=oc["s2"], r1=oc["r1"], r2=oc["r2"],
-            expiry=oc["expiry"],
-            vix=oc.get("vix"),
-            pcr=oc.get("pcr"),
-            max_pain=oc["max_pain"],
-            bias=oc.get("bias_tag"),
-            stale=False
-        )
-        set_snapshot(snap)
-        # write to sheet (best-effort)
-        try:
-            await sh.log_oc_live(snap)
-        except Exception as e:
-            log.warning(f"OC Live write failed: {e}")
-    except fetch_levels.TooManyRequests as e:
-        log.warning(f"Dhan 429: {e} → cooldown 30s")
-        COOLDOWN["until"] = datetime.now(timezone.utc) + timedelta(seconds=30)
-        raise
-    except Exception as e:
-        log.error(f"OC refresh failed: {e}")
-        if not _get_snapshot():
-            raise
-        # else keep old cache
-        return
-# ===== Back-compat alias (smart resolver, drop-in) =====
-# Goal: Always export `refresh_once` from this module, even if the concrete
-# function was renamed during refactors. Prefer well-known names; otherwise
-# heuristically pick a plausible refresh function. As a last resort, bind a
-# no-op that logs a clear warning so the app doesn't crash on import.
-
+# analytics/oc_refresh.py
+# ------------------------------------------------------------
+# Unified OC refresh core with stable API:
+#   - refresh_once(*args, **kwargs) -> dict snapshot
+#   - get_snapshot() -> dict|None
+#   - set_snapshot(snap: dict) -> None
+#
+# How it works:
+# 1) Discovers a provider function in common modules (Dhan/OC sources)
+#    like fetch_levels / refresh / get_oc_snapshot etc., and calls it
+#    with flexible args: (), (None,), ({},) -- whichever matches.
+# 2) Extracts a snapshot (dict) from the return (dict / tuple / object).
+# 3) Stores it in module-global _SNAPSHOT.
+# 4) If no provider or it fails, falls back to Google Sheets "OC_Live"
+#    last row (headers-based) to build a snapshot.
+#
+# Env used:
+#   - GOOGLE_SA_JSON (service account JSON)
+#   - GSHEET_TRADES_SPREADSHEET_ID (sheet id)
+#   - OC_SYMBOL (for defaults)
+# ------------------------------------------------------------
+from __future__ import annotations
+import importlib
 import inspect
 import logging
+from typing import Any, Callable, Optional, Dict, Tuple
+
+import json, os, time
+
+# Sheets (optional)
+try:
+    import gspread  # type: ignore
+except Exception:
+    gspread = None  # type: ignore
 
 _log = logging.getLogger(__name__)
 
-def _pick_refresh_callable():
-    """
-    Returns a callable that performs a single OC refresh, or None if not found.
-    Preference order:
-      1) Known function names we've used historically.
-      2) Any callable with "refresh" in its name.
-      3) Heuristic fallbacks with keywords: snapshot/tick/levels/oc + refresh-ish.
-    """
-    # 1) Exact known names (most stable first)
-    exact_candidates = [
-        "refresh_once",
-        "refresh_now",
-        "run_once",
-        "refresh",
-        "do_refresh",
-        "refresh_one",
-        "do_oc_refresh",
-        "refresh_snapshot",
-        "oc_refresh",
-        "refresh_tick",
-        "update_levels",
-        "fetch_levels",
-    ]
-    for name in exact_candidates:
-        fn = globals().get(name)
-        if callable(fn):
-            return fn
+# Module-global latest snapshot
+_SNAPSHOT: Optional[dict] = None
 
-    # 2) Any callable with "refresh" in the name
-    dynamic = []
-    for name, obj in list(globals().items()):
-        if callable(obj) and isinstance(name, str):
-            n = name.lower()
-            if "refresh" in n:
-                dynamic.append((name, obj))
-    if dynamic:
-        # Prefer ones that look single-shot (contain 'once', 'now', 'tick')
-        def score(item):
-            name = item[0].lower()
-            s = 0
-            if "once" in name or "now" in name: s += 5
-            if "tick" in name: s += 3
-            if "snapshot" in name: s += 2
-            if "oc" in name or "levels" in name: s += 1
-            return -s  # smaller is better for sorting
-        dynamic.sort(key=score)
-        return dynamic[0][1]
+# -------- Public API --------
+def set_snapshot(snap: dict) -> None:
+    global _SNAPSHOT
+    if isinstance(snap, dict):
+        _SNAPSHOT = snap
 
-    # 3) Heuristic: keywords mix (snapshot/tick/levels/oc) even if not 'refresh'
-    kw = ("snapshot", "tick", "levels", "oc")
-    pool = []
-    for name, obj in list(globals().items()):
-        if callable(obj) and isinstance(name, str):
-            n = name.lower()
-            if any(k in n for k in kw):
-                pool.append((name, obj))
-    if pool:
-        def score2(item):
-            name = item[0].lower()
-            s = 0
-            if "snapshot" in name: s += 4
-            if "tick" in name: s += 3
-            if "levels" in name: s += 2
-            if "oc" in name: s += 1
-            return -s
-        pool.sort(key=score2)
-        return pool[0][1]
+def get_snapshot() -> Optional[dict]:
+    return _SNAPSHOT
 
-    return None
-
-# ===== Back-compat resolver + safe wrapper for refresh_once =====
-import inspect
-import logging
-
-_log = logging.getLogger(__name__)
-
-def _required_positional_count(fn):
-    try:
-        sig = inspect.signature(fn)
-    except Exception:
-        return 0
-    req = 0
-    for p in sig.parameters.values():
-        if p.kind in (p.POSITIONAL_ONLY, p.POSITIONAL_OR_KEYWORD) and p.default is inspect._empty:
-            req += 1
-    return req
+# -------- Provider discovery --------
+_MODULE_CANDIDATES = [
+    "analytics.oc_sources",
+    "analytics.oc_core",
+    "analytics.oc_backend",
+    "integrations.dhan_oc",
+    "integrations.oc_feed",
+    "providers.dhan_oc",
+    "providers.oc",
+    "dhan.oc",
+    "oc.providers",
+]
+_FN_CANDIDATE_NAMES = [
+    "refresh_once",
+    "refresh_now",
+    "run_once",
+    "refresh",
+    "do_refresh",
+    "refresh_tick",
+    "refresh_snapshot",
+    "oc_refresh",
+    "fetch_levels",
+    "get_oc_snapshot",
+    "compute_levels",
+    "compute_snapshot",
+    "build_snapshot",
+    "get_levels",
+]
 
 def _score_name(name: str) -> int:
     n = name.lower()
-    s = 100
-    # Prefer known names
-    if n == "refresh_once": s = 0
-    elif n == "refresh_now": s = 1
-    elif n == "run_once": s = 2
-    elif n == "refresh": s = 3
-    elif n in ("do_refresh", "refresh_one", "do_oc_refresh"): s = 4
-    # Generic refresh-ish
-    elif "refresh" in n: s = 5
-    # Then OC-related helpers
-    elif any(k in n for k in ("snapshot", "tick", "levels", "oc", "fetch_levels", "update_levels")):
-        s = 6
-    return s
+    order = {nm: i for i, nm in enumerate(_FN_CANDIDATE_NAMES)}
+    if n in order: return order[n]
+    if "refresh" in n: return 50
+    if any(k in n for k in ("snapshot", "levels", "oc")): return 60
+    return 999
 
-def _pick_refresh_callable():
-    """
-    Choose the best available single-shot refresh callable.
-    Preference by name -> then fewer required args.
-    """
-    cands = []
-    for name, obj in list(globals().items()):
-        if callable(obj):
-            sc = _score_name(name)
-            if sc < 100:
-                cands.append((sc, _required_positional_count(obj), name, obj))
-    # Also consider any function that contains 'refresh' in name
-    for name, obj in list(globals().items()):
-        if callable(obj):
-            n = name.lower()
-            if "refresh" in n and _score_name(name) >= 100:
-                cands.append((5, _required_positional_count(obj), name, obj))
-    # If nothing matched, consider OC helpers as last resort
-    if not cands:
-        for name, obj in list(globals().items()):
+def _discover_provider() -> Tuple[Optional[Callable[..., Any]], str, bool]:
+    for mod_name in _MODULE_CANDIDATES:
+        try:
+            m = importlib.import_module(mod_name)
+        except Exception:
+            continue
+        cands: list[tuple[int,int,str,Callable[...,Any],bool]] = []
+        for nm in dir(m):
+            obj = getattr(m, nm, None)
             if callable(obj):
-                n = name.lower()
-                if any(k in n for k in ("snapshot", "tick", "levels", "oc", "fetch_levels", "update_levels")):
-                    cands.append((6, _required_positional_count(obj), name, obj))
+                score = _score_name(nm)
+                if score < 999:
+                    # required positional params (for arg-flex)
+                    try:
+                        sig = inspect.signature(obj)
+                        req = sum(
+                            1 for p in sig.parameters.values()
+                            if p.kind in (p.POSITIONAL_ONLY, p.POSITIONAL_OR_KEYWORD)
+                            and p.default is inspect._empty
+                        )
+                    except Exception:
+                        req = 0
+                    cands.append((score, req, nm, obj, inspect.iscoroutinefunction(obj)))
+        if cands:
+            cands.sort(key=lambda t: (t[0], t[1]))  # best score, fewer required args
+            _, req, nm, fn, is_coro = cands[0]
+            _log.info("oc_refresh: provider %s.%s (async=%s, req=%s)", mod_name, nm, is_coro, req)
+            return fn, f"{mod_name}.{nm}", is_coro
+    return None, "", False
 
-    if not cands:
+_PROVIDER_FN, _PROVIDER_NAME, _PROVIDER_IS_ASYNC = _discover_provider()
+
+def _extract_snapshot(ret: Any) -> Optional[dict]:
+    """Heuristic: find a dict with expected OC keys."""
+    def looks(d: Any) -> bool:
+        if not isinstance(d, dict): return False
+        k = set(x.lower() for x in d.keys())
+        if "spot" in k and ({"s1","s2","r1","r2"} & k):
+            return True
+        if {"symbol","expiry","spot"} <= k:
+            return True
+        if "levels" in k and "spot" in k:
+            return True
+        return False
+
+    if looks(ret): return ret
+    if isinstance(ret, (tuple, list)):
+        for x in ret:
+            if looks(x): return x
+    for attr in ("snapshot","data","result"):
+        if hasattr(ret, attr):
+            try:
+                val = getattr(ret, attr)
+                if looks(val): return val
+            except Exception:
+                pass
+    return None
+
+def _call_variants(fn: Callable, is_async: bool):
+    """Return a coroutine that tries (), (None,), ({},) in order."""
+    async def _runner():
+        variants = [
+            ((), {}),
+            ((None,), {}),
+            (({},), {}),
+        ]
+        for a,k in variants:
+            try:
+                if is_async:
+                    res = fn(*a, **k)  # may or may not be awaitable
+                    if inspect.isawaitable(res):
+                        res = await res
+                else:
+                    res = fn(*a, **k)
+                return res
+            except TypeError:
+                # try next variant (arg mismatch)
+                continue
+        # last resort: call without caring (may still work)
+        res = fn()
+        if inspect.isawaitable(res):
+            res = await res
+        return res
+    return _runner()
+
+# -------- Sheets fallback --------
+def _env(name: str) -> Optional[str]:
+    v = os.environ.get(name)
+    return v if v and v.strip() else None
+
+def _open_status_ws():
+    """Open spreadsheet and return 'OC_Live' worksheet if present."""
+    if gspread is None:
+        raise RuntimeError("gspread not installed")
+    raw = _env("GOOGLE_SA_JSON")
+    sid = _env("GSHEET_TRADES_SPREADSHEET_ID")
+    if not raw or not sid:
+        raise RuntimeError("Sheets env missing")
+    sa = json.loads(raw)
+    gc = gspread.service_account_from_dict(sa)
+    sh = gc.open_by_key(sid)
+    try:
+        ws = sh.worksheet("OC_Live")
+    except Exception:
+        # fallback to Snapshots
+        ws = sh.worksheet("Snapshots")
+    return ws
+
+_NUMERIC_COLS = {
+    "spot","s1","s2","r1","r2","pcr","max_pain","ce_oi_delta","pe_oi_delta",
+}
+
+def _to_float(x):
+    try:
+        if x in (None,"","—"): return None
+        return float(str(x).replace(",","").strip())
+    except Exception:
         return None
 
-    # Sort: lower score first, then fewer required args first
-    cands.sort(key=lambda t: (t[0], t[1]))
-    return cands[0][3], cands[0][2], cands[0][1]
+def _build_from_sheet() -> Optional[dict]:
+    try:
+        ws = _open_status_ws()
+        vals = ws.get_all_records()  # list of dicts with header mapping
+        if not vals:
+            return None
+        row = vals[-1]
+        # normalize keys
+        row_norm: Dict[str, Any] = {}
+        for k, v in row.items():
+            key = str(k).strip().lower()
+            if key in _NUMERIC_COLS:
+                row_norm[key] = _to_float(v)
+            else:
+                row_norm[key] = v
+        # expected fields
+        sym = (row_norm.get("symbol") or row_norm.get("sym") or _env("OC_SYMBOL") or "").upper()
+        exp = row_norm.get("expiry") or row_norm.get("exp") or ""
+        snap = {
+            "symbol": sym,
+            "expiry": exp,
+            "spot": row_norm.get("spot"),
+            "s1": row_norm.get("s1"),
+            "s2": row_norm.get("s2"),
+            "r1": row_norm.get("r1"),
+            "r2": row_norm.get("r2"),
+            "pcr": row_norm.get("pcr"),
+            "max_pain": row_norm.get("max_pain"),
+            "ce_oi_delta": row_norm.get("ce_oi_delta"),
+            "pe_oi_delta": row_norm.get("pe_oi_delta"),
+            "mv": row_norm.get("mv") or row_norm.get("move") or row_norm.get("trend"),
+            "source": "sheets",
+            "ts": int(time.time()),
+        }
+        return snap
+    except Exception as e:
+        _log.warning("oc_refresh: sheets fallback failed: %s", e)
+        return None
 
-# If user already defined refresh_once, keep it.
-if "refresh_once" in globals() and callable(globals()["refresh_once"]):
-    _log.debug("oc_refresh: using existing refresh_once()")
-else:
-    _picked = _pick_refresh_callable()
-    if _picked is None:
-        _FN = None
-        _FN_name = None
-        _FN_req = 0
-        _log.error("oc_refresh: NO concrete refresh function found. Binding NO-OP.")
-    else:
-        _FN, _FN_name, _FN_req = _picked
-        _log.info("oc_refresh: selected %s (requires %s positional args)", _FN_name, _FN_req)
+# -------- Main entry --------
+async def refresh_once(*args, **kwargs) -> dict:
+    """
+    Try provider; else read last OC snapshot from Sheets.
+    Always returns a dict: {"status": "...", "snapshot": dict|None, ...}
+    and publishes _SNAPSHOT if extracted.
+    """
+    status = "ok"
+    reason = ""
+    snap: Optional[dict] = None
 
-    def refresh_once(*args, **kwargs):  # type: ignore[assignment]
-        """
-        Safe single-shot entry point used by callers.
-        Tries to call the chosen function with compatible arguments.
-        Never raises TypeError outward; returns a dict with status.
-        """
-        if _FN is None:
-            _log.warning("oc_refresh: Using NO-OP refresh_once()")
-            return {"status": "noop", "message": "No refresh function available"}
-
-        # 1) Try zero-arg call
+    # 1) Provider
+    if _PROVIDER_FN is not None:
         try:
-            return _FN()
-        except TypeError as e0:
-            # 2) If it needs one param (common: p/params), try None
-            try:
-                return _FN(None)
-            except TypeError as e1:
-                # 3) Try empty dict
-                try:
-                    return _FN({})
-                except Exception as e2:
-                    _log.exception(
-                        "oc_refresh: refresh call failed (fn=%s). "
-                        "Errors: zero-arg=%s | None=%s | {}=%s",
-                        _FN_name, e0, e1, e2
-                    )
-                    return {"status": "error", "message": str(e2)}
-            except Exception as e:
-                _log.exception("oc_refresh: refresh call (None) raised")
-                return {"status": "error", "message": str(e)}
+            ret = await _call_variants(_PROVIDER_FN, _PROVIDER_IS_ASYNC)
+            snap = _extract_snapshot(ret)
+            if snap is None and isinstance(ret, dict) and "snapshot" in ret and isinstance(ret["snapshot"], dict):
+                snap = ret["snapshot"]
         except Exception as e:
-            _log.exception("oc_refresh: refresh call raised")
-            return {"status": "error", "message": str(e)}
+            status, reason = "provider_error", str(e)
 
-# ===== /Back-compat resolver + safe wrapper =====
+    # 2) Sheets fallback
+    if snap is None:
+        s2 = _build_from_sheet()
+        if s2 is not None:
+            snap = s2
+            if status == "ok" and reason == "":
+                status = "fallback"
+                reason = "sheets"
+
+    # 3) Publish (if any)
+    if isinstance(snap, dict):
+        set_snapshot(snap)
+
+    return {
+        "status": status,
+        "reason": reason,
+        "snapshot": snap,
+        "provider": _PROVIDER_NAME,
+    }
