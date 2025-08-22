@@ -1,18 +1,9 @@
 # agents/eligibility_api.py
 # ------------------------------------------------------------
 # Eligibility wrapper API for /oc_now.
-# - Tries to call your custom agents.signal_generator.check_eligibility(snapshot)
-#   if present (so your rules stay authoritative).
-# - Else uses a safe fallback (C1..C6) with clear reasons.
-# - Output schema:
-#   {
-#     "header": {...},
-#     "checks": [{"id": "C1", "ok": True, "reason": "..."} ...],
-#     "eligible": True/False,
-#     "side": "CE"/"PE"/None,
-#     "level": "S1*"|"S2*"|"R1*"|"R2*"|None,
-#     "trigger_price": float|None
-#   }
+# - Prefers agents.signal_generator.check_eligibility(snapshot) if present.
+# - Else fallback C1..C6 with human-readable reasons.
+# - C2 now implements "MV 1-of-2 (PCR / MaxPainΔ)" fallback when MV tag missing.
 # ------------------------------------------------------------
 from __future__ import annotations
 from dataclasses import dataclass
@@ -23,18 +14,13 @@ import math
 
 IST = ZoneInfo("Asia/Kolkata")
 
-# -----------------------------
-# Utilities
-# -----------------------------
 def _g(snapshot: Any, key: str, default=None):
-    """Get attribute or dict key safely."""
     if snapshot is None:
         return default
     if isinstance(snapshot, dict):
         return snapshot.get(key, default)
     if hasattr(snapshot, key):
         return getattr(snapshot, key)
-    # common alt keys
     if key == "symbol":
         return _g(snapshot, "sym", default)
     if key == "expiry":
@@ -56,14 +42,7 @@ def _in_window(dt: datetime, start: time, end: time) -> bool:
     t = dt.timetz()
     return (t >= start.replace(tzinfo=IST)) and (t <= end.replace(tzinfo=IST))
 
-# -----------------------------
-# Policy defaults (override via Params_Override if your SG uses it)
-# -----------------------------
-DEFAULT_ENTRY_BAND = {
-    "NIFTY": 12.0,
-    "BANKNIFTY": 30.0,
-    "FINNIFTY": 15.0,
-}
+DEFAULT_ENTRY_BAND = {"NIFTY": 12.0, "BANKNIFTY": 30.0, "FINNIFTY": 15.0}
 NO_TRADE_WINDOWS = [
     (time(9, 15, tzinfo=IST), time(9, 30, tzinfo=IST)),
     (time(14, 45, tzinfo=IST), time(15, 15, tzinfo=IST)),
@@ -71,9 +50,6 @@ NO_TRADE_WINDOWS = [
 MV_OK_CE = {"bullish", "big_move", "strong_bullish"}
 MV_OK_PE = {"bearish", "strong_bearish", "big_down"}
 
-# -----------------------------
-# Fallback core
-# -----------------------------
 @dataclass
 class TriggerInfo:
     side: Optional[str] = None  # "CE"/"PE"
@@ -101,7 +77,6 @@ def _compute_shifted_levels(s1, s2, r1, r2, buf: float) -> Dict[str, Optional[fl
     }
 
 def _pick_trigger(spot: Optional[float], shifted: Dict[str, Optional[float]]) -> TriggerInfo:
-    # No previous spot context here; simple cross/near logic.
     if spot is None:
         return TriggerInfo(reason="spot missing")
     ce, pe = [], []
@@ -124,7 +99,6 @@ def _pick_trigger(spot: Optional[float], shifted: Dict[str, Optional[float]]) ->
         tag, lv, _ = both[0]
         side = "CE" if tag.startswith("S") else "PE"
         return TriggerInfo(side, tag, lv, "CROSS both; picked nearest")
-    # nearest (for context)
     cand = []
     for tag, lv in shifted.items():
         if lv is not None:
@@ -135,14 +109,27 @@ def _pick_trigger(spot: Optional[float], shifted: Dict[str, Optional[float]]) ->
         return TriggerInfo(side, tag, lv, "NEAR, not crossed")
     return TriggerInfo(reason="levels missing")
 
-def _mv_gate_ok(side: Optional[str], mv: Optional[str]) -> Tuple[bool, str]:
-    m = (mv or "").lower()
-    if not side:
-        return False, "side unknown"
-    if m == "":
-        return False, "MV missing"
-    ok = (m in MV_OK_CE) if side == "CE" else (m in MV_OK_PE)
-    return ok, f"MV={m}"
+def _mv_gate_ok(side: Optional[str], mv: Optional[str], pcr: Optional[float], max_pain: Optional[float], spot: Optional[float]) -> Tuple[bool, str]:
+    m = (mv or "").lower().strip()
+    # 1) If explicit MV tag present, use it
+    if side == "CE" and m:
+        return (m in MV_OK_CE), f"MV={m}"
+    if side == "PE" and m:
+        return (m in MV_OK_PE), f"MV={m}"
+    # 2) Fallback: 1-of-2 (PCR or MaxPain) support
+    ok_pcr = ok_mp = None
+    if isinstance(pcr, (int, float)):
+        ok_pcr = (pcr >= 1.0) if side == "CE" else (pcr <= 1.0)
+    if isinstance(max_pain, (int, float)) and isinstance(spot, (int, float)):
+        ok_mp = (max_pain >= spot) if side == "CE" else (max_pain <= spot)
+    oks = [x for x in (ok_pcr, ok_mp) if x is not None]
+    if not oks:
+        return False, "MV missing; PCR/MP missing"
+    # Any-one true → pass
+    parts = []
+    parts.append(f"PCR {'✓' if ok_pcr else '×'}" if ok_pcr is not None else "PCR —")
+    parts.append(f"MP {'✓' if ok_mp else '×'}" if ok_mp is not None else "MP —")
+    return any(oks), " / ".join(parts)
 
 def _oc_pattern_ok(side: Optional[str], ce_oi_delta: Optional[float], pe_oi_delta: Optional[float]) -> Tuple[bool, str]:
     if ce_oi_delta is None or pe_oi_delta is None:
@@ -216,7 +203,7 @@ def _fallback_check(snapshot: Any) -> Dict[str, Any]:
     c1_ok = trig.side in ("CE", "PE") and trig.level_tag is not None and trig.price is not None
     checks.append({"id": "C1", "ok": c1_ok, "reason": trig.reason or "—"})
 
-    c2_ok, c2_reason = _mv_gate_ok(trig.side, mv)
+    c2_ok, c2_reason = _mv_gate_ok(trig.side, mv, pcr, max_pain, spot)
     checks.append({"id": "C2", "ok": c2_ok, "reason": c2_reason})
 
     c3_ok, c3_reason = _oc_pattern_ok(trig.side, ce_oi_delta, pe_oi_delta)
@@ -234,7 +221,6 @@ def _fallback_check(snapshot: Any) -> Dict[str, Any]:
     required = {"C1", "C2", "C3", "C5", "C6"}
     okmap = {c["id"]: bool(c["ok"]) for c in checks}
     eligible = all(okmap.get(cid, False) for cid in required)
-    # C4 supportive; data missing होने पर hard-block नहीं
 
     header = {
         "symbol": symbol, "expiry": expiry, "spot": spot,
@@ -251,14 +237,7 @@ def _fallback_check(snapshot: Any) -> Dict[str, Any]:
         "trigger_price": trig.price,
     }
 
-# -----------------------------
-# Public API
-# -----------------------------
 def check_now(snapshot: Any) -> Dict[str, Any]:
-    """
-    Main entry for /oc_now: returns normalized eligibility dict (see top).
-    Prefers user's own agents.signal_generator.check_eligibility if available.
-    """
     try:
         import importlib
         sg = importlib.import_module("agents.signal_generator")
