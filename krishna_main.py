@@ -1,167 +1,187 @@
 # krishna_main.py
-# App bootstrap: starts Telegram bot (non-blocking), day loops, health logs.
+from __future__ import annotations
 
 import os
 import sys
 import asyncio
+import logging
+import inspect
 import signal
-import time
+import platform
 from typing import Optional
 
-from utils.logger import log
+# Ensure all startup hooks (singleton, env guards) load early
+import sitecustomize  # noqa: F401
 
-# Sheets bootstrap
-from integrations import sheets as sh
+# ---------- Logging ----------
+logging.basicConfig(
+    level=os.environ.get("LOG_LEVEL", "INFO"),
+    format="%(asctime)s [%(levelname)s] %(message)s",
+)
+log = logging.getLogger(__name__)
 
-# OC refresh (pulls Dhan OC / compute levels / write OC_Live etc.)
-from analytics.oc_refresh_shim import refresh_once
-
-# Telegram application factory (must return telegram.ext.Application or None if disabled)
-from telegram_bot import init as init_bot
-
-# Optional: TP/SL watcher (may be sync or async; handle both)
+# ---------- Imports that may be optional in your tree ----------
+# Telegram application factory (sync in our drop-in, but we handle both)
 try:
-    from agents.tp_sl_watcher import trail_tick as _trail_tick
-except Exception:  # noqa
-    _trail_tick = None
+    from telegram_bot import init as init_bot
+except Exception:
+    init_bot = None
 
-# Optional: trade loop tick (paper execution)
 try:
-    from agents.trade_loop import tick as _trade_tick
-except Exception:  # noqa
-    _trade_tick = None
+    from telegram_bot import build_application as build_app_fallback
+except Exception:
+    build_app_fallback = None
 
-# Optional: signal generator tick (6-checks etc.) if you keep it separate
+# OC refresh shim (awaitable)
 try:
-    from agents.signal_generator import tick as _signal_tick
-except Exception:  # noqa
-    _signal_tick = None
+    from analytics.oc_refresh_shim import refresh_once, get_snapshot
+except Exception:
+    async def refresh_once(*args, **kwargs):
+        return {"status": "noop"}  # type: ignore[misc]
+    def get_snapshot():
+        return None  # type: ignore[misc]
 
+# Sheets tabs ensure (optional; may be async or sync)
+def _resolve_ensure_tabs():
+    """
+    Try to locate an 'ensure_tabs' function from your codebase.
+    Accepts either async or sync function; returns callable or None.
+    """
+    for mod_name in ("sheets_admin", "skills.sheets_admin", "utils.sheets_admin"):
+        try:
+            mod = __import__(mod_name, fromlist=["*"])
+            fn = getattr(mod, "ensure_tabs", None)
+            if callable(fn):
+                return fn
+        except Exception:
+            continue
+    return None
 
-def _get_int_env(name: str, default: int) -> int:
+ENSURE_TABS_FN = _resolve_ensure_tabs()
+
+# ---------- Helpers ----------
+async def _maybe_await(callable_obj, *args, **kwargs):
+    """Call a function which might be sync or async."""
     try:
-        return int(os.getenv(name, str(default)))
-    except Exception:
-        return default
+        res = callable_obj(*args, **kwargs)
+        if inspect.isawaitable(res):
+            return await res
+        return res
+    except TypeError:
+        # try calling with no args if signature mismatch
+        res = callable_obj()
+        if inspect.isawaitable(res):
+            return await res
+        return res
 
 
-async def _maybe_call(func):
-    """
-    Call a function that might be sync or async. If None, do nothing.
-    """
-    if func is None:
+async def _ensure_tabs_safe():
+    if ENSURE_TABS_FN is None:
         return
     try:
-        res = func()
-        if asyncio.iscoroutine(res):
-            await res
-    except TypeError:
-        # In case it's defined as async def but called without parentheses above
-        try:
-            res = await func()  # type: ignore
-            return res
-        except Exception as e:
-            log.error("call err: %s", e)
+        await _maybe_await(ENSURE_TABS_FN)
+        log.info("✅ Sheets tabs ensured")
     except Exception as e:
-        log.error("call err: %s", e)
+        log.warning("Sheets ensure failed: %s", e)
 
 
-async def day_loop():
+async def _build_application():
     """
-    Main intraday loop:
-    - refresh OC snapshot
-    - run signal/trade/tp-sl ticks (if available)
-    - health heartbeat
+    Create Telegram Application. Supports both sync/async init().
     """
-    refresh_secs = _get_int_env("OC_REFRESH_SECS", 15)
-    heartbeat_every = 30
-    last_heartbeat = 0.0
+    if init_bot is None and build_app_fallback is None:
+        raise RuntimeError("telegram_bot.init/build_application not found")
+
+    factory = init_bot or build_app_fallback
+    if inspect.iscoroutinefunction(factory):
+        app = await factory()  # type: ignore[misc]
+    else:
+        app = factory()        # type: ignore[misc]
+    return app
+
+
+async def day_oc_loop():
+    """
+    Periodically refresh OC snapshot (handles both success & rate-limit).
+    """
+    try:
+        secs = int(os.environ.get("OC_REFRESH_SECS", "12"))
+    except Exception:
+        secs = 12
+    if secs < 5:
+        secs = 12
 
     log.info("Day loop started")
-
     while True:
-        # 1) OC refresh
         try:
             await refresh_once()
         except Exception as e:
-            # oc_refresh internally logs fine-grained errors; this is a guard
             log.error("OC refresh failed: %s", e)
+        await asyncio.sleep(secs)
 
-        # 2) Run signal generator (if exposed as tick)
-        try:
-            await _maybe_call(_signal_tick)
-        except Exception as e:
-            log.error("signal gen err: %s", e)
 
-        # 3) Paper trade loop (entries/exits)
-        try:
-            await _maybe_call(_trade_tick)
-        except Exception as e:
-            log.error("trade loop err: %s", e)
+async def heartbeat_loop():
+    while True:
+        log.info("heartbeat: day_loop alive")
+        await asyncio.sleep(10)
 
-        # 4) TP/SL watcher (trail / MV reversal exits)
-        try:
-            # Support both sync & async versions
-            if _trail_tick is not None:
-                res = _trail_tick()
-                if asyncio.iscoroutine(res):
-                    await res
-        except Exception as e:
-            log.error("tp/sl watcher err: %s", e)
 
-        # 5) Heartbeat
-        now = time.time()
-        if now - last_heartbeat >= heartbeat_every:
-            log.info("heartbeat: day_loop alive")
-            last_heartbeat = now
+async def start_polling(app):
+    """
+    v20-safe start sequence. sitecustomize may skip start if disabled/locked.
+    """
+    # Application.init & start
+    try:
+        await app.initialize()
+        await app.start()
+        # Updater.start_polling() is awaitable in PTB v20
+        await app.updater.start_polling()
+        log.info("Telegram bot started")
+    except Exception as e:
+        # If TELEGRAM_DISABLED=true or singleton lock busy, sitecustomize
+        # will skip start_polling() silently; we just log and continue.
+        log.warning("Telegram polling start skipped/failed: %s", e)
 
-        # sleep till next cycle
-        try:
-            await asyncio.sleep(max(1, refresh_secs))
-        except asyncio.CancelledError:
-            # Shutdown requested
-            break
+
+async def stop_polling(app):
+    try:
+        await app.updater.stop()
+    except Exception:
+        pass
+    try:
+        await app.stop()
+    except Exception:
+        pass
+    try:
+        await app.shutdown()
+    except Exception:
+        pass
 
 
 async def main():
-    # Basic runtime info
-    log.info("Python runtime: %s", ".".join(map(str, sys.version_info[:3])))
+    log.info("Python runtime: %s", platform.python_version())
 
-    # Ensure Sheets tabs exist (idempotent)
-    try:
-        ok = sh.ensure_tabs()
-        if ok:
-            log.info("✅ Sheets tabs ensured")
-        else:
-            log.warning("Sheets ensure_tabs returned False (check creds/ids)")
-    except Exception as e:
-        log.error("Sheets ensure_tabs failed: %s", e)
+    # Ensure Sheets tabs (async/sync supported)
+    await _ensure_tabs_safe()
 
-    # Build Telegram Application (may return None if TELEGRAM_DISABLED=true)
-    app = await init_bot()
-    tasks = []
+    # Build Telegram application (sync or async factory)
+    app = await _build_application()
 
-    # Start Telegram non-blocking within our asyncio loop
-    if app:
-        # Proper async lifecycle for PTB v20+
-        await app.initialize()
-        log.info("Telegram polling started")
-        await app.start()
-        await app.updater.start_polling()
-        log.info("Telegram bot started")
+    # Start polling (guarded by sitecustomize singleton)
+    await start_polling(app)
 
-    # Start our day loop as a background task
-    day_task = asyncio.create_task(day_loop())
-    tasks.append(day_task)
+    # Start background loops
+    tasks = [
+        asyncio.create_task(day_oc_loop(), name="day_oc_loop"),
+        asyncio.create_task(heartbeat_loop(), name="heartbeat"),
+    ]
 
-    # Graceful shutdown on SIGTERM/SIGINT
-    shutdown_event = asyncio.Event()
+    # Graceful shutdown handling
+    stop_event = asyncio.Event()
 
     def _signal_handler():
-        try:
-            shutdown_event.set()
-        except Exception:
-            pass
+        log.info("Shutdown signal received")
+        stop_event.set()
 
     loop = asyncio.get_running_loop()
     for sig in (signal.SIGINT, signal.SIGTERM):
@@ -171,32 +191,16 @@ async def main():
             # Windows or restricted env
             pass
 
-    # Wait for shutdown request
-    await shutdown_event.wait()
+    await stop_event.wait()
 
-    # Cancel background tasks
     for t in tasks:
         t.cancel()
     await asyncio.gather(*tasks, return_exceptions=True)
-
-    # Telegram clean shutdown
-    if app:
-        try:
-            await app.updater.stop()
-        except Exception:
-            pass
-        try:
-            await app.stop()
-        except Exception:
-            pass
-        try:
-            await app.shutdown()
-        except Exception:
-            pass
+    await stop_polling(app)
+    log.info("Shutdown complete")
 
 
 if __name__ == "__main__":
-    # Run the async main
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
