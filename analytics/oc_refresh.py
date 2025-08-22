@@ -11,6 +11,7 @@
 #       summary, summary_text, summary_line, summary_str, final_summary
 #   - Sheets fallback safe; expiry < today (IST) या age > OC_MAX_SNAPSHOT_AGE_SEC ⇒ STALE
 #   - snapshot["c5_reason"] = "OK" / "HOLD" / "DailyCap"
+#   - ❗ Summary labels fixed: PCR/MP gate को **C4** नाम से ही count करेगा
 # ------------------------------------------------------------
 from __future__ import annotations
 import importlib, inspect, logging, re, time, json, os
@@ -185,13 +186,13 @@ def _build_summary(s: Dict[str, Any]) -> str:
         elif mv == "bullish":
             c3_ok = (pe_d > 0 and ce_d <= 0)
 
-    # PCR/MP gate proxy (our C2 proxy)
-    c2_ok = None
+    # PCR/MP gate (this is **C4** in checks)
+    c4_ok = None
     if isinstance(pcr,(int,float)) and isinstance(mp,(int,float)) and isinstance(spot,(int,float)):
         if mv == "bearish":
-            c2_ok = (pcr < 1.0 and mp <= spot)
+            c4_ok = (pcr < 1.0 and mp <= spot)
         elif mv == "bullish":
-            c2_ok = (pcr >= 1.0 and mp >= spot)
+            c4_ok = (pcr >= 1.0 and mp >= spot)
 
     side = None; level = None
     if mv == "bearish":
@@ -200,14 +201,14 @@ def _build_summary(s: Dict[str, Any]) -> str:
         side, level = "PE", "R1*"
 
     fails: List[str] = []
-    if c2_ok is False: fails.append("C2")
+    if c4_ok is False: fails.append("C4")
     if c3_ok is False: fails.append("C3")
 
-    if mv and (c2_ok is True) and (c3_ok is True):
+    if mv and (c4_ok is True) and (c3_ok is True):
         return f"✅ Eligible — {side} @ {level}"
     if mv:
         if fails:
-            return f"❌ Not eligible — failed: {', '.join(fails)}"
+            return f"❌ Not eligible — failed: {', '.join(sorted(fails))}"
         return f"⏳ Bias: {mv} — waiting for OIΔ/PCR alignment"
     return "❔ Insufficient data — waiting for live feed"
 
@@ -391,7 +392,7 @@ async def refresh_once(*args, **kwargs) -> dict:
                 # Build summary + aliases + explicit C5 text
                 snap["summary"] = _build_summary(snap)
                 _apply_summary_aliases(snap)
-                snap["c5_reason"] = "HOLD" if snap["hold"] else ("DailyCap" if snap["daily_cap_hit"] else "OK")
+                snap["c5_reason"] = "HOLD" if snap["hold"] else ("DailyCap" if snap["daily_cap"] else "OK") if snap.get("daily_cap") is not None else ("DailyCap" if snap["daily_cap_hit"] else "OK")
         except Exception as e:
             status, reason = "provider_error", str(e)
 
