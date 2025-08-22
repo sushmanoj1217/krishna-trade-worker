@@ -8,6 +8,7 @@ import logging
 import inspect
 import signal
 import platform
+import random
 from typing import Optional
 
 # Ensure all startup hooks (singleton, env guards) load early
@@ -62,18 +63,10 @@ ENSURE_TABS_FN = _resolve_ensure_tabs()
 # ---------- Helpers ----------
 async def _maybe_await(callable_obj, *args, **kwargs):
     """Call a function which might be sync or async."""
-    try:
-        res = callable_obj(*args, **kwargs)
-        if inspect.isawaitable(res):
-            return await res
-        return res
-    except TypeError:
-        # try calling with no args if signature mismatch
-        res = callable_obj()
-        if inspect.isawaitable(res):
-            return await res
-        return res
-
+    res = callable_obj(*args, **kwargs)
+    if inspect.isawaitable(res):
+        return await res
+    return res
 
 async def _ensure_tabs_safe():
     if ENSURE_TABS_FN is None:
@@ -83,7 +76,6 @@ async def _ensure_tabs_safe():
         log.info("✅ Sheets tabs ensured")
     except Exception as e:
         log.warning("Sheets ensure failed: %s", e)
-
 
 async def _build_application():
     """
@@ -99,49 +91,58 @@ async def _build_application():
         app = factory()        # type: ignore[misc]
     return app
 
+# ---------- OC refresh loops ----------
+def _read_int_env(name: str, default: int) -> int:
+    try:
+        v = int(os.environ.get(name, str(default)))
+        return v
+    except Exception:
+        return default
 
 async def day_oc_loop():
     """
-    Periodically refresh OC snapshot (handles both success & rate-limit).
+    Periodically refresh OC snapshot.
+    Now with jitter to avoid thundering herd / 429 spikes.
+    Env:
+      - OC_REFRESH_SECS (default 15)
+      - OC_REFRESH_JITTER_SECS (default 3)  -> actual sleep = base + U(0, jitter)
     """
-    try:
-        secs = int(os.environ.get("OC_REFRESH_SECS", "12"))
-    except Exception:
-        secs = 12
-    if secs < 5:
-        secs = 12
+    base = _read_int_env("OC_REFRESH_SECS", 15)
+    jitter = _read_int_env("OC_REFRESH_JITTER_SECS", 3)
+    if base < 5:
+        base = 15
+    if jitter < 0:
+        jitter = 0
 
-    log.info("Day loop started")
+    log.info("Day loop started (cadence ~%ss + jitter 0–%ss)", base, jitter)
     while True:
         try:
             await refresh_once()
         except Exception as e:
             log.error("OC refresh failed: %s", e)
-        await asyncio.sleep(secs)
-
+        # jittered sleep
+        sleep_for = float(base) + (random.random() * float(jitter))
+        await asyncio.sleep(sleep_for)
 
 async def heartbeat_loop():
     while True:
         log.info("heartbeat: day_loop alive")
         await asyncio.sleep(10)
 
-
+# ---------- Telegram start/stop ----------
 async def start_polling(app):
     """
     v20-safe start sequence. sitecustomize may skip start if disabled/locked.
     """
-    # Application.init & start
     try:
         await app.initialize()
         await app.start()
-        # Updater.start_polling() is awaitable in PTB v20
         await app.updater.start_polling()
         log.info("Telegram bot started")
     except Exception as e:
         # If TELEGRAM_DISABLED=true or singleton lock busy, sitecustomize
         # will skip start_polling() silently; we just log and continue.
         log.warning("Telegram polling start skipped/failed: %s", e)
-
 
 async def stop_polling(app):
     try:
@@ -157,7 +158,7 @@ async def stop_polling(app):
     except Exception:
         pass
 
-
+# ---------- Main ----------
 async def main():
     log.info("Python runtime: %s", platform.python_version())
 
@@ -188,7 +189,6 @@ async def main():
         try:
             loop.add_signal_handler(sig, _signal_handler)
         except NotImplementedError:
-            # Windows or restricted env
             pass
 
     await stop_event.wait()
@@ -198,7 +198,6 @@ async def main():
     await asyncio.gather(*tasks, return_exceptions=True)
     await stop_polling(app)
     log.info("Shutdown complete")
-
 
 if __name__ == "__main__":
     try:
