@@ -4,17 +4,18 @@
 #   - async refresh_once(*args, **kwargs) -> dict {status, reason, snapshot, provider}
 #   - get_snapshot(), set_snapshot()
 #
-# This version:
-#   - Provider snapshot पर HOLD/daily_cap flags merge करता है (env/sheet)
-#   - MV हमेशा derive करता है (PCR/MaxPain; tie-break via OIΔ)
-#   - Summary हमेशा भरता है और **aliases** भी देता है:
+# Features:
+#   - Provider snapshot + env/sheet flags merge (HOLD/daily_cap_hit)
+#   - MV हमेशा derive (PCR/MaxPain; tie-break via OIΔ)
+#   - Summary हमेशा भरा + aliases:
 #       summary, summary_text, summary_line, summary_str, final_summary
-#   - Sheets fallback safe; expiry < today (IST) या age > OC_MAX_SNAPSHOT_AGE_SEC ⇒ STALE
+#   - Sheets fallback सुरक्षित; expiry < today (IST) या age > OC_MAX_SNAPSHOT_AGE_SEC ⇒ STALE
 #   - snapshot["c5_reason"] = "OK" / "HOLD" / "DailyCap"
-#   - ❗ Summary labels fixed: PCR/MP gate को **C4** नाम से ही count करेगा
+#   - ❗ 429 / rate-limit detection ⇒ exponential backoff retry (config via env)
+#   - ❗ Summary labels: PCR/MP gate = **C4** (Checks से aligned)
 # ------------------------------------------------------------
 from __future__ import annotations
-import importlib, inspect, logging, re, time, json, os
+import importlib, inspect, logging, re, time, json, os, asyncio, random
 from typing import Any, Optional, Dict, Tuple, List
 
 try:
@@ -339,13 +340,45 @@ async def _call_provider(fn, is_async: bool):
         res = await res
     return res
 
+# -------- rate-limit detection + backoff ----------
+def _is_rate_limit_obj(ret: Any) -> bool:
+    try:
+        txt = json.dumps(ret, default=str).lower()
+    except Exception:
+        txt = str(ret).lower()
+    return bool(re.search(r"\b429\b|rate[-\s]?limit|too many requests|quota", txt))
+
+def _is_rate_limit_exc(exc: Exception) -> bool:
+    txt = (str(exc) or "").lower()
+    return bool(re.search(r"\b429\b|rate[-\s]?limit|too many requests|quota", txt))
+
+async def _call_provider_with_backoff():
+    max_r = int(_env("OC_BACKOFF_MAX_RETRIES") or "1")  # total retries on 429
+    base  = float(_env("OC_BACKOFF_BASE_SECS") or "3")
+    jit   = float(_env("OC_BACKOFF_JITTER_SECS") or "3")
+    attempts = 0
+    while True:
+        try:
+            ret = await _call_provider(_PROVIDER_FN, _PROVIDER_IS_ASYNC)
+            if _is_rate_limit_obj(ret):
+                raise RuntimeError(f"rate_limit: {ret}")
+            return ret, attempts
+        except Exception as e:
+            if attempts >= max_r or not _is_rate_limit_exc(e):
+                raise
+            sleep = base * (2 ** attempts) + (random.random() * jit if jit > 0 else 0.0)
+            _log.warning("oc_refresh: rate-limit detected; retrying in %.1fs (attempt %d/%d)", sleep, attempts+1, max_r)
+            attempts += 1
+            await asyncio.sleep(sleep)
+
 # ---------------- main entry ----------------
 async def refresh_once(*args, **kwargs) -> dict:
     status = "ok"; reason = ""; snap: Optional[dict] = None
+    retry_attempts = 0
 
     if _PROVIDER_FN is not None:
         try:
-            ret = await _call_provider(_PROVIDER_FN, _PROVIDER_IS_ASYNC)
+            ret, retry_attempts = await _call_provider_with_backoff()
             if isinstance(ret, dict) and isinstance(ret.get("snapshot"), dict):
                 psnap = ret["snapshot"]
             elif isinstance(ret, dict):
@@ -392,7 +425,9 @@ async def refresh_once(*args, **kwargs) -> dict:
                 # Build summary + aliases + explicit C5 text
                 snap["summary"] = _build_summary(snap)
                 _apply_summary_aliases(snap)
-                snap["c5_reason"] = "HOLD" if snap["hold"] else ("DailyCap" if snap["daily_cap"] else "OK") if snap.get("daily_cap") is not None else ("DailyCap" if snap["daily_cap_hit"] else "OK")
+                snap["c5_reason"] = "HOLD" if snap["hold"] else ("DailyCap" if snap["daily_cap_hit"] else "OK")
+                if retry_attempts:
+                    snap["retry_attempts"] = retry_attempts
         except Exception as e:
             status, reason = "provider_error", str(e)
 
@@ -405,5 +440,9 @@ async def refresh_once(*args, **kwargs) -> dict:
 
     if isinstance(snap, dict):
         set_snapshot(snap)
+
+    # reason annotate (non-fatal)
+    if status == "ok" and retry_attempts:
+        reason = f"provider backoff retries={retry_attempts}"
 
     return {"status": status, "reason": reason, "snapshot": snap, "provider": _PROVIDER_NAME}
