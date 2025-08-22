@@ -1,35 +1,38 @@
 # providers/dhan_oc.py
 # ------------------------------------------------------------
-# Dhan-backed live Option-Chain provider for oc_refresh.
-# Strategy:
-#   - First, try to call your existing integrations (e.g. integrations.dhan_oc)
-#     with tolerant function discovery. We *trust* your integration to hit Dhan.
-#   - Normalize to unified snapshot schema used by the bot.
-#   - Add light rate-limit: respect OC_REFRESH_SECS; simple 429 cooldown.
+# Hard-bound Dhan OC provider:
+#   - Calls your integration:  DHAN_PROVIDER_MODULE.DHAN_PROVIDER_FUNC
+#   - Function signature (your case): async fetch_levels(p: utils.params.Params) -> Dict
+#   - Builds a Params-like object from env (duck-typing OK)
+#   - Cadence cache + 429 cooldown
+#   - Normalizes snapshot (adds source='provider', ts=now)
 #
-# Env required (you already set most of these):
-#   OC_SYMBOL                NIFTY|BANKNIFTY|FINNIFTY     (default NIFTY)
-#   DHAN_UNDERLYING_SEG      e.g. IDX_I                   (required by your integration)
-#   DHAN_UNDERLYING_SCRIP    e.g. 13 (NIFTY)             (or use DHAN_UNDERLYING_SCRIP_MAP)
-#   DHAN_UNDERLYING_SCRIP_MAP like "NIFTY=13,BANKNIFTY=25,FINNIFTY=27"
+# Required env (already in your setup):
+#   OC_SYMBOL=NIFTY|BANKNIFTY|FINNIFTY       (default NIFTY)
+#   DHAN_UNDERLYING_SEG=IDX_I                (indices)
+#   DHAN_UNDERLYING_SCRIP=13                 (or DHAN_UNDERLYING_SCRIP_MAP="NIFTY=13,BANKNIFTY=25,FINNIFTY=27")
+#
+# Bind your integration explicitly:
+#   DHAN_PROVIDER_MODULE=integrations.option_chain_dhan
+#   DHAN_PROVIDER_FUNC=fetch_levels
 #
 # Optional:
-#   OC_REFRESH_SECS          default 12
-#   DHAN_429_COOLDOWN_SEC    default 30
-#
-# Public API exposed (for oc_refresh discovery):
-#   - async refresh_once() -> {"snapshot": {...}, ...}  (zero-arg)
+#   OC_REFRESH_SECS=12
+#   DHAN_429_COOLDOWN_SEC=30
 # ------------------------------------------------------------
 from __future__ import annotations
 
-import os, time, importlib, inspect
-from typing import Any, Dict, Optional, Tuple
+import os, time, importlib, inspect, logging
+from types import SimpleNamespace
+from typing import Any, Dict, Optional
+
+log = logging.getLogger(__name__)
 
 _last_fetch_ts: Optional[int] = None
 _last_snapshot: Optional[Dict[str, Any]] = None
 _cooldown_until: int = 0
 
-# ------------- small utils -------------
+# ---------------- utils ----------------
 def _env(name: str, default: Optional[str] = None) -> Optional[str]:
     v = os.environ.get(name)
     return v.strip() if v and str(v).strip() else default
@@ -37,184 +40,199 @@ def _env(name: str, default: Optional[str] = None) -> Optional[str]:
 def _now() -> int:
     return int(time.time())
 
+def _to_float(x):
+    try:
+        if x in (None, "", "—"): return None
+        return float(str(x).replace(",", "").strip())
+    except Exception:
+        return None
+
 def _parse_map(s: Optional[str]) -> Dict[str, str]:
     out: Dict[str, str] = {}
     if not s: return out
-    parts = [p.strip() for p in s.split(",") if p.strip()]
-    for p in parts:
-        if "=" in p:
-            k, v = p.split("=", 1)
-            out[k.strip().upper()] = v.strip()
+    for part in s.split(","):
+        part = part.strip()
+        if not part or "=" not in part:
+            continue
+        k, v = part.split("=", 1)
+        out[k.strip().upper()] = v.strip()
     return out
 
 def _get_symbol() -> str:
     sym = (_env("OC_SYMBOL") or "NIFTY").upper()
-    if sym not in {"NIFTY","BANKNIFTY","FINNIFTY"}:
-        sym = "NIFTY"
-    return sym
+    return sym if sym in {"NIFTY","BANKNIFTY","FINNIFTY"} else "NIFTY"
 
 def _get_security_id(sym: str) -> Optional[str]:
-    # Prefer explicit DHAN_UNDERLYING_SCRIP, else map
     sid = _env("DHAN_UNDERLYING_SCRIP")
     if sid: return sid
     mp = _parse_map(_env("DHAN_UNDERLYING_SCRIP_MAP"))
     return mp.get(sym)
 
-def _pick_func(mod, names: list[str]):
-    for nm in names:
-        if hasattr(mod, nm) and callable(getattr(mod, nm)):
-            return getattr(mod, nm), nm
-    return None, ""
+# ---------------- Params builder ----------------
+def _build_params() -> Any:
+    """
+    Try to import utils.params.Params; else fall back to a SimpleNamespace
+    and set common attributes that your fetch_levels likely uses.
+    """
+    sym = _get_symbol()
+    seg = _env("DHAN_UNDERLYING_SEG", "IDX_I")
+    sid = _get_security_id(sym)
+    cadence = int(_env("OC_REFRESH_SECS", "12") or "12")
 
-def _is_snapshot(d: Any) -> bool:
-    if not isinstance(d, dict): return False
-    k = set(x.lower() for x in d.keys())
-    if {"symbol","spot"} <= k and ({"s1","s2","r1","r2"} & k):
-        return True
-    if {"symbol","expiry","spot"} <= k:
-        return True
-    if "levels" in k and "spot" in k:
-        return True
-    return False
-
-def _extract_snapshot(ret: Any) -> Optional[dict]:
-    # direct dict?
-    if _is_snapshot(ret): return ret
-    # dict under common keys
-    if isinstance(ret, dict):
-        for key in ("snapshot","data","result"):
-            v = ret.get(key)
-            if _is_snapshot(v): return v  # type: ignore
-    # tuple/list: search first dict-looking snapshot
-    if isinstance(ret, (tuple, list)):
-        for it in ret:
-            if _is_snapshot(it): return it
-        if ret and isinstance(ret[0], dict) and _is_snapshot(ret[0]):
-            return ret[0]
-    # object attrs
-    for attr in ("snapshot","data","result"):
+    # Preferred: real Params class
+    try:
+        from utils.params import Params  # type: ignore
+        # Try zero-arg construct, then set attrs
         try:
-            v = getattr(ret, attr)
-            if _is_snapshot(v): return v
+            p = Params()
+        except Exception:
+            # try kwargs constructor with a safe subset
+            try:
+                p = Params(symbol=sym, segment=seg, security_id=sid, oc_refresh_secs=cadence)  # type: ignore
+            except Exception:
+                p = SimpleNamespace()
+    except Exception:
+        p = SimpleNamespace()
+
+    # Set a rich set of synonyms (duck-typed)
+    for k, v in {
+        "symbol": sym,
+        "oc_symbol": sym,
+        "underlying_symbol": sym,
+        "segment": seg,
+        "underlying_segment": seg,
+        "security_id": sid,
+        "underlying_scrip": sid,
+        "scrip": sid,
+        "oc_refresh_secs": cadence,
+        "refresh_secs": cadence,
+    }.items():
+        try:
+            setattr(p, k, v)
         except Exception:
             pass
-    return None
 
-def _merge_defaults(s: Dict[str, Any]) -> Dict[str, Any]:
-    # Ensure mandatory keys with safe defaults
-    out = dict(s)
+    return p
+
+# ---------------- Normalization ----------------
+def _looks_like_snapshot(d: Any) -> bool:
+    if not isinstance(d, dict): return False
+    k = {str(x).lower() for x in d.keys()}
+    if {"symbol","expiry","spot"} <= k: return True
+    if "spot" in k and ({"s1","s2","r1","r2"} & k): return True
+    if "levels" in k and "spot" in k: return True
+    return False
+
+def _normalize_snapshot(raw: Dict[str, Any]) -> Dict[str, Any]:
+    out: Dict[str, Any] = dict(raw)
+
+    # pull nested levels if present
+    lv = out.get("levels")
+    if isinstance(lv, dict):
+        def pick(*names):
+            for n in names:
+                if n in lv: return lv[n]
+                if isinstance(n, str) and n.upper() in lv: return lv[n.upper()]
+            return None
+        out.setdefault("s1", _to_float(pick("s1","S1")))
+        out.setdefault("s2", _to_float(pick("s2","S2")))
+        out.setdefault("r1", _to_float(pick("r1","R1")))
+        out.setdefault("r2", _to_float(pick("r2","R2")))
+
+    # numeric coercions (leave None if not parseable)
+    for key in ("spot","s1","s2","r1","r2","pcr","max_pain","ce_oi_delta","pe_oi_delta"):
+        if key in out:
+            out[key] = _to_float(out.get(key))
+
+    # expiry aliases
+    if not out.get("expiry"):
+        exp = out.get("exp") or out.get("expiry_date") or out.get("expy") or ""
+        out["expiry"] = exp
+
+    # mv tag
+    if out.get("mv") is None:
+        # optional: derive crude mv from pcr/max_pain
+        pcr = out.get("pcr")
+        mp, spot = out.get("max_pain"), out.get("spot")
+        mv = ""
+        try:
+            score = 0
+            if isinstance(pcr, (int,float)):
+                score += 1 if float(pcr) >= 1.0 else -1
+            if isinstance(mp, (int,float)) and isinstance(spot, (int,float)):
+                score += 1 if float(mp) > float(spot) else -1
+            if score > 0: mv = "bullish"
+            elif score < 0: mv = "bearish"
+        except Exception:
+            pass
+        out["mv"] = mv
+
     out.setdefault("symbol", _get_symbol())
-    out.setdefault("expiry", out.get("exp") or "")
-    out.setdefault("spot", out.get("underlying") or out.get("underlying_value") or out.get("ltp") or 0.0)
-    for k in ("s1","s2","r1","r2","pcr","max_pain","ce_oi_delta","pe_oi_delta","mv"):
-        out.setdefault(k, None)
-    # provider tags
     out["source"] = "provider"
     out.setdefault("ts", _now())
     return out
 
-# ------------- core call into your Dhan integration -------------
-_CANDIDATE_MODULES = [
-    "integrations.dhan_oc",
-    "dhan.oc",
-    "dhan_integration.oc",
-    "oc.dhan",
-]
-_CANDIDATE_FUNCS = [
-    # most likely:
-    "refresh_once", "get_oc_snapshot", "get_snapshot", "fetch_levels", "compute_snapshot",
-    # generic:
-    "refresh", "run_once", "oc_refresh",
-]
+# ---------------- Resolver & caller ----------------
+def _resolve_callable():
+    mod_name = _env("DHAN_PROVIDER_MODULE", "integrations.option_chain_dhan")
+    func_name = _env("DHAN_PROVIDER_FUNC", "fetch_levels")
+    m = importlib.import_module(mod_name)
+    fn = getattr(m, func_name)
+    if not callable(fn):
+        raise RuntimeError(f"{mod_name}.{func_name} is not callable")
+    return fn, f"{mod_name}.{func_name}", inspect.iscoroutinefunction(fn)
 
-async def _invoke_callable(fn, *args, **kwargs):
+async def _invoke(fn, *args, **kwargs):
     res = fn(*args, **kwargs)
     if inspect.isawaitable(res):
         res = await res
     return res
 
-async def _call_dhan_integration() -> Dict[str, Any]:
-    sym = _get_symbol()
-    sid = _get_security_id(sym)
-    seg = _env("DHAN_UNDERLYING_SEG", "IDX_I")
-
-    # Build param packs we will try to pass
-    param_variants = [
-        (),  # zero-arg
-        ({"symbol": sym},),
-        ({"symbol": sym, "segment": seg},),
-        ({"security_id": sid or "", "segment": seg},),
-        ({"symbol": sym, "security_id": sid or "", "segment": seg},),
-    ]
-
-    last_err: Optional[Exception] = None
-    for mod_name in _CANDIDATE_MODULES:
-        try:
-            m = importlib.import_module(mod_name)
-        except Exception as e:
-            last_err = e
-            continue
-        fn, fname = _pick_func(m, _CANDIDATE_FUNCS)
-        if not fn:
-            continue
-
-        # Try tolerant parameter packs
-        for pack in param_variants:
-            try:
-                if isinstance(pack, tuple) and len(pack) == 1 and isinstance(pack[0], dict):
-                    ret = await _invoke_callable(fn, **pack[0])
-                else:
-                    ret = await _invoke_callable(fn, *pack)
-                snap = _extract_snapshot(ret)
-                if isinstance(snap, dict):
-                    return _merge_defaults(snap)
-            except TypeError:
-                # wrong signature; try next
-                continue
-            except Exception as e:
-                # handle 429 cooldown hint
-                msg = str(e).lower()
-                if "429" in msg or "too many" in msg:
-                    raise RuntimeError("DHAN_429") from e
-                last_err = e
-                # try next variant
-                continue
-
-    # If we reached here, no suitable callable succeeded
-    if last_err:
-        raise last_err
-    raise RuntimeError("No usable Dhan integration function found")
-
-# ------------- public API -------------
+# ---------------- Public API ----------------
 async def refresh_once() -> Dict[str, Any]:
     """
-    Respect OC_REFRESH_SECS cadence; apply 429 cooldown;
-    then call your Dhan integration and return unified payload.
+    Cadence cache; 429 cooldown; call your Dhan integration with a Params-like object.
+    Returns: {"status": "...", "reason": "...", "snapshot": {...}}
     """
     global _last_fetch_ts, _last_snapshot, _cooldown_until
 
     now = _now()
     if now < _cooldown_until:
-        # return cached snapshot if available, else raise
         if _last_snapshot:
-            return {"status": "cooldown", "reason": "429_cooldown", "snapshot": _last_snapshot}
+            return {"status":"cooldown", "reason":"429_cooldown", "snapshot":_last_snapshot}
         raise RuntimeError(f"429 cooldown; wait {(_cooldown_until-now)}s")
 
     cadence = int(_env("OC_REFRESH_SECS", "12") or "12")
     if _last_fetch_ts and _last_snapshot and now - _last_fetch_ts < max(3, cadence):
-        return {"status": "cached", "reason": "", "snapshot": _last_snapshot}
+        return {"status":"cached", "reason":"", "snapshot":_last_snapshot}
+
+    fn, fqname, is_async = _resolve_callable()
+    p = _build_params()
 
     try:
-        snap = await _call_dhan_integration()
-    except RuntimeError as e:
-        if str(e) == "DHAN_429":
+        ret = await _invoke(fn, p)
+    except Exception as e:
+        msg = str(e).lower()
+        if "429" in msg or "too many requests" in msg or "rate limit" in msg:
             cd = int(_env("DHAN_429_COOLDOWN_SEC", "30") or "30")
             _cooldown_until = now + max(10, min(120, cd))
             if _last_snapshot:
-                return {"status": "cooldown", "reason": "429_cooldown", "snapshot": _last_snapshot}
-            raise
+                return {"status":"cooldown", "reason":"429_cooldown", "snapshot":_last_snapshot}
+        # bubble up provider_error; oc_refresh will mark fallback sheets
         raise
+
+    # Extract/normalize snapshot (ret may already be snapshot)
+    if isinstance(ret, dict) and ("snapshot" in ret and isinstance(ret["snapshot"], dict)):
+        snap = _normalize_snapshot(ret["snapshot"])
+    elif isinstance(ret, dict):
+        snap = _normalize_snapshot(ret)
+    else:
+        # try attribute 'snapshot'
+        try:
+            snap = _normalize_snapshot(getattr(ret, "snapshot"))
+        except Exception:
+            raise RuntimeError(f"{fqname} did not return a snapshot-like dict")
 
     _last_fetch_ts = now
     _last_snapshot = snap
-    return {"status": "ok", "reason": "", "snapshot": snap}
+    return {"status":"ok", "reason":"", "snapshot":snap}
