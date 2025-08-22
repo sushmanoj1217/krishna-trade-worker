@@ -2,15 +2,13 @@
 # ------------------------------------------------------------
 # Stable API:
 #   - async refresh_once(*args, **kwargs) -> dict {status, reason, snapshot, provider}
-#   - get_snapshot() -> dict|None
-#   - set_snapshot(dict)
+#   - get_snapshot(), set_snapshot()
 #
-# What’s included:
-#   - GLOBAL provider discovery (best-overall, not first-hit)
-#   - Robust result extraction from provider returns
-#   - Staleness detection (expiry vs today's IST, as-of age)
-#   - HOLD / DAILY_CAP_HIT from Params_Override or env
-#   - OIΔ fallbacks (explicit cols -> abs OI diff -> dPCR -> MV -> PCR)
+# Changes in this version:
+#   - STALE logic for expiry: now *only* stale if expiry < today (IST).
+#     (Earlier 'expiry != today' was over-strict.)
+#   - For provider snapshots: compute age_sec and asof from ts if present.
+#   - Everything else (HOLD/daily_cap, OIΔ fallbacks, sheet fallback) intact.
 # ------------------------------------------------------------
 from __future__ import annotations
 import importlib, inspect, logging, re, time
@@ -54,9 +52,21 @@ def _norm_key(k: str) -> str:
     s = re.sub(r"__+", "_", s).strip("_")
     return s
 
-def _today_ist_date_str() -> str:
+def _today_ist_ymd_tuple() -> Tuple[int,int,int]:
     t = time.time() + 5.5 * 3600
-    return time.strftime("%Y-%m-%d", time.gmtime(t))
+    y = int(time.strftime("%Y", time.gmtime(t)))
+    m = int(time.strftime("%m", time.gmtime(t)))
+    d = int(time.strftime("%d", time.gmtime(t)))
+    return y, m, d
+
+def _parse_ymd(s: str) -> Optional[Tuple[int,int,int]]:
+    s = s.strip()
+    m = re.match(r"^(\d{4})-(\d{2})-(\d{2})$", s)
+    if not m: return None
+    return int(m.group(1)), int(m.group(2)), int(m.group(3))
+
+def _ymd_lt(a: Tuple[int,int,int], b: Tuple[int,int,int]) -> bool:
+    return a < b  # tuple comparison works (y,m,d)
 
 def _fmt_ist_dt(epoch_utc: Optional[int]) -> str:
     if not epoch_utc:
@@ -110,11 +120,12 @@ def _extract_asof_from_row(row: Dict[str, Any]) -> Optional[int]:
         return None
     return _parse_any_timestamp(cand)
 
-# -------- Provider discovery (GLOBAL best choice) --------
+# -------- Provider discovery (GLOBAL) --------
 _MODULE_CANDIDATES = [
+    "providers.dhan_oc",           # <-- हमारा नया provider सबसे पहले
     "analytics.oc_sources", "analytics.oc_core", "analytics.oc_backend",
     "integrations.dhan_oc", "integrations.oc_feed",
-    "providers.dhan_oc", "providers.oc",
+    "providers.oc",
     "dhan.oc", "oc.providers",
 ]
 _FN_CANDIDATE_NAMES = [
@@ -130,8 +141,8 @@ def _score_name(name: str) -> int:
     if any(k in n for k in ("snapshot","levels","oc")): return 60
     return 999
 
-def _discover_provider() -> Tuple[Optional[Callable[..., Any]], str, bool]:
-    all_cands: list[tuple[int,int,str,str,Callable[...,Any],bool]] = []
+def _discover_provider():
+    all_cands: list[tuple[int,int,str,str,Any,bool]] = []
     for mod_name in _MODULE_CANDIDATES:
         try:
             m = importlib.import_module(mod_name)
@@ -142,7 +153,6 @@ def _discover_provider() -> Tuple[Optional[Callable[..., Any]], str, bool]:
             if callable(obj):
                 sc = _score_name(nm)
                 if sc < 999:
-                    # required positional params (rough proxy for "easier" to call)
                     try:
                         sig = inspect.signature(obj)
                         req = sum(
@@ -155,16 +165,14 @@ def _discover_provider() -> Tuple[Optional[Callable[..., Any]], str, bool]:
                     all_cands.append((sc, req, mod_name, nm, obj, inspect.iscoroutinefunction(obj)))
     if not all_cands:
         return None, "", False
-    # Best by (name-score, fewest required args)
     all_cands.sort(key=lambda t: (t[0], t[1]))
-    sc, req, mod_name, nm, fn, is_coro = all_cands[0]
-    _log.info("oc_refresh: provider %s.%s selected (async=%s, req=%s, score=%s)", mod_name, nm, is_coro, req, sc)
-    return fn, f"{mod_name}.{nm}", is_coro
+    sc, req, mod, nm, fn, is_coro = all_cands[0]
+    _log.info("oc_refresh: provider %s.%s selected (async=%s req=%s score=%s)", mod, nm, is_coro, req, sc)
+    return fn, f"{mod}.{nm}", is_coro
 
 _PROVIDER_FN, _PROVIDER_NAME, _PROVIDER_IS_ASYNC = _discover_provider()
 
-async def _call_variants(fn: Callable, is_async: bool):
-    """Call provider with tolerant variants and return its raw result."""
+async def _call_variants(fn, is_async: bool):
     variants = [((),{}), ((None,),{}), (({},),{})]
     for a,k in variants:
         try:
@@ -188,24 +196,19 @@ def _looks_like_snapshot(d: Any) -> bool:
     return False
 
 def _extract_snapshot_from(ret: Any) -> Optional[dict]:
-    # direct dict
     if _looks_like_snapshot(ret): 
         return ret
-    # nested dict under common keys
     if isinstance(ret, dict):
         for key in ("snapshot","data","result"):
             v = ret.get(key)
             if _looks_like_snapshot(v): 
-                return v  # type: ignore[return-value]
-    # tuple/list: search first match
+                return v  # type: ignore
     if isinstance(ret, (tuple, list)):
         for x in ret:
             if _looks_like_snapshot(x):
                 return x
-        # tuple of (snapshot, meta)
         if ret and isinstance(ret[0], dict) and _looks_like_snapshot(ret[0]):
             return ret[0]
-    # object attribute
     for attr in ("snapshot","data","result"):
         try:
             v = getattr(ret, attr)
@@ -215,7 +218,7 @@ def _extract_snapshot_from(ret: Any) -> Optional[dict]:
             pass
     return None
 
-# -------- Sheets I/O --------
+# -------- Sheets I/O + flags (unchanged) --------
 def _open_by_key():
     if gspread is None:
         raise RuntimeError("gspread not installed")
@@ -244,7 +247,6 @@ def _open_ws_and_rows() -> Optional[List[dict]]:
         _log.warning("oc_refresh: sheets read failed: %s", e)
         return None
 
-# -------- Flags (HOLD / Daily Cap) --------
 def _truthy(x: Any) -> Optional[bool]:
     if x is None: return None
     s = str(x).strip().lower()
@@ -289,25 +291,22 @@ def _read_params_override() -> Dict[str, bool]:
             if tv is not None: out["daily_cap_hit"] = tv; break
     return out
 
-# -------- OIΔ helpers --------
+# -------- OIΔ helpers (unchanged) --------
 _CE_TOKS = ("ce",); _PE_TOKS = ("pe",); _CALL_TOKS = ("call",); _PUT_TOKS = ("put",)
 _OI_TOKS = ("oi", "openinterest", "open_interest")
 _DELTA_TOKS = ("delta", "chg", "change", "d")
-
 def _is_delta_key(norm: str, side: str) -> bool:
     side_ok = (side in norm) or (side == "ce" and any(t in norm for t in _CALL_TOKS)) or (side == "pe" and any(t in norm for t in _PUT_TOKS))
     if not side_ok: return False
     if not any(t in norm for t in _OI_TOKS): return False
     if not any(t in norm for t in _DELTA_TOKS): return False
     return True
-
 def _is_abs_oi_key(norm: str, side: str) -> bool:
     side_ok = (side in norm) or (side == "ce" and any(t in norm for t in _CALL_TOKS)) or (side == "pe" and any(t in norm for t in _PUT_TOKS))
     if not side_ok: return False
     if not any(t in norm for t in _OI_TOKS): return False
     if any(t in norm for t in _DELTA_TOKS): return False
     return True
-
 def _pick_oi_delta_any(row: Dict[str, Any], prev: Optional[Dict[str, Any]], side: str) -> Optional[float]:
     for k, v in row.items():
         nk = _norm_key(k)
@@ -348,7 +347,15 @@ def _derive_mv(pcr: Optional[float], max_pain: Optional[float], spot: Optional[f
         return "bullish" if dpcr < 0 else "bearish"
     return ""
 
-# -------- Build snapshot from Sheets --------
+# -------- Build snapshot from Sheets (unchanged except staleness rule) --------
+def _open_ws_and_rows() -> Optional[List[dict]]:
+    try:
+        ws = _open_oc_ws()
+        return ws.get_all_records()
+    except Exception as e:
+        _log.warning("oc_refresh: sheets read failed: %s", e)
+        return None
+
 def _build_from_sheet() -> Optional[dict]:
     rows = _open_ws_and_rows()
     if not rows:
@@ -393,19 +400,21 @@ def _build_from_sheet() -> Optional[dict]:
     if ce_d is None and pe_d is None and isinstance(pcr, (int,float)) and pcr != 1.0:
         pe_d, ce_d = (1.0, -1.0) if pcr > 1.0 else (-1.0, 1.0)
 
+    # Flags (sheet/env)
     flags_sheet = _read_params_override()
     flags_env = _read_override_flags()
     hold = flags_env["hold"] if flags_env.get("hold_set") else flags_sheet.get("hold", False)
     daily_cap_hit = flags_env["daily_cap_hit"] if flags_env.get("cap_set") else flags_sheet.get("daily_cap_hit", False)
 
-    # Staleness checks
+    # Staleness checks (FIXED)
     stale = False; reasons: List[str] = []
-    today = _today_ist_date_str()
-    exp_s = str(exp).strip()
-    if exp_s and exp_s != today:
-        stale = True
-        reasons.append(f"expiry {exp_s} != today {today}")
-
+    exp_s = str(exp or "").strip()
+    if exp_s:
+        exp_ymd = _parse_ymd(exp_s)
+        today = _today_ist_ymd_tuple()
+        if exp_ymd and _ymd_lt(exp_ymd, today):
+            stale = True
+            reasons.append(f"expiry {exp_s} < today {today[0]:04d}-{today[1]:02d}-{today[2]:02d}")
     max_age = int(_env("OC_MAX_SNAPSHOT_AGE_SEC") or "300")
     age_sec = None
     asof_str = ""
@@ -439,18 +448,32 @@ async def refresh_once(*args, **kwargs) -> dict:
             ret = await _call_variants(_PROVIDER_FN, _PROVIDER_IS_ASYNC)
             psnap = _extract_snapshot_from(ret)
             if isinstance(psnap, dict):
-                snap = psnap
-                # normalize provider fields
+                snap = dict(psnap)  # copy
                 snap.setdefault("source", "provider")
                 snap.setdefault("ts", int(time.time()))
+                # Compute age/asof from ts if present
+                ts = psnap.get("ts")
+                ts_epoch = None
+                if ts is not None:
+                    ts_epoch = _parse_epoch_like(ts)
+                if ts_epoch:
+                    snap["age_sec"] = max(0, int(time.time()) - int(ts_epoch))
+                    snap["asof"] = _fmt_ist_dt(ts_epoch)
+                snap.setdefault("age_sec", 0)
+                snap.setdefault("asof", snap.get("asof",""))
+
+                # expiry sanity (FIXED rule: stale only if expiry < today)
+                exp_s = str(snap.get("expiry") or "").strip()
+                if exp_s:
+                    exp_ymd = _parse_ymd(exp_s)
+                    today = _today_ist_ymd_tuple()
+                    if exp_ymd and _ymd_lt(exp_ymd, today):
+                        snap["stale"] = True
+                        snap.setdefault("stale_reason", []).append(
+                            f"expiry {exp_s} < today {today[0]:04d}-{today[1]:02d}-{today[2]:02d}"
+                        )
                 snap.setdefault("stale", False)
                 snap.setdefault("stale_reason", [])
-                # expiry sanity even for provider
-                today = _today_ist_date_str()
-                exp_s = str(snap.get("expiry") or "").strip()
-                if exp_s and exp_s != today:
-                    snap["stale"] = True
-                    snap.setdefault("stale_reason", []).append(f"expiry {exp_s} != today {today}")
         except Exception as e:
             status, reason = "provider_error", str(e)
 
