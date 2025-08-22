@@ -8,34 +8,12 @@
 #   EOD_LOOKBACK_DAYS       = 10         # distinct trade-dates to look back
 #   EOD_MIN_TRADES          = 8          # minimum trades in lookback to tune
 #   EOD_TUNER_DRY_RUN       = 0/1        # 1 => don't write, only log
+#   PERFORMANCE_SHEET_NAME  = Performance (override if your sheet is named differently)
 #
-# Sheets env (already used across project):
+# Sheets env:
 #   GOOGLE_SA_JSON, GSHEET_TRADES_SPREADSHEET_ID
 #
 # Output Sheet: Params_Override (wide row per run)
-#   Columns ensured: date, symbol, LEVEL_BUFFER, ENTRY_BAND, TARGET_MIN_POINTS,
-#                    TP_POINTS, SL_POINTS, TRAIL_TRIGGER_POINTS, TRAIL_OFFSET_POINTS,
-#                    MV_REV_CONFIRM, lookback_days, src, notes
-#
-# Heuristics (symbol-aware):
-#   Baselines (fallbacks):
-#     LEVEL_BUFFER:  NIFTY=12, BANKNIFTY=30, FINNIFTY=15
-#     ENTRY_BAND:    NIFTY=3,  BANKNIFTY=8,  FINNIFTY=4
-#     TARGET_MIN:    NIFTY=30, BANKNIFTY=80, FINNIFTY=50
-#     TP/SL:         NIFTY (40/20), BANKNIFTY(100/60), FINNIFTY(60/35)
-#     TRAIL:         TRIGGER (25/70/45), OFFSET (15/40/25)
-#     MV_REV_CONFIRM: default 2
-#
-#   Adjustments (last EOD_LOOKBACK_DAYS):
-#     - if win_rate < 40%  and avg_loss >= 0.6*TP  -> BUFFER +step; SL = max(0.8*SL, SL-5% of TP)
-#     - if win_rate > 55%  and avg_win  >= 0.7*TP  -> TP +step_small
-#     - if trades/day < 0.6 and win_rate >= 50%    -> BUFFER -step_small (more entries)
-#     - Trail trigger ≈ min( TP-5, 0.6*median_win ), offset ≈ 0.5*trigger (clamped)
-#
-# Notes:
-#   - Safe defaults when data sparse; no wild swings.
-#   - Uses tolerant numeric parsing on 'pnl_points'.
-#   - Distinct by trade date (Performance.date).
 # -----------------------------------------------------------------------------
 
 from __future__ import annotations
@@ -50,7 +28,6 @@ except Exception:
 
 log = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
-
 
 # ---------------- ENV helpers ----------------
 def _env(name: str, default: Optional[str] = None) -> Optional[str]:
@@ -74,19 +51,41 @@ REQ_HEADERS_PARAMS = [
     "MV_REV_CONFIRM","lookback_days","src","notes"
 ]
 
-def _open_ws(name: str):
+def _open_spreadsheet():
     if gspread is None:
         raise RuntimeError("gspread not installed")
     raw = _env("GOOGLE_SA_JSON"); sid = _env("GSHEET_TRADES_SPREADSHEET_ID")
     if not raw or not sid:
-        raise RuntimeError("Sheets env missing")
+        raise RuntimeError("Sheets env missing (GOOGLE_SA_JSON / GSHEET_TRADES_SPREADSHEET_ID)")
     sa = json.loads(raw)
     gc = gspread.service_account_from_dict(sa)
     sh = gc.open_by_key(sid)
+    return sh, sid
+
+def _open_ws_write(name: str):
+    """For writing: create if missing."""
+    sh, sid = _open_spreadsheet()
     try:
         return sh.worksheet(name)
     except Exception:
+        log.info("Sheet '%s' not found in %s → creating", name, sid)
         return sh.add_worksheet(title=name, rows=1000, cols=40)
+
+def _open_ws_read_must(name: str):
+    """For reading: DO NOT create silently. Raise with helpful info."""
+    sh, sid = _open_spreadsheet()
+    try:
+        return sh.worksheet(name)
+    except Exception:
+        names = [w.title for w in sh.worksheets()]
+        raise RuntimeError(f"Worksheet '{name}' not found in spreadsheet {sid}. Available: {names}")
+
+def _open_ws_read_optional(name: str):
+    sh, sid = _open_spreadsheet()
+    try:
+        return sh.worksheet(name)
+    except Exception:
+        return None
 
 def _ensure_params_headers(ws) -> List[str]:
     try:
@@ -103,19 +102,12 @@ def _ensure_params_headers(ws) -> List[str]:
     return hdr
 
 def _append_params_row(row: Dict[str, Any]) -> None:
-    ws = _open_ws("Params_Override")
+    ws = _open_ws_write("Params_Override")
     hdr = _ensure_params_headers(ws)
     vals = [row.get(h,"") for h in hdr]
     ws.append_row(vals, value_input_option="RAW")
 
-def _read_performance() -> List[Dict[str,Any]]:
-    ws = _open_ws("Performance")
-    try:
-        return ws.get_all_records() or []
-    except Exception:
-        return []
-
-# ---------------- numeric helpers ----------------
+# -------- tolerant numeric/string helpers --------
 def _num(x) -> Optional[float]:
     try:
         if x in (None,"","—"): return None
@@ -148,10 +140,11 @@ def _base(sym: str, key: str, fallback: float) -> float:
 
 # ---------------- core stats ----------------
 def _last_n_dates(records: List[Dict[str,Any]], n: int, sym: str) -> List[str]:
-    # collect distinct dates (string-compare)
     seen = []
+    S = sym.upper()
     for r in records:
-        if str(r.get("symbol","")).upper() not in ("", sym.upper()):
+        rs = str(r.get("symbol") or r.get("Symbol") or "").upper()
+        if rs and rs != S:
             continue
         d = str(r.get("date") or r.get("Date") or "").strip()
         if not d: continue
@@ -162,8 +155,10 @@ def _last_n_dates(records: List[Dict[str,Any]], n: int, sym: str) -> List[str]:
 def _filter_by(records: List[Dict[str,Any]], sym: str, dates: List[str]) -> List[Dict[str,Any]]:
     out = []
     D = set(dates)
+    S = sym.upper()
     for r in records:
-        if str(r.get("symbol","")).upper() not in ("", sym.upper()):
+        rs = str(r.get("symbol") or r.get("Symbol") or "").upper()
+        if rs and rs != S:
             continue
         d = str(r.get("date") or r.get("Date") or "").strip()
         if d in D:
@@ -175,14 +170,14 @@ def _stats(records: List[Dict[str,Any]]) -> Dict[str,Any]:
     wins = []; losses = []
     reasons = []
     for r in records:
-        p = _num(r.get("pnl_points") or r.get("PNL") or r.get("Net PnL"))
+        p = _num(r.get("pnl_points") or r.get("PNL") or r.get("Net PnL") or r.get("NetPNL"))
         if p is None: continue
         pnls.append(p)
         if p >= 0:
             wins.append(p)
         else:
             losses.append(-p)
-        er = str(r.get("exit_reason") or "").strip().upper()
+        er = str(r.get("exit_reason") or r.get("ExitReason") or "").strip().upper()
         if er:
             reasons.append(er)
     n = len(pnls)
@@ -202,7 +197,6 @@ def _stats(records: List[Dict[str,Any]]) -> Dict[str,Any]:
 
 # ---------------- tuning ----------------
 def _tune_for_symbol(sym: str, perf: List[Dict[str,Any]], lookback_days: int, min_trades: int) -> Optional[Dict[str,Any]]:
-    # baselines from ENV overrides first (if present), else hard defaults
     BUF = _sym_env(sym, "LEVEL_BUFFER", _base(sym, "BUF", 12.0))
     BAND= _sym_env(sym, "ENTRY_BAND", _base(sym, "BAND", 3.0))
     TGT = _sym_env(sym, "TARGET_MIN_POINTS", _base(sym, "TGT", 30.0))
@@ -226,33 +220,27 @@ def _tune_for_symbol(sym: str, perf: List[Dict[str,Any]], lookback_days: int, mi
     steps = STEP.get(sym.upper(), STEP["NIFTY"])
     notes = []
 
-    # 1) Buffer: widen on low WR + big losses; narrow if too few trades but decent WR
     TRADES_PER_DAY = n / max(1, len(dates))
     if wr < 40.0 and avg_loss >= 0.6*TP:
         BUF = BUF + steps["BUF_UP"]
-        # also slightly tighten SL toward 0.8*SL or -5% TP whichever gives smaller point-cut
         SL = max(0.8*SL, SL - 0.05*TP)
         notes.append("WR<40 & loss>=0.6*TP → BUF↑, SL tighten")
     elif TRADES_PER_DAY < 0.6 and wr >= 50.0:
         BUF = max(1.0, BUF - steps["BUF_DN"])
         notes.append("Low trades/day & WR≥50 → BUF↓")
 
-    # 2) TP: push a little if wins are healthy
     if wr > 55.0 and avg_win >= 0.7*TP:
         TP = TP + steps["TP_UP"]
         notes.append("WR>55 & avg_win≥0.7*TP → TP↑")
 
-    # 3) Trail: trigger near 60% of median win; offset ~50% of trigger, clamp to sensible bounds
     if med_win > 0:
         TR = min(TP - 5.0, max(0.5*SL, 0.6*med_win))
         TOF = max(0.4*TR, min(0.6*TR, TR - 5.0))
         notes.append("Trail tuned from median win")
 
-    # 4) SL sanity: do not exceed TP; keep ratio between 0.4–0.7 of TP
     SL = min(SL, 0.7*TP)
     SL = max(SL, 0.4*TP)
 
-    # Round nicelies
     def rnd(x: float) -> float:
         return round(float(x), 2)
     BUF, BAND, TGT, TP, SL, TR, TOF, MVN = map(rnd, [BUF, BAND, TGT, TP, SL, TR, TOF, MVN])
@@ -270,6 +258,34 @@ def _tune_for_symbol(sym: str, perf: List[Dict[str,Any]], lookback_days: int, mi
         notes=summary + " | " + "; ".join(notes)
     )
 
+# ---------------- read Performance (no auto-create) ----------------
+ALT_PERF_NAMES = ["Performance","performance","PERFORMANCE","Perf","Trades","TRADES"]
+
+def _read_performance() -> List[Dict[str,Any]]:
+    name = _env("PERFORMANCE_SHEET_NAME","Performance")
+    # first try explicit name (must-exist)
+    try:
+        ws = _open_ws_read_must(name)
+        rows = ws.get_all_records() or []
+        log.info("Performance sheet='%s' rows=%d", name, len(rows))
+        return rows
+    except Exception as e:
+        log.warning("Preferred sheet '%s' not found (%s). Trying fallbacks...", name, e)
+
+    # try fallbacks without creating
+    for alt in [n for n in ALT_PERF_NAMES if n != name]:
+        ws = _open_ws_read_optional(alt)
+        if ws:
+            rows = ws.get_all_records() or []
+            log.info("Performance fallback sheet='%s' rows=%d", alt, len(rows))
+            return rows
+
+    # final: show helpful info
+    sh, sid = _open_spreadsheet()
+    names = [w.title for w in sh.worksheets()]
+    raise RuntimeError(f"Performance sheet not found. Tried: {[name]+[n for n in ALT_PERF_NAMES if n!=name]}. "
+                       f"Available in {sid}: {names}. Set PERFORMANCE_SHEET_NAME=... if needed.")
+
 # ---------------- main ----------------
 def run():
     symbols_csv = _env("EOD_TUNE_SYMBOLS") or _env("OC_SYMBOL","NIFTY")
@@ -280,7 +296,7 @@ def run():
 
     perf = _read_performance()
     if not perf:
-        raise RuntimeError("Performance sheet empty or not accessible")
+        raise RuntimeError("Performance sheet is present but has no rows. Run backtest or live first.")
 
     today = _today_ist_str()
     wrote = 0
