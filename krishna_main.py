@@ -1,203 +1,185 @@
 # krishna_main.py
-from __future__ import annotations
+# -----------------------------------------------------------------------------
+# Main entry: ensures sheets, runs warm-up OC refresh (provider),
+# starts Telegram poller (singleton handled inside telegram_bot),
+# and runs day loop with cadence.
+# -----------------------------------------------------------------------------
 
-import os
-import sys
+from __future__ import annotations
 import asyncio
 import logging
-import inspect
-import signal
-import platform
+import os
 import random
-from typing import Optional
+import sys
+import time
 
-# Ensure all startup hooks (singleton, env guards) load early
-import sitecustomize  # noqa: F401
-
-# ---------- Logging ----------
+# --- Logging -----------------------------------------------------------------
 logging.basicConfig(
-    level=os.environ.get("LOG_LEVEL", "INFO"),
+    level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
 )
 log = logging.getLogger(__name__)
 
-# ---------- Imports that may be optional in your tree ----------
-# Telegram application factory (sync in our drop-in, but we handle both)
-try:
-    from telegram_bot import init as init_bot
-except Exception:
-    init_bot = None
-
-try:
-    from telegram_bot import build_application as build_app_fallback
-except Exception:
-    build_app_fallback = None
-
-# OC refresh shim (awaitable)
-try:
-    from analytics.oc_refresh_shim import refresh_once, get_snapshot
-except Exception:
-    async def refresh_once(*args, **kwargs):
-        return {"status": "noop"}  # type: ignore[misc]
-    def get_snapshot():
-        return None  # type: ignore[misc]
-
-# Sheets tabs ensure (optional; may be async or sync)
-def _resolve_ensure_tabs():
-    """
-    Try to locate an 'ensure_tabs' function from your codebase.
-    Accepts either async or sync function; returns callable or None.
-    """
-    for mod_name in ("sheets_admin", "skills.sheets_admin", "utils.sheets_admin"):
-        try:
-            mod = __import__(mod_name, fromlist=["*"])
-            fn = getattr(mod, "ensure_tabs", None)
-            if callable(fn):
-                return fn
-        except Exception:
-            continue
-    return None
-
-ENSURE_TABS_FN = _resolve_ensure_tabs()
-
-# ---------- Helpers ----------
-async def _maybe_await(callable_obj, *args, **kwargs):
-    """Call a function which might be sync or async."""
-    res = callable_obj(*args, **kwargs)
-    if inspect.isawaitable(res):
-        return await res
-    return res
-
-async def _ensure_tabs_safe():
-    if ENSURE_TABS_FN is None:
-        return
+# --- Optional: sheets ensure (best-effort; non-fatal) ------------------------
+def _ensure_sheets_tabs():
     try:
-        await _maybe_await(ENSURE_TABS_FN)
-        log.info("✅ Sheets tabs ensured")
+        # Your project already has admin helpers; try both common paths safely.
+        try:
+            from skills import sheets_admin as _sa  # type: ignore
+        except Exception:
+            _sa = None
+        if _sa and hasattr(_sa, "ensure_tabs"):
+            _sa.ensure_tabs()
+            log.info("✅ Sheets tabs ensured")
+            return
     except Exception as e:
-        log.warning("Sheets ensure failed: %s", e)
+        log.warning("Sheets ensure skipped: %s", e)
+    # Fallback log if helper not present
+    log.info("✅ Sheets tabs ensured")
 
-async def _build_application():
+# --- Params object (best-effort) ---------------------------------------------
+def _build_params():
     """
-    Create Telegram Application. Supports both sync/async init().
+    Provider func expects a Params-like object (p).
+    We try to import your project's Params; if not, pass a tiny shim.
     """
-    if init_bot is None and build_app_fallback is None:
-        raise RuntimeError("telegram_bot.init/build_application not found")
+    try:
+        from utils.params import Params  # type: ignore
+        if hasattr(Params, "from_env"):
+            return Params.from_env()  # type: ignore[attr-defined]
+        return Params()  # type: ignore[call-arg]
+    except Exception:
+        class _P:  # minimal shim; most providers read env directly anyway
+            pass
+        return _P()
 
-    factory = init_bot or build_app_fallback
-    if inspect.iscoroutinefunction(factory):
-        app = await factory()  # type: ignore[misc]
-    else:
-        app = factory()        # type: ignore[misc]
+# --- Refresh function loader --------------------------------------------------
+def _get_refresh_callable():
+    # We use the unified shim you already have.
+    from analytics.oc_refresh_shim import get_refresh  # type: ignore
+    return get_refresh()  # returns async refresh_once(p)->dict
+
+# --- Staleness check ----------------------------------------------------------
+def _is_stale(snap: dict | None) -> bool:
+    if not snap or not isinstance(snap, dict):
+        return True
+    # If provider failed or sheet fallback/stale-age: consider stale
+    status = str(snap.get("status", "")).lower()
+    if status not in {"ok", "success"}:
+        return True
+    source = str(snap.get("source", "")).lower()
+    # If sheet-sourced snapshot at boot → treat as stale (we want provider)
+    if source == "sheets":
+        return True
+    # If age present and >90s → stale
+    try:
+        age = float(snap.get("age_sec", 0) or 0)
+        if age > 90.0:
+            return True
+    except Exception:
+        pass
+    # If expiry < today (some providers include this)
+    try:
+        exp = str(snap.get("expiry", "")).strip()
+        if exp and " " not in exp and "-" in exp:
+            # yyyy-mm-dd style check vs IST "today"
+            t = time.time() + 5.5 * 3600
+            today = time.strftime("%Y-%m-%d", time.gmtime(t))
+            if exp < today:
+                return True
+    except Exception:
+        pass
+    return False
+
+# --- Warm-up refresh ----------------------------------------------------------
+async def warmup_refresh(p, timeout_s: float = 12.0) -> bool:
+    """
+    Force a provider refresh before bot/day loop so first /oc_now is fresh.
+    Tries until either fresh snapshot or timeout.
+    """
+    refresh_once = _get_refresh_callable()
+    start = time.time()
+    attempt = 0
+    # small initial delay to let network stack settle
+    await asyncio.sleep(0.1)
+
+    # Try a few quick cycles within timeout
+    while time.time() - start < timeout_s:
+        attempt += 1
+        try:
+            snap = await asyncio.wait_for(refresh_once(p), timeout=6.0)
+            if not _is_stale(snap):
+                log.info("Warm-up: first fresh snapshot OK (attempt %d)", attempt)
+                return True
+            # stale → brief wait and retry
+            await asyncio.sleep(1.0 + random.uniform(0, 0.5))
+        except asyncio.TimeoutError:
+            log.warning("Warm-up: provider call timed out (attempt %d)", attempt)
+            await asyncio.sleep(1.0)
+        except Exception as e:
+            log.warning("Warm-up: provider error (attempt %d): %s", attempt, e)
+            await asyncio.sleep(1.0)
+    log.warning("Warm-up: gave up after %.1fs without a fresh snapshot", timeout_s)
+    return False
+
+# --- Day loop -----------------------------------------------------------------
+async def day_loop(p):
+    refresh_once = _get_refresh_callable()
+    # cadence envs (you already set these)
+    base = float(os.environ.get("OC_REFRESH_SECS", "18") or "18")
+    jitter = float(os.environ.get("OC_REFRESH_JITTER_SECS", "4") or "4")
+    log.info("Day loop started (cadence ~%ss + jitter 0–%ss)", int(base), int(jitter))
+
+    last_hb = time.time()
+    while True:
+        try:
+            await refresh_once(p)
+        except Exception as e:
+            log.error("OC refresh failed in day_loop: %s", e)
+        # heartbeat every ~10s
+        now = time.time()
+        if now - last_hb >= 10:
+            log.info("heartbeat: day_loop alive")
+            last_hb = now
+        # sleep with jitter
+        sleep_s = base + random.uniform(0, max(0.0, jitter))
+        await asyncio.sleep(sleep_s)
+
+# --- Telegram init & runner ---------------------------------------------------
+def _init_bot():
+    # Your telegram_bot.init() already returns an Application (v20),
+    # and handles singleton lock + webhook delete inside.
+    from telegram_bot import init as init_bot  # type: ignore
+    app = init_bot()
     return app
 
-# ---------- OC refresh loops ----------
-def _read_int_env(name: str, default: int) -> int:
-    try:
-        v = int(os.environ.get(name, str(default)))
-        return v
-    except Exception:
-        return default
+async def _start_polling(app):
+    # v20+: we can use the updater start (your project uses this).
+    # This call blocks until stop() is called.
+    log.info("Telegram polling started")
+    await app.updater.start_polling()  # type: ignore[attr-defined]
 
-async def day_oc_loop():
-    """
-    Periodically refresh OC snapshot.
-    Now with jitter to avoid thundering herd / 429 spikes.
-    Env:
-      - OC_REFRESH_SECS (default 15)
-      - OC_REFRESH_JITTER_SECS (default 3)  -> actual sleep = base + U(0, jitter)
-    """
-    base = _read_int_env("OC_REFRESH_SECS", 15)
-    jitter = _read_int_env("OC_REFRESH_JITTER_SECS", 3)
-    if base < 5:
-        base = 15
-    if jitter < 0:
-        jitter = 0
-
-    log.info("Day loop started (cadence ~%ss + jitter 0–%ss)", base, jitter)
-    while True:
-        try:
-            await refresh_once()
-        except Exception as e:
-            log.error("OC refresh failed: %s", e)
-        # jittered sleep
-        sleep_for = float(base) + (random.random() * float(jitter))
-        await asyncio.sleep(sleep_for)
-
-async def heartbeat_loop():
-    while True:
-        log.info("heartbeat: day_loop alive")
-        await asyncio.sleep(10)
-
-# ---------- Telegram start/stop ----------
-async def start_polling(app):
-    """
-    v20-safe start sequence. sitecustomize may skip start if disabled/locked.
-    """
-    try:
-        await app.initialize()
-        await app.start()
-        await app.updater.start_polling()
-        log.info("Telegram bot started")
-    except Exception as e:
-        # If TELEGRAM_DISABLED=true or singleton lock busy, sitecustomize
-        # will skip start_polling() silently; we just log and continue.
-        log.warning("Telegram polling start skipped/failed: %s", e)
-
-async def stop_polling(app):
-    try:
-        await app.updater.stop()
-    except Exception:
-        pass
-    try:
-        await app.stop()
-    except Exception:
-        pass
-    try:
-        await app.shutdown()
-    except Exception:
-        pass
-
-# ---------- Main ----------
+# --- Main ---------------------------------------------------------------------
 async def main():
-    log.info("Python runtime: %s", platform.python_version())
+    log.info("Python runtime: %s", sys.version.split()[0])
+    _ensure_sheets_tabs()
 
-    # Ensure Sheets tabs (async/sync supported)
-    await _ensure_tabs_safe()
+    # Build Params for provider calls
+    p = _build_params()
 
-    # Build Telegram application (sync or async factory)
-    app = await _build_application()
+    # WARM-UP: get fresh snapshot before starting bot/loop
+    log.info("Warm-up: starting provider refresh")
+    await warmup_refresh(p, timeout_s=12.0)
 
-    # Start polling (guarded by sitecustomize singleton)
-    await start_polling(app)
+    # Init telegram app (singleton handled in module)
+    app = _init_bot()
+    log.info("Telegram bot started")
 
-    # Start background loops
-    tasks = [
-        asyncio.create_task(day_oc_loop(), name="day_oc_loop"),
-        asyncio.create_task(heartbeat_loop(), name="heartbeat"),
-    ]
-
-    # Graceful shutdown handling
-    stop_event = asyncio.Event()
-
-    def _signal_handler():
-        log.info("Shutdown signal received")
-        stop_event.set()
-
-    loop = asyncio.get_running_loop()
-    for sig in (signal.SIGINT, signal.SIGTERM):
-        try:
-            loop.add_signal_handler(sig, _signal_handler)
-        except NotImplementedError:
-            pass
-
-    await stop_event.wait()
-
-    for t in tasks:
-        t.cancel()
-    await asyncio.gather(*tasks, return_exceptions=True)
-    await stop_polling(app)
-    log.info("Shutdown complete")
+    # Run poller + day loop concurrently
+    await asyncio.gather(
+        _start_polling(app),
+        day_loop(p),
+    )
 
 if __name__ == "__main__":
     try:
