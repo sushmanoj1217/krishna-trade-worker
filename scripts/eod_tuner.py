@@ -7,6 +7,10 @@
 #   EOD_TUNE_SYMBOLS, EOD_LOOKBACK_DAYS, EOD_MIN_TRADES, EOD_TUNER_DRY_RUN
 #   EOD_TUNER_DEBUG=1  -> raw→parsed PNL + fallback source logs
 #   PERFORMANCE_SHEET_NAME, GOOGLE_SA_JSON, GSHEET_TRADES_SPREADSHEET_ID
+#   PERF_PNL_COL=...   -> (optional) exact header OR 1-based column index for PnL
+#   PERF_DATE_COL=...  -> (optional) exact header OR 1-based index for Date
+#   PERF_SYMBOL_COL=...-> (optional) exact header OR 1-based index for Symbol
+#   PERF_SKIP_SUMMARY=1-> (default on) skip rows that look like summaries/totals
 # -----------------------------------------------------------------------------
 
 from __future__ import annotations
@@ -109,25 +113,21 @@ def _is_formula(x: Any) -> bool:
         return False
 
 def _num(x) -> Optional[float]:
-    """Parse numbers from messy strings; ignore formulas; parentheses = negative only if pure numeric inside."""
+    """Parse numbers; ignore formulas; parentheses negative only if whole string is '(number)'."""
     if x in (None, "", "—"):
         return None
     s = str(x).strip()
     if _is_formula(s):
         return None  # skip formulas entirely
-
     for uni in _MINUSES:
         s = s.replace(uni, "-")
     s = s.replace(",", "")
-
-    # accounting negative only if whole string is '(number)'
     m_full = _FULL_PAREN_NUM.match(s)
     if m_full:
         try:
             return -float(m_full.group(1))
         except Exception:
             return None
-
     m = _NUM_RE.search(s)
     if not m:
         return None
@@ -182,8 +182,10 @@ SYMBOL_CANDS = ["symbol","Symbol","underlying","Underlying","index","Index","ins
 PNL_CANDS    = ["pnl_points","PNL","Net PnL","NetPNL","Profit","Net P&L"]
 EXIT_CANDS   = ["exit_reason","ExitReason","Exit Reason","reason","Reason"]
 
+_SUMMARY_CELL_HINT = re.compile(r"(summary|wins|losses|average|avg|total|count)", re.I)
+
 def _dupe_safe_from_ws(ws) -> List[Dict[str,Any]]:
-    """Non-unique headers safe reader: maps row to dict, keeps raw columns too."""
+    """Non-unique headers safe reader: maps row to dict, keeps raw cols too."""
     vals = ws.get_all_values()
     if not vals or len(vals) < 2:
         return []
@@ -293,30 +295,66 @@ def _read_performance() -> List[Dict[str,Any]]:
     raise RuntimeError(f"Performance sheet not found/usable. Tried: {[pref]+[n for n in ALT_PERF_NAMES if n!=pref]}. "
                        f"Available in {sid}: {names}. Set PERFORMANCE_SHEET_NAME=... if needed.")
 
+# ---------------- helpers for explicit column mapping & summary-skip -------------
+def _col_from_env(row: Dict[str,Any], header: List[str], env_name: str) -> Optional[Any]:
+    """Fetch cell using exact header or 1-based index if provided via env."""
+    key = _env(env_name)
+    if not key:
+        return None
+    # numeric index?
+    if key.isdigit():
+        idx = int(key) - 1
+        if 0 <= idx < len(header):
+            h = header[idx]
+            return row.get(h)
+        return None
+    # else by header (case-insensitive)
+    for h in header:
+        if h.strip().lower() == key.strip().lower():
+            return row.get(h)
+    # also allow direct lookup if dupe-safe already stored exact key
+    return row.get(key)
+
+def _is_summary_row(row: Dict[str,Any]) -> bool:
+    if _env("PERF_SKIP_SUMMARY","1") not in {"0","no","false"}:
+        # if any header key is SUMMARY-ish or any cell contains summary-ish tokens
+        for k, v in row.items():
+            if isinstance(k, str) and _SUMMARY_CELL_HINT.search(k):
+                return True
+            if isinstance(v, str) and _SUMMARY_CELL_HINT.search(v):
+                return True
+    return False
+
 # ---------------- PNL fallback & stats ----------------
 _PNL_KEY_HINT = re.compile(r"(pnl|p&l|profit|points?)", re.I)
-_BAD_COL_HINT = re.compile(r"(date|time|qty|quantity|ltp|price|spot|level|s1|s2|r1|r2|mp|pcr|ce|pe|oi|open|close|entry|exit|value)", re.I)
+_BAD_COL_HINT = re.compile(r"(date|time|qty|quantity|ltp|price|spot|level|s1|s2|r1|r2|mp|pcr|ce|pe|oi|open|close|entry|exit|value|wins|losses|average|total|summary)", re.I)
 
 def _find_pnl_in_row(row: Dict[str,Any]) -> Tuple[Optional[float], Optional[str], Optional[str]]:
-    """Try multiple ways to find a PNL number in a row dict. Returns (value, key, reason)."""
-    # 0) quick reject if row is formula-heavy (most non-empty cells start with '=')
-    non_empty = [(k, v) for k, v in row.items() if isinstance(v, str) and v.strip()]
-    if non_empty:
-        formula_cells = sum(1 for _, v in non_empty if _is_formula(v))
-        if formula_cells >= max(2, int(0.6 * len(non_empty))):
-            return None, None, "row_formula_heavy"
+    """Return (value, key, reason). Obeys PERF_PNL_COL if set; skips formulas/summary rows; zero=allowed but neutral."""
+    # summary rows → ignore
+    if _is_summary_row(row):
+        return None, None, "summary_row"
 
-    # 1) explicit keys first (but skip formulas)
+    # explicit column via env
+    pnl_env = _env("PERF_PNL_COL")
+    if pnl_env:
+        header = [k for k in row.keys() if isinstance(k,str)]
+        raw = _col_from_env(row, header, "PERF_PNL_COL")
+        if not _is_formula(raw):
+            p = _num(raw)
+            if p is not None:
+                return p, pnl_env, "env_col"
+        # if env specified but unusable, do NOT fallback silently — still try heuristics
+    # 1) explicit keys
     for k in ["pnl_points","PNL","Net PnL","NetPNL","Profit","Net P&L"]:
         if k in row:
             raw = row.get(k)
-            if _is_formula(raw):
+            if _is_formula(raw): 
                 continue
             p = _num(raw)
             if p is not None:
                 return p, k, "explicit_key"
-
-    # 2) any header containing pnl/p&l/profit/points (skip formulas)
+    # 2) header hints
     for k, v in row.items():
         if isinstance(k, str) and _PNL_KEY_HINT.search(k):
             if _is_formula(v):
@@ -324,8 +362,9 @@ def _find_pnl_in_row(row: Dict[str,Any]) -> Tuple[Optional[float], Optional[str]
             p = _num(v)
             if p is not None:
                 return p, k, "hint_key"
-
-    # 3) last resort: scan all columns for first reasonable numeric that isn't an obviously bad column or formula
+    # 3) last resort: any non-bad column, non-formula numeric (prefer non-zero)
+    best_zero = None
+    best_zero_key = None
     for k, v in row.items():
         if not isinstance(k, str):
             continue
@@ -334,9 +373,14 @@ def _find_pnl_in_row(row: Dict[str,Any]) -> Tuple[Optional[float], Optional[str]
         if _is_formula(v):
             continue
         p = _num(v)
-        if p is not None:
-            return p, k, "any_col"
-
+        if p is None:
+            continue
+        if p != 0:
+            return p, k, "any_col_nonzero"
+        if best_zero is None:  # remember a zero only if nothing better
+            best_zero, best_zero_key = p, k
+    if best_zero is not None:
+        return best_zero, best_zero_key, "any_col_zero"
     return None, None, "not_found"
 
 def _stats(records: List[Dict[str,Any]]) -> Dict[str,Any]:
@@ -345,15 +389,15 @@ def _stats(records: List[Dict[str,Any]]) -> Dict[str,Any]:
     dbg_shown = 0
     for r in records:
         p, src, why = _find_pnl_in_row(r)
-        if debug and dbg_shown < 12:
+        if debug and dbg_shown < 20:
             raw = (r.get(src) if src else None)
             log.info("[DBG] PNL pick: src=%r why=%s raw=%r → parsed=%r", src, why, raw, p)
             dbg_shown += 1
         if p is None:
             continue
         pnls.append(p)
-        if p >= 0: wins.append(p)
-        else:      losses.append(-p)
+        if p > 0:   wins.append(p)      # zero = neutral
+        elif p < 0: losses.append(-p)
         er = str(r.get("exit_reason") or r.get("ExitReason") or r.get("Exit Reason") or r.get("reason") or r.get("Reason") or "").strip().upper()
         if er: reasons.append(er)
 
