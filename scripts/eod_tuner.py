@@ -11,7 +11,7 @@
 
 from __future__ import annotations
 import os, json, time, logging, statistics, re
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 try:
     import gspread  # type: ignore
@@ -100,28 +100,39 @@ def _append_params_row(row: Dict[str, Any]) -> None:
 # -------- tolerant numeric/string helpers --------
 _MINUSES = ["\u2212", "–", "—"]   # unicode minus/dashes
 _NUM_RE  = re.compile(r"[-+]?\d+(?:\.\d+)?")
+_FULL_PAREN_NUM = re.compile(r"^\(\s*([-+]?\d+(?:\.\d+)?)\s*\)$")  # like (12.5)
+
+def _is_formula(x: Any) -> bool:
+    try:
+        return isinstance(x, str) and x.strip().startswith("=")
+    except Exception:
+        return False
 
 def _num(x) -> Optional[float]:
-    """Parse numbers from messy strings: '₹1,234.5', '+35pts', '(12.5)', '−14' etc."""
+    """Parse numbers from messy strings; ignore formulas; parentheses = negative only if pure numeric inside."""
     if x in (None, "", "—"):
         return None
-    s = str(x)
+    s = str(x).strip()
+    if _is_formula(s):
+        return None  # skip formulas entirely
+
     for uni in _MINUSES:
         s = s.replace(uni, "-")
-    s = s.replace(",", "").strip()
-    neg = False
-    if "(" in s and ")" in s:
-        inside = s[s.find("(")+1 : s.rfind(")")]
-        s = inside
-        neg = True
+    s = s.replace(",", "")
+
+    # accounting negative only if whole string is '(number)'
+    m_full = _FULL_PAREN_NUM.match(s)
+    if m_full:
+        try:
+            return -float(m_full.group(1))
+        except Exception:
+            return None
+
     m = _NUM_RE.search(s)
     if not m:
         return None
     try:
-        val = float(m.group(0))
-        if neg:
-            val = -abs(val)
-        return val
+        return float(m.group(0))
     except Exception:
         return None
 
@@ -284,39 +295,59 @@ def _read_performance() -> List[Dict[str,Any]]:
 
 # ---------------- PNL fallback & stats ----------------
 _PNL_KEY_HINT = re.compile(r"(pnl|p&l|profit|points?)", re.I)
-_BAD_COL_HINT = re.compile(r"(date|time|qty|quantity|ltp|price|spot|level|s1|s2|r1|r2|mp|pcr|ce|pe|oi|open|close|entry|exit)", re.I)
+_BAD_COL_HINT = re.compile(r"(date|time|qty|quantity|ltp|price|spot|level|s1|s2|r1|r2|mp|pcr|ce|pe|oi|open|close|entry|exit|value)", re.I)
 
-def _find_pnl_in_row(row: Dict[str,Any]) -> tuple[Optional[float], Optional[str]]:
-    """Try multiple ways to find a PNL number in a row dict."""
-    # 1) explicit keys
+def _find_pnl_in_row(row: Dict[str,Any]) -> Tuple[Optional[float], Optional[str], Optional[str]]:
+    """Try multiple ways to find a PNL number in a row dict. Returns (value, key, reason)."""
+    # 0) quick reject if row is formula-heavy (most non-empty cells start with '=')
+    non_empty = [(k, v) for k, v in row.items() if isinstance(v, str) and v.strip()]
+    if non_empty:
+        formula_cells = sum(1 for _, v in non_empty if _is_formula(v))
+        if formula_cells >= max(2, int(0.6 * len(non_empty))):
+            return None, None, "row_formula_heavy"
+
+    # 1) explicit keys first (but skip formulas)
     for k in ["pnl_points","PNL","Net PnL","NetPNL","Profit","Net P&L"]:
         if k in row:
-            p = _num(row.get(k))
+            raw = row.get(k)
+            if _is_formula(raw):
+                continue
+            p = _num(raw)
             if p is not None:
-                return p, k
-    # 2) any header containing pnl/p&l/profit/points
-    for k,v in row.items():
-        if isinstance(k,str) and _PNL_KEY_HINT.search(k):
+                return p, k, "explicit_key"
+
+    # 2) any header containing pnl/p&l/profit/points (skip formulas)
+    for k, v in row.items():
+        if isinstance(k, str) and _PNL_KEY_HINT.search(k):
+            if _is_formula(v):
+                continue
             p = _num(v)
             if p is not None:
-                return p, k
-    # 3) last resort: scan all columns for first reasonable numeric that isn't obviously a bad column
-    for k,v in row.items():
-        if isinstance(k,str) and _BAD_COL_HINT.search(k):
+                return p, k, "hint_key"
+
+    # 3) last resort: scan all columns for first reasonable numeric that isn't an obviously bad column or formula
+    for k, v in row.items():
+        if not isinstance(k, str):
+            continue
+        if _BAD_COL_HINT.search(k):
+            continue
+        if _is_formula(v):
             continue
         p = _num(v)
         if p is not None:
-            return p, k
-    return None, None
+            return p, k, "any_col"
+
+    return None, None, "not_found"
 
 def _stats(records: List[Dict[str,Any]]) -> Dict[str,Any]:
     debug = _env("EOD_TUNER_DEBUG","0") in {"1","true","on","yes"}
     pnls = []; wins = []; losses = []; reasons = []
     dbg_shown = 0
     for r in records:
-        p, src = _find_pnl_in_row(r)
-        if debug and dbg_shown < 8:
-            log.info("[DBG] PNL pick: src=%r raw=%r → parsed=%r", src, (r.get(src) if src else None), p)
+        p, src, why = _find_pnl_in_row(r)
+        if debug and dbg_shown < 12:
+            raw = (r.get(src) if src else None)
+            log.info("[DBG] PNL pick: src=%r why=%s raw=%r → parsed=%r", src, why, raw, p)
             dbg_shown += 1
         if p is None:
             continue
@@ -356,7 +387,7 @@ def _tune_for_symbol(sym: str, perf: List[Dict[str,Any]], lookback_days: int, mi
     TOF = _sym_env(sym, "TRAIL_OFFSET_POINTS",  _base(sym, "TR_OFF", 15.0))
     MVN = float(_env("MV_REV_CONFIRM","2") or "2")
 
-    # Dates filter (kept simple; if no dates, uses ALL)
+    # Dates filter (simple; if no dates, uses ALL)
     def _last_n_dates(records: List[Dict[str,Any]], n: int, sym: str) -> List[str]:
         seen = []
         S = sym.upper()
