@@ -1,230 +1,112 @@
 # analytics/oc_refresh_shim.py
-# ------------------------------------------------------------
-# Safe async shim around analytics.oc_refresh
-# - Always exposes `async refresh_once(...)` (awaitable) even if target is sync
-# - Accepts arg variants: (), (None,), ({},)
-# - Extracts a snapshot from the target's return value (dict/tuple/list)
-# - Publishes snapshot to:
-#     1) analytics.oc_refresh.set_snapshot / update_snapshot if available
-#     2) shim-local _LAST_SNAPSHOT (fallback)
-# - `get_snapshot()` first tries oc_refresh.get_snapshot / accessors; else returns _LAST_SNAPSHOT
-# ------------------------------------------------------------
+# -----------------------------------------------------------------------------
+# OC refresh shim that provides:
+#   - Dynamic function resolution (env overrides)
+#   - **Single-flight** guard (no overlapping refresh calls)
+#   - Last-snapshot caching (serve while refresh inflight)
+#   - Tiny helpers for market-hours checks (optional for callers)
+#
+# Default chain:
+#   OC_REFRESH_FUNC (env)  -> dotted async(p)->dict
+#   else DHAN_PROVIDER_FUNC-> dotted async(p)->dict
+#   else providers.dhan_oc.refresh_once
+# -----------------------------------------------------------------------------
+
 from __future__ import annotations
-import importlib
-import inspect
-import logging
-import asyncio
-from typing import Any, Callable, Optional, Tuple
+import asyncio, importlib, logging, os, time
+from typing import Any, Awaitable, Callable, Dict, Optional
 
-_log = logging.getLogger(__name__)
+log = logging.getLogger(__name__)
 
-# ------- Module discovery -------
-try:
-    _m = importlib.import_module("analytics.oc_refresh")
-except Exception as e:
-    _log.exception("oc_refresh_shim: failed to import analytics.oc_refresh: %s", e)
-    _m = None
+def _env(name: str, default: Optional[str]=None) -> Optional[str]:
+    v = os.environ.get(name)
+    return v.strip() if v and str(v).strip() else default
 
-# ------- Snapshot storage (fallback) -------
-_LAST_SNAPSHOT: Any = None
+def _now_ist() -> float:
+    return time.time() + 5.5 * 3600
 
-# ------- Helpers: score/select a callable -------
-def _required_positional_count(fn: Callable) -> int:
-    try:
-        sig = inspect.signature(fn)
-    except Exception:
-        return 0
-    req = 0
-    for p in sig.parameters.values():
-        if p.kind in (p.POSITIONAL_ONLY, p.POSITIONAL_OR_KEYWORD) and p.default is inspect._empty:
-            req += 1
-    return req
+def _now_ist_str() -> str:
+    return time.strftime("%Y-%m-%d %H:%M:%S IST", time.gmtime(_now_ist()))
 
-def _score_name(name: str) -> int:
-    n = name.lower()
-    order = [
-        "refresh_once",
-        "refresh_now",
-        "run_once",
-        "refresh",
-        "do_refresh", "refresh_one", "do_oc_refresh",
-        "refresh_tick", "refresh_snapshot", "oc_refresh",
-        "update_levels", "fetch_levels",
-    ]
-    if n in order:
-        return order.index(n)
-    if "refresh" in n:
-        return 50
-    if any(k in n for k in ("snapshot", "tick", "levels", "oc")):
-        return 60
-    return 999
-
-def _pick_refresh_callable(mod) -> Tuple[Optional[Callable[..., Any]], str, bool]:
-    cands = []
-    for name in dir(mod):
-        obj = getattr(mod, name, None)
-        if callable(obj):
-            sc = _score_name(name)
-            if sc < 999:
-                cands.append((sc, _required_positional_count(obj), name, obj, inspect.iscoroutinefunction(obj)))
-    if not cands:
-        return None, "", False
-    cands.sort(key=lambda t: (t[0], t[1]))  # preference, then fewer required args
-    _, _req, nm, fn, is_coro = cands[0]
-    return fn, nm, is_coro
-
-_FN, _FN_name, _FN_is_async = (None, "", False)
-if _m is not None:
-    _FN, _FN_name, _FN_is_async = _pick_refresh_callable(_m)
-    if _FN:
-        _log.info("oc_refresh_shim: selected %s (async=%s)", _FN_name, _FN_is_async)
-    else:
-        _log.error("oc_refresh_shim: NO suitable refresh function found in analytics.oc_refresh")
-
-# ------- Snapshot publishing / extraction -------
-def _try_call_setters(snap: Any) -> None:
-    """Push snapshot into oc_refresh module if it provides a setter, else keep local."""
-    global _LAST_SNAPSHOT
-    _LAST_SNAPSHOT = snap
-    if _m is None:
-        return
-    for setter_name in ("set_snapshot", "update_snapshot", "publish_snapshot", "store_snapshot"):
-        setter = getattr(_m, setter_name, None)
-        if callable(setter):
-            try:
-                setter(snap)
-                _log.debug("oc_refresh_shim: snapshot published via %s()", setter_name)
-                return
-            except Exception:
-                _log.warning("oc_refresh_shim: %s() raised; keeping local snapshot", setter_name)
-
-def _looks_like_snapshot(d: Any) -> bool:
-    if not isinstance(d, dict):
+# ------------ market hours helper (09:15–15:30 IST; Fri special same) ----------
+def is_market_hours(ts: Optional[float]=None) -> bool:
+    t = ts if ts is not None else _now_ist()
+    lt = time.gmtime(t)
+    # lt.tm_wday: Mon=0 … Sun=6
+    if lt.tm_wday >= 5:   # Sat/Sun
         return False
-    keys = set(k.lower() for k in d.keys())
-    # Heuristics: presence of spot + any level-ish keys OR symbol/expiry
-    if "spot" in keys and ({"s1","s2","r1","r2"} & keys or "levels" in keys):
-        return True
-    if "symbol" in keys and "expiry" in keys and "spot" in keys:
-        return True
-    return False
+    hh = lt.tm_hour; mm = lt.tm_min
+    # Convert IST gmtime already
+    minutes = hh*60 + mm
+    open_m  = 9*60 + 15
+    close_m = 15*60 + 30
+    return open_m <= minutes <= close_m
 
-def _extract_snapshot(ret: Any) -> Optional[Any]:
-    """Extract snapshot from various return formats."""
-    # direct dict
-    if _looks_like_snapshot(ret):
-        return ret
-    # tuple/list → try each element
-    if isinstance(ret, (tuple, list)):
-        for x in ret:
-            if _looks_like_snapshot(x):
-                return x
-    # object with attribute 'snapshot' or 'data'
-    for attr in ("snapshot", "data"):
-        if hasattr(ret, attr):
-            try:
-                val = getattr(ret, attr)
-                if _looks_like_snapshot(val):
-                    return val
-            except Exception:
-                pass
-    return None
+# ------------ function resolution --------------------------------------------
+def _resolve_refresh_func() -> Callable[..., Awaitable[Dict[str, Any]]]:
+    # priority: OC_REFRESH_FUNC → DHAN_PROVIDER_FUNC → providers.dhan_oc.refresh_once
+    path = _env("OC_REFRESH_FUNC")
+    if not path:
+        path = _env("DHAN_PROVIDER_FUNC")
+        if not path:
+            path = "providers.dhan_oc.refresh_once"
+    mod_path, _, fn_name = path.rpartition(".")
+    if not mod_path:
+        raise ImportError(f"OC refresh func invalid: {path!r}")
+    mod = importlib.import_module(mod_path)
+    fn = getattr(mod, fn_name, None)
+    if fn is None:
+        raise ImportError(f"{path}: function not found")
+    if not asyncio.iscoroutinefunction(fn):
+        raise TypeError(f"{path}: must be async def")
+    log.info("oc_refresh_shim: selected %s (async=True)", fn_name)
+    return fn
 
-def _build_variants(args: tuple, kwargs: dict) -> list[tuple]:
-    variants: list[tuple] = []
-    if args or kwargs:
-        variants.append(("caller", args, kwargs))
-    variants.extend([
-        ("zero", tuple(), {}),
-        ("none", (None,), {}),
-        ("dict", ({},), {}),
-    ])
-    return variants
+# Global single-flight state
+_lock = asyncio.Lock()
+_inflight: Optional[asyncio.Task] = None
+_last_snapshot: Optional[Dict[str, Any]] = None
+_last_ts: Optional[float] = None
 
-async def _call_async(fn: Callable, args: tuple, kwargs: dict) -> Any:
-    res = fn(*args, **kwargs)
-    if inspect.isawaitable(res):
-        return await res
-    return res
+async def _do_refresh(p, fn: Callable[..., Awaitable[Dict[str, Any]]]) -> Dict[str, Any]:
+    global _last_snapshot, _last_ts
+    snap = await fn(p)
+    _last_snapshot = snap
+    _last_ts = time.time()
+    return snap
 
-# ------- Public API -------
-async def refresh_once(*args, **kwargs) -> Any:
+def get_refresh() -> Callable[..., Awaitable[Dict[str, Any]]]:
     """
-    Async, safe, single-shot OC refresh entrypoint.
-    Calls underlying oc_refresh function with arg variants, and
-    extracts+publishes a snapshot if present in return value.
+    Returns an async function(p)->dict that:
+      - ensures single-flight
+      - returns last snapshot if refresh is inflight
     """
-    if _FN is None:
-        _log.warning("oc_refresh_shim: Using NO-OP refresh_once() (no target)")
-        return {"status": "noop", "message": "No refresh function available (shim)"}
+    fn = _resolve_refresh_func()
 
-    variants = _build_variants(args, kwargs)
-
-    # async target
-    if _FN_is_async:
-        last_err: Optional[BaseException] = None
-        for tag, a, k in variants:
-            try:
-                ret = await _call_async(_FN, a, k)
-                snap = _extract_snapshot(ret)
-                if snap is not None:
-                    _try_call_setters(snap)
-                return ret
-            except TypeError as e:
-                last_err = e
-                continue
-            except Exception as e:
-                _log.exception("oc_refresh_shim: async call (%s) raised", tag)
-                return {"status": "error", "message": str(e)}
-        _log.error("oc_refresh_shim: async arg-mismatch across variants: %s", last_err)
-        return {"status": "error", "message": str(last_err)}
-
-    # sync target -> run in thread
-    loop = asyncio.get_running_loop()
-    last_te: Optional[TypeError] = None
-    for tag, a, k in variants:
-        try:
-            ret = await loop.run_in_executor(None, lambda: _FN(*a, **k))  # type: ignore[misc]
-            snap = _extract_snapshot(ret)
-            if snap is not None:
-                _try_call_setters(snap)
-            return ret
-        except TypeError as e:
-            last_te = e
-            continue
-        except Exception as e:
-            _log.exception("oc_refresh_shim: sync call (%s) raised", tag)
-            return {"status": "error", "message": str(e)}
-    _log.error("oc_refresh_shim: sync arg-mismatch across variants: %s", last_te)
-    return {"status": "error", "message": str(last_te)}
-
-def get_snapshot():
-    """
-    Try multiple ways to fetch latest snapshot.
-    Order:
-      1) analytics.oc_refresh.get_snapshot()/latest_snapshot()/snapshot()/export_snapshot()
-      2) analytics.oc_refresh.SNAPSHOT/LATEST (common globals)
-      3) shim-local _LAST_SNAPSHOT
-    """
-    # Module accessors
-    if _m is not None:
-        for nm in ("get_snapshot", "latest_snapshot", "snapshot", "export_snapshot"):
-            fn = getattr(_m, nm, None)
-            if callable(fn):
+    async def refresh_once(p) -> Dict[str, Any]:
+        global _inflight
+        if _lock.locked():
+            # Someone else is refreshing: serve last snapshot (if any) to avoid overlap
+            if _last_snapshot is not None:
+                log.debug("oc_refresh: single-flight in progress → serving cached snapshot")
+                return _last_snapshot
+            # No cache yet → wait for inflight to finish to avoid empty result
+            if _inflight:
                 try:
-                    val = fn()
-                    if val is not None:
-                        return val
+                    return await _inflight
                 except Exception:
+                    # if inflight failed, fall through to try ourselves
                     pass
-        # Module globals
-        for nm in ("SNAPSHOT", "LATEST", "LAST_SNAPSHOT"):
-            if hasattr(_m, nm):
-                try:
-                    val = getattr(_m, nm)
-                    if val is not None:
-                        return val
-                except Exception:
-                    pass
-    # Fallback to our memory
-    return _LAST_SNAPSHOT
+
+        async with _lock:
+            # create and store inflight task so parallel callers (if any) can await
+            _inflight = asyncio.create_task(_do_refresh(p, fn))
+            try:
+                return await _inflight
+            finally:
+                _inflight = None
+
+    return refresh_once
+
+# Convenience: sometimes callers import refresh_once directly
+refresh_once = get_refresh()
