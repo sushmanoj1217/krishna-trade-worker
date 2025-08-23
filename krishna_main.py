@@ -80,7 +80,7 @@ def _is_stale(snap: dict | None) -> bool:
         pass
     return False
 
-# --- Warm-up refresh (now fully guarded) --------------------------------------
+# --- Warm-up refresh (fully guarded) -----------------------------------------
 async def warmup_refresh(p, timeout_s: float = 12.0) -> bool:
     """
     Force a provider refresh before bot/day loop so first /oc_now is fresh.
@@ -152,7 +152,15 @@ def _init_bot():
 
 async def _start_polling(app):
     log.info("Telegram polling started")
-    # v20 Updater path (your project already uses it)
+    # Proper PTB v20 manual sequence: initialize → start → updater.start_polling
+    try:
+        await app.initialize()
+    except Exception as e:
+        log.warning("PTB initialize skipped/failed (maybe already initialized): %s", e)
+    try:
+        await app.start()
+    except Exception as e:
+        log.warning("PTB start skipped/failed (maybe already started): %s", e)
     await app.updater.start_polling()  # type: ignore[attr-defined]
 
 # --- Main ---------------------------------------------------------------------
@@ -168,7 +176,6 @@ async def main():
         if not ok:
             log.warning("Warm-up: continuing without fresh snapshot (will refresh in day loop)")
     except Exception:
-        # absolute last defense
         log.exception("Warm-up: unexpected crash prevented; continuing")
 
     app = _init_bot()
