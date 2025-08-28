@@ -1,50 +1,82 @@
-# scripts/supervisor.py
-# Runs: paper_entry_maker (entries), paper_exit_watcher (exits)
-# + optional nightly eod_tuner at 18:10 Asia/Kolkata
-# Single-file, no external deps. Python 3.11+ (zoneinfo ok).
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+"""
+Supervisor that runs:
+  - scripts.paper_entry_maker  (entry loop)
+  - scripts.paper_exit_watcher (exit loop)
+  - scripts.eod_tuner          (nightly at ~18:10 IST, optional)
+
+Key fixes:
+  * Child processes launched with -u (unbuffered) + env PYTHONUNBUFFERED=1
+  * UTF-8 output; stdout is streamed line-by-line immediately
+  * Heartbeat logs
+  * Auto-restart on crash
+
+Env knobs (optional):
+  LOOP_SECS                -> default 18 (used if ENTRY/EXIT specific not set)
+  ENTRY_LOOP_SECS          -> override for entry loop
+  EXIT_LOOP_SECS           -> override for exit loop
+  EOD_TUNER_RUN_IN_SUPERVISOR -> 1/0 (default 1 = run)
+"""
 
 from __future__ import annotations
+
 import asyncio
 import os
 import sys
-import signal
 import time
 from dataclasses import dataclass
-from typing import Dict, List, Optional
+from datetime import datetime, timedelta, timezone
 
-try:
-    from zoneinfo import ZoneInfo  # py3.9+
-except Exception:  # pragma: no cover
-    ZoneInfo = None  # type: ignore
-
-# ------------ Config helpers ------------
-
-def _env_bool(name: str, default: bool = False) -> bool:
-    v = os.environ.get(name)
-    if v is None:
-        return default
-    return str(v).strip().lower() in {"1", "true", "yes", "y", "on"}
-
-def _env_int(name: str, default: int) -> int:
-    try:
-        return int(str(os.environ.get(name, default)).strip())
-    except Exception:
-        return default
+# ---------- helpers ----------
 
 def _now_ts() -> str:
     return time.strftime("%Y-%m-%d %H:%M:%S")
 
-# ------------ Processes we supervise ------------
+def _env_int(name: str, default: int) -> int:
+    v = os.environ.get(name)
+    if not v:
+        return default
+    try:
+        return int(v)
+    except Exception:
+        return default
+
+def _env_bool(name: str, default: bool) -> bool:
+    v = os.environ.get(name)
+    if v is None:
+        return default
+    v = v.strip().lower()
+    if v in ("1", "true", "yes", "y", "on"):
+        return True
+    if v in ("0", "false", "no", "n", "off"):
+        return False
+    return default
+
+def _ist_now() -> datetime:
+    # IST = UTC+5:30
+    return datetime.now(timezone(timedelta(hours=5, minutes=30)))
+
+def _sec_human(n: int) -> str:
+    if n < 60:
+        return f"{n}s"
+    m, s = divmod(n, 60)
+    if m < 60:
+        return f"{m}m{s:02d}s"
+    h, m = divmod(m, 60)
+    return f"{h}h{m:02d}m"
 
 @dataclass
 class ProcSpec:
     name: str
-    cmd: List[str]
-    backoff_sec: int = 3
-    backoff_max: int = 60
+    cmd: list[str]
 
-async def run_and_restart(spec: ProcSpec, env: Dict[str, str]) -> None:
-    """Run a subprocess; on exit, restart with exponential backoff."""
+# ---------- core runners ----------
+
+async def run_and_restart(spec: ProcSpec, env: dict) -> None:
+    """Run a child process, stream logs, restart if it exits."""
+    backoff = 1
     while True:
         print(f"{_now_ts()} [SUP] starting `{spec.name}`: {' '.join(spec.cmd)}", flush=True)
         try:
@@ -53,66 +85,50 @@ async def run_and_restart(spec: ProcSpec, env: Dict[str, str]) -> None:
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.STDOUT,
                 env=env,
+                cwd=os.getcwd(),  # keep working dir consistent
             )
         except Exception as e:
-            print(f"{_now_ts()} [SUP][{spec.name}] spawn failed: {e}", flush=True)
-            await asyncio.sleep(min(spec.backoff_sec, spec.backoff_max))
-            spec.backoff_sec = min(spec.backoff_sec * 2, spec.backoff_max)
+            print(f"{_now_ts()} [SUP] spawn failed `{spec.name}`: {e}", flush=True)
+            await asyncio.sleep(backoff)
+            backoff = min(backoff * 2, 60)
             continue
 
-        # stream logs
+        backoff = 1  # reset on successful spawn
+
         assert proc.stdout is not None
-        async for line in proc.stdout:
-            try:
-                txt = line.decode(errors="replace").rstrip("\n")
-            except Exception:
-                txt = str(line).rstrip("\n")
-            print(f"{_now_ts()} [{spec.name}] {txt}", flush=True)
+        try:
+            # Stream child's stdout line by line
+            while True:
+                line = await proc.stdout.readline()
+                if not line:
+                    break
+                try:
+                    text = line.decode("utf-8", errors="replace").rstrip("\n\r")
+                except Exception:
+                    text = str(line).rstrip("\n\r")
+                # Prefix with child name
+                print(f"[{spec.name}] {text}", flush=True)
+        except Exception as e:
+            print(f"{_now_ts()} [SUP] stream error `{spec.name}`: {e}", flush=True)
 
         rc = await proc.wait()
-        print(f"{_now_ts()} [SUP][{spec.name}] exited rc={rc}", flush=True)
-        # backoff then restart
-        await asyncio.sleep(spec.backoff_sec)
-        spec.backoff_sec = min(spec.backoff_sec * 2, spec.backoff_max)
+        print(f"{_now_ts()} [SUP] `{spec.name}` exited with code {rc}. Restarting in 3s...", flush=True)
+        await asyncio.sleep(3)
 
-# ------------ Nightly EOD tuner ------------
-
-def _seconds_until_next_run_ist(hour: int, minute: int) -> int:
-    if ZoneInfo is None:
-        # Fallback: assume local time
-        now = time.time()
-        t = time.localtime(now)
-        today_target = time.struct_time((
-            t.tm_year, t.tm_mon, t.tm_mday, hour, minute, 0,
-            t.tm_wday, t.tm_yday, t.tm_isdst
-        ))
-        target_ts = time.mktime(today_target)
-        if target_ts <= now:
-            target_ts += 86400
-        return max(1, int(round(target_ts - now)))
-    else:
-        import datetime as dt
-        tz = ZoneInfo("Asia/Kolkata")
-        now = dt.datetime.now(tz)
-        target = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
-        if target <= now:
-            target = target + dt.timedelta(days=1)
-        return int((target - now).total_seconds())
-
-async def nightly_tuner(env: Dict[str, str]) -> None:
-    enabled = _env_bool("EOD_TUNER_ENABLED", True)
-    if not enabled:
-        print(f"{_now_ts()} [TUNER] disabled via EOD_TUNER_ENABLED=0", flush=True)
-        return
-
-    hour = _env_int("EOD_TUNER_HOUR", 18)     # 18:10 IST default
-    minute = _env_int("EOD_TUNER_MINUTE", 10)
-
-    cmd = [sys.executable, "-m", "scripts.eod_tuner"]
+async def nightly_tuner(env: dict) -> None:
+    """Run eod_tuner once daily at ~18:10 IST."""
+    # Schedule next 18:10 IST
     while True:
-        wait_s = _seconds_until_next_run_ist(hour, minute)
-        print(f"{_now_ts()} [TUNER] next run in ~{wait_s}s at {hour:02d}:{minute:02d} IST", flush=True)
-        await asyncio.sleep(wait_s)
+        now = _ist_now()
+        run_time = now.replace(hour=18, minute=10, second=0, microsecond=0)
+        if run_time <= now:
+            run_time = run_time + timedelta(days=1)
+        wait_sec = int((run_time - now).total_seconds())
+        print(f"{_now_ts()} [TUNER] next run in ~{_sec_human(wait_sec)} at {run_time.strftime('%H:%M')} IST", flush=True)
+        await asyncio.sleep(wait_sec)
+
+        # Run tuner
+        cmd = [sys.executable, "-u", "-m", "scripts.eod_tuner"]
         print(f"{_now_ts()} [TUNER] running: {' '.join(cmd)}", flush=True)
         try:
             proc = await asyncio.create_subprocess_exec(
@@ -120,70 +136,54 @@ async def nightly_tuner(env: Dict[str, str]) -> None:
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.STDOUT,
                 env=env,
+                cwd=os.getcwd(),
             )
             assert proc.stdout is not None
-            async for line in proc.stdout:
-                try:
-                    txt = line.decode(errors="replace").rstrip("\n")
-                except Exception:
-                    txt = str(line).rstrip("\n")
-                print(f"{_now_ts()} [eod_tuner] {txt}", flush=True)
+            while True:
+                line = await proc.stdout.readline()
+                if not line:
+                    break
+                text = line.decode("utf-8", errors="replace").rstrip("\n\r")
+                print(f"[tuner] {text}", flush=True)
             rc = await proc.wait()
-            print(f"{_now_ts()} [TUNER] finished rc={rc}", flush=True)
+            print(f"{_now_ts()} [TUNER] exit code {rc}", flush=True)
         except Exception as e:
-            print(f"{_now_ts()} [TUNER] spawn failed: {e}", flush=True)
-            # try again next day
-            await asyncio.sleep(5)
+            print(f"{_now_ts()} [TUNER] failed to run: {e}", flush=True)
 
-# ------------ Main ------------
+async def heartbeat() -> None:
+    while True:
+        print(f"{_now_ts()} [SUP] heartbeat ok", flush=True)
+        await asyncio.sleep(60)
 
 async def main() -> None:
-    # Required envs should already be set from your existing setup
-    # (DHAN_*, GOOGLE_SA_JSON, GSHEET_TRADES_SPREADSHEET_ID, OC_SYMBOL, etc.)
     loop_secs = _env_int("LOOP_SECS", 18)
     entry_loop = _env_int("ENTRY_LOOP_SECS", loop_secs)
     exit_loop  = _env_int("EXIT_LOOP_SECS",  loop_secs)
 
-    # Respect your dry-run toggles if provided; Supervisor just passes env through.
+    # Inherit env + force unbuffered I/O in children
     env = dict(os.environ)
+    env["PYTHONUNBUFFERED"] = "1"
+    env["PYTHONIOENCODING"] = "utf-8"
 
-    entry_cmd = [sys.executable, "-m", "scripts.paper_entry_maker", "--loop", str(entry_loop)]
-    exit_cmd  = [sys.executable, "-m", "scripts.paper_exit_watcher", "--loop", str(exit_loop)]
+    # Build commands with -u (unbuffered)
+    entry_cmd = [sys.executable, "-u", "-m", "scripts.paper_entry_maker", "--loop", str(entry_loop)]
+    exit_cmd  = [sys.executable, "-u", "-m", "scripts.paper_exit_watcher", "--loop", str(exit_loop)]
 
     tasks = [
         asyncio.create_task(run_and_restart(ProcSpec("entry", entry_cmd), env)),
         asyncio.create_task(run_and_restart(ProcSpec("exit",  exit_cmd),  env)),
+        asyncio.create_task(heartbeat()),
     ]
 
-    # optional nightly tuner
     if _env_bool("EOD_TUNER_RUN_IN_SUPERVISOR", True):
         tasks.append(asyncio.create_task(nightly_tuner(env)))
     else:
         print(f"{_now_ts()} [SUP] nightly tuner disabled (EOD_TUNER_RUN_IN_SUPERVISOR=0)", flush=True)
 
-    # Handle SIGTERM/SIGINT for clean shutdown
-    stop = asyncio.Event()
-    def _signal_handler(*_):
-        print(f"{_now_ts()} [SUP] signal received, shutting down...", flush=True)
-        stop.set()
-    for sig in (signal.SIGINT, signal.SIGTERM):
-        try:
-            asyncio.get_running_loop().add_signal_handler(sig, _signal_handler)
-        except NotImplementedError:
-            pass  # Windows
-
-    # heartbeat
-    async def heartbeat():
-        while not stop.is_set():
-            print(f"{_now_ts()} [SUP] heartbeat ok", flush=True)
-            await asyncio.sleep(60)
-
-    tasks.append(asyncio.create_task(heartbeat()))
-    await stop.wait()
-    for t in tasks:
-        t.cancel()
-    await asyncio.gather(*tasks, return_exceptions=True)
-    print(f"{_now_ts()} [SUP] bye", flush=True)
+    try:
+        await asyncio.gather(*tasks)
+    except asyncio.CancelledError:
+        pass
 
 if __name__ == "__main__":
     try:
