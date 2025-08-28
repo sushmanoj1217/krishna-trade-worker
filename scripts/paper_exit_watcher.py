@@ -1,33 +1,47 @@
 # scripts/paper_exit_watcher.py
 """
-Paper exit watcher (FIXED):
+Paper Exit Watcher (robust logging + CLI):
+
 - हर N सेकंड में latest OC snapshot (spot) लेता है (DHAN provider via oc_refresh_shim)
-- Trades sheet में OPEN (paper) rows ढूंढता है
+- Trades sheet में OPEN (paper) rows पढ़ता है
 - analytics.paper_exit.evaluate_exit() से TP/SL/Trail/AUTO_FLAT लागू करता है
-- DRY/RUN मोड: EXIT_DRY_RUN=1 पर सिर्फ Status में log; =0 पर Trades row close
+- DRY/RUN मोड: EXIT_DRY_RUN=1 पर केवल Status log; =0 पर Trades row close
 
 ENV:
   GSHEET_TRADES_SPREADSHEET_ID, GOOGLE_SA_JSON
   OC_SYMBOL (NIFTY/BANKNIFTY/FINNIFTY)
-  LOOP_SECS (default 18)
+  LOOP_SECS   (default 18)
   EXIT_DRY_RUN (default 1)
   PERFORMANCE_SHEET_NAME (optional)
   TP_POINTS, SL_POINTS, TRAIL_TRIGGER_POINTS, TRAIL_OFFSET_POINTS (optional overrides)
+
+CLI:
+  python -m scripts.paper_exit_watcher --once      # एक टिक, फिर exit (debug के लिए)
+  python -m scripts.paper_exit_watcher --loop      # सतत लूप (default)
 """
+
 from __future__ import annotations
-import os, json, time, logging
+import os, json, time, argparse
 from typing import List, Dict, Any, Optional
 from datetime import datetime
+
+import logging
+import sys
 
 import gspread
 from gspread.utils import rowcol_to_a1
 
 from analytics.paper_exit import ExitParams, TradeRow, evaluate_exit, _ceilnum, _norm_side
 
-logging.basicConfig(
-    level=os.environ.get("LOG_LEVEL", "INFO"),
-    format="%(asctime)s [%(levelname)s] %(message)s",
-)
+# ---------- Robust logger (stdout handler forced) ----------
+LOGGER_NAME = "paper_exit_watcher"
+logger = logging.getLogger(LOGGER_NAME)
+logger.setLevel(logging.INFO)
+if not logger.handlers:
+    _h = logging.StreamHandler(stream=sys.stdout)
+    _h.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(message)s"))
+    logger.addHandler(_h)
+logger.propagate = False
 
 def _gc():
     sa = json.loads(os.environ["GOOGLE_SA_JSON"])
@@ -44,7 +58,6 @@ def _pick_ws(sh, name: str):
     except Exception:
         return None
 
-# Header synonyms for flexible mapping
 HDR = {
     "id": {"id", "trade_id", "uid", "key"},
     "status": {"status", "state"},
@@ -60,7 +73,6 @@ HDR = {
 }
 
 def _index_headers(ws) -> Dict[str, int]:
-    # Find first non-empty row as header
     rows = ws.get_values("A1:Z1")
     hdr_row = rows[0] if rows else []
     if not hdr_row:
@@ -176,72 +188,89 @@ def _close_trade_row(ws, trade: TradeRow, exit_spot: float, pnl_points: Optional
         ws.update(a1, [[tmax]], value_input_option="USER_ENTERED")
 
 def _get_snapshot() -> Dict[str, Any]:
-    # isolate asyncio usage; safe every tick
     import asyncio
     from analytics.oc_refresh_shim import get_refresh
     return asyncio.run(get_refresh()({}))  # type: ignore
 
+def _one_tick(sh, trades_ws, p: ExitParams, dry: bool) -> None:
+    try:
+        snap = _get_snapshot() or {}
+        spot = float(snap.get("spot") or 0.0)
+        if not spot:
+            logger.warning("No spot from provider; skipping tick")
+            return
+
+        open_trades = _read_open_trades(trades_ws)
+        if not open_trades:
+            logger.info("No OPEN trades")
+            return
+
+        for tr in open_trades:
+            out = evaluate_exit(spot, tr, p)
+            if "trail_max" in out and out["trail_max"] is not None:
+                tr.raw["trail_max_update"] = out["trail_max"]
+
+            if out["action"] == "EXIT":
+                msg = f"[{tr.symbol} {tr.side}] EXIT @{spot} reason={out['reason']} pnl={out.get('pnl_points')}"
+                logger.info(msg)
+                if dry:
+                    _append_status(sh, msg + " (dry)")
+                else:
+                    try:
+                        _close_trade_row(trades_ws, tr, out["exit_spot"], out.get("pnl_points"), out["reason"])
+                        _append_status(sh, msg)
+                    except Exception as e:
+                        logger.exception("close failed: %s", e)
+                        _append_status(sh, f"ERROR close: {e}")
+            # HOLD → no spam
+    except Exception as e:
+        logger.exception("tick error: %s", e)
+
 def main():
+    ap = argparse.ArgumentParser(description="Paper Exit Watcher")
+    ap.add_argument("--once", action="store_true", help="Run single tick and exit")
+    ap.add_argument("--loop", action="store_true", help="Run forever loop (default)")
+    args = ap.parse_args()
+
+    # Visible banner (in case logging is muted elsewhere)
+    print("[paper_exit_watcher] starting...", flush=True)
+
     try:
         loop_secs = int(os.environ.get("LOOP_SECS", "18"))
     except Exception:
         loop_secs = 18
     dry = os.environ.get("EXIT_DRY_RUN", "1") != "0"
+    sym = os.environ.get("OC_SYMBOL", "NIFTY")
 
-    logging.info("paper_exit_watcher: starting (loop=%ss, dry_run=%s, symbol=%s)",
-                 loop_secs, dry, os.environ.get("OC_SYMBOL", "NIFTY"))
+    logger.info("config: loop=%ss, dry_run=%s, symbol=%s", loop_secs, dry, sym)
 
     try:
         sh = _open_sheet()
     except KeyError as e:
-        logging.error("Missing env for Sheets: %s", e)
+        logger.error("Missing env for Sheets: %s", e)
         return
     except Exception as e:
-        logging.exception("Cannot open spreadsheet: %s", e)
+        logger.exception("Cannot open spreadsheet: %s", e)
         return
 
     trades_ws = _pick_ws(sh, "Trades")
     if not trades_ws:
-        logging.error("Trades worksheet not found")
+        logger.error("Trades worksheet not found")
         return
+    else:
+        logger.info("Sheets OK: Trades worksheet found")
 
     p = ExitParams()
 
+    if args.once and not args.loop:
+        _one_tick(sh, trades_ws, p, dry)
+        logger.info("once done")
+        return
+
+    # default: loop
+    logger.info("loop started")
     while True:
-        try:
-            snap = _get_snapshot() or {}
-            spot = float(snap.get("spot") or 0.0)
-            if not spot:
-                logging.warning("No spot from provider; skipping tick")
-                time.sleep(loop_secs); continue
-
-            open_trades = _read_open_trades(trades_ws)
-            if not open_trades:
-                logging.info("No OPEN trades; sleep %ss", loop_secs)
-                time.sleep(loop_secs); continue
-
-            for tr in open_trades:
-                out = evaluate_exit(spot, tr, p)
-                if "trail_max" in out and out["trail_max"] is not None:
-                    tr.raw["trail_max_update"] = out["trail_max"]
-
-                if out["action"] == "EXIT":
-                    msg = f"[{tr.symbol} {tr.side}] EXIT @{spot} reason={out['reason']} pnl={out.get('pnl_points')}"
-                    logging.info(msg)
-                    if dry:
-                        _append_status(sh, msg + " (dry)")
-                    else:
-                        try:
-                            _close_trade_row(trades_ws, tr, out["exit_spot"], out.get("pnl_points"), out["reason"])
-                            _append_status(sh, msg)
-                        except Exception as e:
-                            logging.exception("close failed: %s", e)
-                            _append_status(sh, f"ERROR close: {e}")
-                # HOLD → no log spam
-
-        except Exception as e:
-            logging.exception("tick error: %s", e)
-
+        _one_tick(sh, trades_ws, p, dry)
         time.sleep(loop_secs)
 
 if __name__ == "__main__":
