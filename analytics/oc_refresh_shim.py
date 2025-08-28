@@ -1,112 +1,121 @@
 # analytics/oc_refresh_shim.py
 # -----------------------------------------------------------------------------
-# OC refresh shim that provides:
-#   - Dynamic function resolution (env overrides)
-#   - **Single-flight** guard (no overlapping refresh calls)
-#   - Last-snapshot caching (serve while refresh inflight)
-#   - Tiny helpers for market-hours checks (optional for callers)
-#
-# Default chain:
-#   OC_REFRESH_FUNC (env)  -> dotted async(p)->dict
-#   else DHAN_PROVIDER_FUNC-> dotted async(p)->dict
-#   else providers.dhan_oc.refresh_once
+# Lazy resolver for the OC refresh callable.
+# - No import-time resolution (so bad env won't crash the process).
+# - Supports env: OC_REFRESH_FUNC (preferred), fallback DHAN_PROVIDER_FUNC.
+# - Accepts shorthands like "fetch_levels" and maps them to dotted paths.
+# - Returns an async callable refresh_once(p) -> dict
 # -----------------------------------------------------------------------------
 
 from __future__ import annotations
-import asyncio, importlib, logging, os, time
-from typing import Any, Awaitable, Callable, Dict, Optional
+import importlib
+import inspect
+import logging
+import os
+from typing import Any, Callable, Awaitable
 
 log = logging.getLogger(__name__)
 
-def _env(name: str, default: Optional[str]=None) -> Optional[str]:
-    v = os.environ.get(name)
-    return v.strip() if v and str(v).strip() else default
+__all__ = ["get_refresh"]
 
-def _now_ist() -> float:
-    return time.time() + 5.5 * 3600
+# Known shorthands -> dotted targets
+_SHORTCUTS: dict[str, str] = {
+    # common mistakes / short forms
+    "fetch_levels": "integrations.option_chain_dhan.fetch_levels",
+    "refresh_once": "providers.dhan_oc.refresh_once",
+    "dhan": "providers.dhan_oc.refresh_once",
+    # add more if you have other providers:
+    # "sheet": "providers.sheet_oc.refresh_once",
+}
 
-def _now_ist_str() -> str:
-    return time.strftime("%Y-%m-%d %H:%M:%S IST", time.gmtime(_now_ist()))
+# Default if nothing set
+_DEFAULT_PATH = "providers.dhan_oc.refresh_once"
 
-# ------------ market hours helper (09:15–15:30 IST; Fri special same) ----------
-def is_market_hours(ts: Optional[float]=None) -> bool:
-    t = ts if ts is not None else _now_ist()
-    lt = time.gmtime(t)
-    # lt.tm_wday: Mon=0 … Sun=6
-    if lt.tm_wday >= 5:   # Sat/Sun
-        return False
-    hh = lt.tm_hour; mm = lt.tm_min
-    # Convert IST gmtime already
-    minutes = hh*60 + mm
-    open_m  = 9*60 + 15
-    close_m = 15*60 + 30
-    return open_m <= minutes <= close_m
 
-# ------------ function resolution --------------------------------------------
-def _resolve_refresh_func() -> Callable[..., Awaitable[Dict[str, Any]]]:
-    # priority: OC_REFRESH_FUNC → DHAN_PROVIDER_FUNC → providers.dhan_oc.refresh_once
-    path = _env("OC_REFRESH_FUNC")
-    if not path:
-        path = _env("DHAN_PROVIDER_FUNC")
-        if not path:
-            path = "providers.dhan_oc.refresh_once"
-    mod_path, _, fn_name = path.rpartition(".")
-    if not mod_path:
+def _pick_env_path() -> str:
+    """
+    Decide which dotted path to use for the refresh function.
+    Priority: OC_REFRESH_FUNC > DHAN_PROVIDER_FUNC > default
+    Also expand shorthands like 'fetch_levels' to dotted path.
+    """
+    raw = os.environ.get("OC_REFRESH_FUNC") or os.environ.get("DHAN_PROVIDER_FUNC") or _DEFAULT_PATH
+    path = (raw or "").strip()
+
+    # expand shorthand
+    if "." not in path:
+        mapped = _SHORTCUTS.get(path)
+        if mapped:
+            log.warning("oc_refresh_shim: expanded shorthand %r -> %r", path, mapped)
+            path = mapped
+        else:
+            # If still no dot, it's invalid; keep as-is for error to be explicit
+            pass
+
+    return path
+
+
+def _resolve_dotted(path: str) -> Callable[..., Any]:
+    """
+    Import dotted path "pkg.mod.func" and return the attribute.
+    Raises ImportError with a clear message if anything is wrong.
+    """
+    if "." not in path:
         raise ImportError(f"OC refresh func invalid: {path!r}")
-    mod = importlib.import_module(mod_path)
-    fn = getattr(mod, fn_name, None)
-    if fn is None:
-        raise ImportError(f"{path}: function not found")
-    if not asyncio.iscoroutinefunction(fn):
-        raise TypeError(f"{path}: must be async def")
-    log.info("oc_refresh_shim: selected %s (async=True)", fn_name)
+
+    mod_name, attr = path.rsplit(".", 1)
+    try:
+        mod = importlib.import_module(mod_name)
+    except Exception as e:
+        raise ImportError(f"Cannot import module {mod_name!r} for {path!r}: {e}") from e
+
+    try:
+        fn = getattr(mod, attr)
+    except AttributeError as e:
+        raise ImportError(f"Module {mod_name!r} has no attribute {attr!r} for {path!r}") from e
+
+    if not callable(fn):
+        raise ImportError(f"Resolved object {path!r} is not callable")
+
     return fn
 
-# Global single-flight state
-_lock = asyncio.Lock()
-_inflight: Optional[asyncio.Task] = None
-_last_snapshot: Optional[Dict[str, Any]] = None
-_last_ts: Optional[float] = None
 
-async def _do_refresh(p, fn: Callable[..., Awaitable[Dict[str, Any]]]) -> Dict[str, Any]:
-    global _last_snapshot, _last_ts
-    snap = await fn(p)
-    _last_snapshot = snap
-    _last_ts = time.time()
-    return snap
-
-def get_refresh() -> Callable[..., Awaitable[Dict[str, Any]]]:
+def _to_async(fn: Callable[..., Any]) -> Callable[[Any], Awaitable[dict]]:
     """
-    Returns an async function(p)->dict that:
-      - ensures single-flight
-      - returns last snapshot if refresh is inflight
+    Wrap a sync function to async; pass through if already coroutine function.
+    The provider function is expected to accept a single 'p' (Params-like) arg,
+    and return a dict snapshot (or serializable mapping).
     """
-    fn = _resolve_refresh_func()
+    if inspect.iscoroutinefunction(fn):
+        return fn  # type: ignore[return-value]
 
-    async def refresh_once(p) -> Dict[str, Any]:
-        global _inflight
-        if _lock.locked():
-            # Someone else is refreshing: serve last snapshot (if any) to avoid overlap
-            if _last_snapshot is not None:
-                log.debug("oc_refresh: single-flight in progress → serving cached snapshot")
-                return _last_snapshot
-            # No cache yet → wait for inflight to finish to avoid empty result
-            if _inflight:
-                try:
-                    return await _inflight
-                except Exception:
-                    # if inflight failed, fall through to try ourselves
-                    pass
+    async def _wrap(p: Any) -> dict:
+        try:
+            res = fn(p)  # type: ignore[misc]
+            return res if isinstance(res, dict) else dict(res or {})
+        except Exception as e:
+            # bubble up with context
+            raise RuntimeError(f"refresh callable (sync) failed: {e}") from e
 
-        async with _lock:
-            # create and store inflight task so parallel callers (if any) can await
-            _inflight = asyncio.create_task(_do_refresh(p, fn))
-            try:
-                return await _inflight
-            finally:
-                _inflight = None
+    return _wrap
 
-    return refresh_once
 
-# Convenience: sometimes callers import refresh_once directly
-refresh_once = get_refresh()
+def get_refresh() -> Callable[[Any], Awaitable[dict]]:
+    """
+    Resolve and return an async refresh_once(p) -> dict callable.
+    Lazy: evaluates env on each call so hot-reload of env is reflected
+    (cheap enough; importlib caches modules).
+    """
+    path = _pick_env_path()
+    try:
+        fn = _resolve_dotted(path)
+        async_fn = _to_async(fn)
+        # Log only when switching target (lightweight guard via an attribute)
+        prev = getattr(get_refresh, "_prev_path", None)
+        if prev != path:
+            log.info("oc_refresh_shim: selected %s (async=%s)", path, inspect.iscoroutinefunction(fn))
+            setattr(get_refresh, "_prev_path", path)
+        return async_fn
+    except Exception as e:
+        # Log clearly and rethrow so caller can decide fallback/no-op
+        log.error("oc_refresh_shim: failed to resolve refresh func from %r: %s", path, e)
+        raise
