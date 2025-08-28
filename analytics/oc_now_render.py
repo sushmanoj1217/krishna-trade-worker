@@ -87,6 +87,55 @@ def _get_target_min(symbol: str) -> float:
     return DEFAULT_TARGET_MIN.get(symbol, 30.0)
 
 # ---------------------------------
+# MV derivation (fallback if missing)
+# ---------------------------------
+
+def _mv_from_pcr(pcr: Optional[float]) -> Optional[str]:
+    if pcr is None:
+        return None
+    # Loosish thresholds so MV rarely stays unknown:
+    # PCR ≥ 1.10 → bullish, PCR ≤ 0.90 → bearish
+    if pcr >= 1.10:
+        return "bullish"
+    if pcr <= 0.90:
+        return "bearish"
+    return None
+
+def _mv_from_mp(spot: Optional[float], mp: Optional[float], sym: str) -> Optional[str]:
+    if spot is None or mp is None:
+        return None
+    # Use symbol buffer as a "neutral zone" around MP
+    buf = DEFAULT_BUFFERS.get(sym, 12.0)
+    diff = spot - mp
+    if diff > buf:
+        return "bullish"
+    if diff < -buf:
+        return "bearish"
+    return None
+
+def _derive_mv_if_missing(s: Dict[str, Any], sym: str) -> str:
+    mv = (s.get("mv") or "").strip().lower()
+    if mv:
+        return mv
+
+    pcr = s.get("pcr")
+    mp = s.get("mp")
+    spot = s.get("spot")
+
+    mv_pcr = _mv_from_pcr(pcr)
+    mv_mp  = _mv_from_mp(spot, mp, sym)
+
+    # Prefer agreement; else fall back to PCR if MP inconclusive;
+    # else use MP; else unknown.
+    if mv_pcr and mv_mp and mv_pcr == mv_mp:
+        return mv_pcr
+    if mv_pcr and not mv_mp:
+        return mv_pcr
+    if mv_mp and not mv_pcr:
+        return mv_mp
+    return ""  # unknown
+
+# ---------------------------------
 # Shifted levels & side selection
 # ---------------------------------
 
@@ -176,19 +225,22 @@ def _c2_mv(side: str, mv: Optional[str]) -> Tuple[bool, str]:
 
 def _c3_oi_pattern(side: str, ce_d: Optional[float], pe_d: Optional[float]) -> Tuple[bool, str]:
     s_ce = _sign(ce_d); s_pe = _sign(pe_d)
+    def _tag(n: Optional[int]) -> str:
+        return '+' if n == 1 else ('-' if n == -1 else '0')
+
     if s_ce is None or s_pe is None:
         return (False, "OIΔ missing")
 
     # CE rules (bullish): (CE↓ & PE↑) OR (CE↓ & PE↓) OR (CE↔/↓ & PE↑)
     if side == "CE":
         if (s_ce == -1 and s_pe == +1) or (s_ce == -1 and s_pe == -1) or ((s_ce in (0, -1)) and s_pe == +1):
-            return (True, f"CEΔ={'+/-0'[s_ce]} / PEΔ={'+/-0'[s_pe] if s_pe in (1,-1,0) else s_pe}")  # readable tag
-        return (False, f"CEΔ={'+' if s_ce == 1 else ('-' if s_ce == -1 else '0')} / PEΔ={'+' if s_pe == 1 else ('-' if s_pe == -1 else '0')}")
+            return (True, f"CEΔ={_tag(s_ce)} / PEΔ={_tag(s_pe)}")
+        return (False, f"CEΔ={_tag(s_ce)} / PEΔ={_tag(s_pe)}")
 
     # PE rules (bearish): (CE↑ & PE↓) OR (CE↓ & PE↓) OR (CE↑ & PE↔/↓)
     if (s_ce == +1 and s_pe == -1) or (s_ce == -1 and s_pe == -1) or (s_ce == +1 and s_pe in (0, -1)):
-        return (True, f"CEΔ={'+' if s_ce == 1 else ('-' if s_ce == -1 else '0')} / PEΔ={'+' if s_pe == 1 else ('-' if s_pe == -1 else '0')}")
-    return (False, f"CEΔ={'+' if s_ce == 1 else ('-' if s_ce == -1 else '0')} / PEΔ={'+' if s_pe == 1 else ('-' if s_pe == -1 else '0')}")
+        return (True, f"CEΔ={_tag(s_ce)} / PEΔ={_tag(s_pe)}")
+    return (False, f"CEΔ={_tag(s_ce)} / PEΔ={_tag(s_pe)}")
 
 def _c4_timing_fresh(age_sec: Optional[float]) -> Tuple[bool, str]:
     now = _now_ist()
@@ -203,7 +255,6 @@ def _c4_timing_fresh(age_sec: Optional[float]) -> Tuple[bool, str]:
     return (True, f"time OK, fresh {int(age_sec)}s≤{os.environ.get('OC_FRESH_MAX_SEC','90')}s")
 
 def _c5_hygiene() -> Tuple[bool, str]:
-    # Minimal offline hygiene:
     # HOLD via env; caps/dedupe assumed enforced elsewhere (trade_loop).
     hold = (os.environ.get("HOLD") or os.environ.get("SYSTEM_HOLD") or "").strip().lower() in ("1", "true", "yes", "y")
     if hold:
@@ -240,7 +291,8 @@ def _render_text(s: Dict[str, Any]) -> str:
     s2 = float(s.get("s2") or 0)
     r1 = float(s.get("r1") or 0)
     r2 = float(s.get("r2") or 0)
-    mv = s.get("mv")
+    # derive MV if missing
+    mv = _derive_mv_if_missing(s, symbol)
     pcr = s.get("pcr")
     mp = s.get("mp")
     ce_d = s.get("ce_oi_delta")
@@ -272,7 +324,7 @@ def _render_text(s: Dict[str, Any]) -> str:
     )
     mv_txt = (mv or "—")
     lines.append(
-        f"Buffer: {int(buf) if buf.is_integer() else buf}  |  MV: {mv_txt}  |  PCR: {_fnum(pcr) if pcr not in (None, '') else '—'}  |  MP: {_fprice(mp) if mp else '—'}"
+        f"Buffer: {int(buf) if float(buf).is_integer() else buf}  |  MV: {mv_txt}  |  PCR: {_fnum(pcr) if pcr not in (None, '') else '—'}  |  MP: {_fprice(mp) if mp else '—'}"
     )
     age_txt = f"{int(age_sec)}s" if age_sec is not None else "—"
     if asof:
@@ -305,8 +357,6 @@ def _render_text(s: Dict[str, Any]) -> str:
         if not c4_ok: failed.append("C4")
         if not c5_ok: failed.append("C5")
         if not c6_ok: failed.append("C6")
-        if age_sec is not None and age_sec > 300:
-            lines[-1] = lines[-1]  # keep C6 line; nothing to change
         lines.append(f"Summary: ❌ Not eligible — failed: {', '.join(failed) if failed else '—'}")
 
     return "\n".join(lines)
