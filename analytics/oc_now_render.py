@@ -93,8 +93,7 @@ def _get_target_min(symbol: str) -> float:
 def _mv_from_pcr(pcr: Optional[float]) -> Optional[str]:
     if pcr is None:
         return None
-    # Loosish thresholds so MV rarely stays unknown:
-    # PCR ≥ 1.10 → bullish, PCR ≤ 0.90 → bearish
+    # thresholds: PCR ≥ 1.10 → bullish, PCR ≤ 0.90 → bearish
     if pcr >= 1.10:
         return "bullish"
     if pcr <= 0.90:
@@ -104,7 +103,6 @@ def _mv_from_pcr(pcr: Optional[float]) -> Optional[str]:
 def _mv_from_mp(spot: Optional[float], mp: Optional[float], sym: str) -> Optional[str]:
     if spot is None or mp is None:
         return None
-    # Use symbol buffer as a "neutral zone" around MP
     buf = DEFAULT_BUFFERS.get(sym, 12.0)
     diff = spot - mp
     if diff > buf:
@@ -113,10 +111,19 @@ def _mv_from_mp(spot: Optional[float], mp: Optional[float], sym: str) -> Optiona
         return "bearish"
     return None
 
-def _derive_mv_if_missing(s: Dict[str, Any], sym: str) -> str:
-    mv = (s.get("mv") or "").strip().lower()
-    if mv:
-        return mv
+def _derive_mv(s: Dict[str, Any], sym: str) -> Tuple[str, str]:
+    """
+    Returns (mv, mv_src). mv is '', 'bullish', or 'bearish'.
+    Priority:
+      1) provider MV (if present)
+      2) both PCR & MP agree → that label [PCR&MP]
+      3) disagreement → prefer PCR [PCR>MP]
+      4) only one present → that one [PCR] or [MP]
+      5) else unknown ''
+    """
+    mv_prov = (s.get("mv") or "").strip().lower()
+    if mv_prov:
+        return (mv_prov, "provider")
 
     pcr = s.get("pcr")
     mp = s.get("mp")
@@ -125,15 +132,16 @@ def _derive_mv_if_missing(s: Dict[str, Any], sym: str) -> str:
     mv_pcr = _mv_from_pcr(pcr)
     mv_mp  = _mv_from_mp(spot, mp, sym)
 
-    # Prefer agreement; else fall back to PCR if MP inconclusive;
-    # else use MP; else unknown.
     if mv_pcr and mv_mp and mv_pcr == mv_mp:
-        return mv_pcr
+        return (mv_pcr, "PCR&MP")
+    if mv_pcr and mv_mp and mv_pcr != mv_mp:
+        # tie-break → prefer PCR so MV rarely stays unknown
+        return (mv_pcr, "PCR>MP")
     if mv_pcr and not mv_mp:
-        return mv_pcr
+        return (mv_pcr, "PCR")
     if mv_mp and not mv_pcr:
-        return mv_mp
-    return ""  # unknown
+        return (mv_mp, "MP")
+    return ("", "")
 
 # ---------------------------------
 # Shifted levels & side selection
@@ -192,14 +200,12 @@ def _c1_level(side: str, spot: float, trig_name: str, trig_price: float, entry_b
 
     dist = spot - trig_price
     if side == "CE":
-        # want price to dip to <= trigger; band allows prefill
         if spot <= trig_price:
             return (True, "CROSS")
         if abs(dist) <= entry_band:
             return (False, "NEAR")
         return (False, f"FAR @ {trig_name} ({_fprice(trig_price)})")
     else:  # PE
-        # want price to rise to >= trigger
         if spot >= trig_price:
             return (True, "CROSS")
         if abs(dist) <= entry_band:
@@ -255,14 +261,12 @@ def _c4_timing_fresh(age_sec: Optional[float]) -> Tuple[bool, str]:
     return (True, f"time OK, fresh {int(age_sec)}s≤{os.environ.get('OC_FRESH_MAX_SEC','90')}s")
 
 def _c5_hygiene() -> Tuple[bool, str]:
-    # HOLD via env; caps/dedupe assumed enforced elsewhere (trade_loop).
     hold = (os.environ.get("HOLD") or os.environ.get("SYSTEM_HOLD") or "").strip().lower() in ("1", "true", "yes", "y")
     if hold:
         return (False, "HOLD")
     return (True, "OK")
 
 def _c6_space(side: str, trig_price: float, levels: Dict[str, float], target_min: float) -> Tuple[bool, str]:
-    # Space from trigger to the opposite first barrier (S1* vs R1; R1* vs S1)
     if trig_price == 0.0:
         return (False, "no trigger")
     s1 = levels.get("s1") or 0.0
@@ -291,8 +295,8 @@ def _render_text(s: Dict[str, Any]) -> str:
     s2 = float(s.get("s2") or 0)
     r1 = float(s.get("r1") or 0)
     r2 = float(s.get("r2") or 0)
-    # derive MV if missing
-    mv = _derive_mv_if_missing(s, symbol)
+    # derive MV (+ source tag) if missing
+    mv, mv_src = _derive_mv(s, symbol)
     pcr = s.get("pcr")
     mp = s.get("mp")
     ce_d = s.get("ce_oi_delta")
@@ -323,8 +327,9 @@ def _render_text(s: Dict[str, Any]) -> str:
         f"Shifted: S1 `{_fprice(shifted['S1*'])}`  S2 {_fprice(shifted['S2*'])}  R1 `{_fprice(shifted['R1*'])}`  R2 {_fprice(shifted['R2*'])}"
     )
     mv_txt = (mv or "—")
+    mv_tag = f"{mv_txt}" + (f" [{mv_src}]" if mv_txt != "—" and mv_src else "")
     lines.append(
-        f"Buffer: {int(buf) if float(buf).is_integer() else buf}  |  MV: {mv_txt}  |  PCR: {_fnum(pcr) if pcr not in (None, '') else '—'}  |  MP: {_fprice(mp) if mp else '—'}"
+        f"Buffer: {int(buf) if float(buf).is_integer() else buf}  |  MV: {mv_tag}  |  PCR: {_fnum(pcr) if pcr not in (None, '') else '—'}  |  MP: {_fprice(mp) if mp else '—'}"
     )
     age_txt = f"{int(age_sec)}s" if age_sec is not None else "—"
     if asof:
