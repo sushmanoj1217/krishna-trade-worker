@@ -6,24 +6,32 @@ Headless Auto Smoke Test
 - Prints a clean, human-readable summary
 - No Telegram, no order placement (safe)
 
-Run:
-  export TELEGRAM_DISABLED=true
-  export DHAN_PROVIDER_FUNC=integrations.option_chain_dhan.fetch_levels
-  export DHAN_UNDERLYING_SEG=IDX_I
-  export DHAN_UNDERLYING_SCRIP=13          # NIFTY
-  export OC_SYMBOL=NIFTY
-  # Optional tuning (or rely on Params_Override via utils.params):
-  # export LEVEL_BUFFER=12 ENTRY_BAND=3 TARGET_MIN_POINTS=30
-  python scripts/headless_auto_smoke.py --once        # one-shot
-  python scripts/headless_auto_smoke.py --loop 18     # loop every ~18s
+Run (any ONE of these styles):
+  # A) Module mode (best)
+  python -m scripts.headless_auto_smoke --once
+  python -m scripts.headless_auto_smoke --loop 18
+
+  # B) With PYTHONPATH set
+  export PYTHONPATH=/opt/render/project/src
+  python scripts/headless_auto_smoke.py --once
+
+  # C) Direct run (this file has sys.path bootstrap so it also works)
+  python scripts/headless_auto_smoke.py --once
 """
 
 from __future__ import annotations
-import os, asyncio, math, time, sys
+import os, sys, math, time
 from dataclasses import dataclass
 from typing import Any, Dict, Optional, Tuple, List
 from zoneinfo import ZoneInfo
 from datetime import datetime
+
+# ---- PATH BOOTSTRAP: add project root so 'analytics', 'utils', etc. resolve ----
+_THIS = os.path.abspath(__file__)
+_SCRIPTS_DIR = os.path.dirname(_THIS)                 # .../src/scripts
+_ROOT = os.path.dirname(_SCRIPTS_DIR)                 # .../src
+if _ROOT not in sys.path:
+    sys.path.insert(0, _ROOT)
 
 # --- project deps (existing) ---
 try:
@@ -43,7 +51,19 @@ else:
     # Prefer real Params loader (reads sheet overrides too)
     Params = Params
 
-from analytics.oc_refresh_shim import get_refresh  # resolves DHAN provider
+# resolve DHAN provider via shim
+try:
+    from analytics.oc_refresh_shim import get_refresh
+except ModuleNotFoundError as e:
+    raise SystemExit(
+        "[FATAL] Can't import 'analytics'.\n"
+        f"  cwd={os.getcwd()}\n"
+        f"  this={_THIS}\n"
+        f"  sys.path[0]={sys.path[0]}\n"
+        "Fixes:\n"
+        "  - Run as module:  python -m scripts.headless_auto_smoke --once\n"
+        "  - Or set PYTHONPATH: export PYTHONPATH=/opt/render/project/src\n"
+    ) from e
 
 IST = ZoneInfo("Asia/Kolkata")
 
@@ -52,7 +72,7 @@ ALLOWED_MV_PE = {"bearish", "strong_bearish"}
 
 def fmt_pts(x: Optional[float]) -> str:
     if x is None: return "—"
-    return f"{x:,.2f}".replace(",", "X").replace(".", ",").replace("X", ",")
+    return f"{x:,.2f}"
 
 def derive_mv_if_missing(snap: Dict[str, Any]) -> str:
     """Tie-break: use PCR & MaxPain distance when 'mv' missing/neutral."""
@@ -62,9 +82,7 @@ def derive_mv_if_missing(snap: Dict[str, Any]) -> str:
     pcr = snap.get("pcr")
     mp  = snap.get("mp")
     spot = snap.get("spot")
-    # Generic thresholds (conservative):
-    # PCR > 1.05 ⇒ bullish tilt, PCR < 0.95 ⇒ bearish tilt
-    # If PCR around neutral, use MP distance sign: spot < MP ⇒ bullish (mean-revert), else bearish
+    # Conservative PCR thresholds:
     if isinstance(pcr, (int, float)):
         if pcr >= 1.05: return "bullish"
         if pcr <= 0.95: return "bearish"
@@ -93,10 +111,7 @@ def c1_level_trigger(spot: float, s1s: float, s2s: float, r1s: float, r2s: float
     dists.sort(key=lambda x: x[2])
     for side, trg, _ in dists:
         if within_band(spot, trg, band):
-            # NEAR/CROSS distinction isn't needed for smoke; treat within band as eligible
-            reason = f"NEAR/CROSS @ {side} {fmt_pts(trg)}"
-            return True, reason, side, trg
-    # FAR: show the nearest target to guide user
+            return True, f"NEAR/CROSS @ {side} {fmt_pts(trg)}", side, trg
     side_n, trg_n, d = dists[0]
     return False, f"FAR @ {side_n} {fmt_pts(trg_n)} (Δ≈{fmt_pts(d)})", None, None
 
@@ -125,27 +140,21 @@ def c3_oi_pattern(ce_delta: Optional[float], pe_delta: Optional[float], side: Op
     p_eq  = pe_delta == 0
 
     if side == "CE":  # bullish patterns
-        # Normal Bullish: CE↓ & PE↑
         if (c_dn or c_eq) and p_up: return True, f"CEΔ={int(ce_delta):,}↓ / PEΔ={int(pe_delta):,}↑".replace(",", " ")
-        # Squeeze: CE↓ & PE↓
         if (c_dn or c_eq) and (p_dn or p_eq): return True, f"CEΔ={int(ce_delta):,}↓ / PEΔ={int(pe_delta):,}↓".replace(",", " ")
-        # Mild: CE↔/↓ & PE↑
         if (c_eq or c_dn) and p_up: return True, f"CEΔ~ / PEΔ↑"
         return False, f"CEΔ={'+' if c_up else ('0' if c_eq else '-') } / PEΔ={'+' if p_up else ('0' if p_eq else '-') }  (raw CEΔ={ce_delta:,.0f}, PEΔ={pe_delta:,.0f})".replace(",", " ")
     else:            # PE (bearish patterns)
-        # Normal Bearish: CE↑ & PE↓
         if c_up and (p_dn or p_eq): return True, f"CEΔ={int(ce_delta):,}↑ / PEΔ={int(pe_delta):,}↓".replace(",", " ")
-        # Squeeze: CE↓ & PE↓
         if (c_dn or c_eq) and (p_dn or p_eq): return True, f"CEΔ={int(ce_delta):,}↓ / PEΔ={int(pe_delta):,}↓".replace(",", " ")
-        # Mild: CE↑ & PE↔/↓
         if c_up and (p_eq or p_dn): return True, f"CEΔ↑ / PEΔ~|↓"
         return False, f"CEΔ={'+' if c_up else ('0' if c_eq else '-') } / PEΔ={'+' if p_up else ('0' if p_eq else '-') }  (raw CEΔ={ce_delta:,.0f}, PEΔ={pe_delta:,.0f})".replace(",", " ")
 
 def c4_time_and_fresh(age_sec: Optional[float], now: datetime) -> Tuple[bool, str]:
     # No-trade windows: 09:15–09:30, 14:45–15:15
     h, m = now.hour, now.minute
-    in_915_930  = (h == 9 and 15 <= m < 30)
-    in_1445_1515 = ( (h == 14 and m >= 45) or (h == 15 and m < 15) )
+    in_915_930   = (h == 9 and 15 <= m < 30)
+    in_1445_1515 = ((h == 14 and m >= 45) or (h == 15 and m < 15))
     if in_915_930 or in_1445_1515:
         return False, "no-trade window"
     if isinstance(age_sec, (int,float)) and age_sec > 90:
@@ -160,10 +169,8 @@ def c6_space(side: Optional[str], trig: Optional[float], s1: float, s2: float, r
     if side is None or trig is None:
         return False, "no side/trigger (C1 fail)"
     if side == "CE":
-        # space to next opposite barrier: use R1
         space = (r1 - trig) if (r1 is not None and trig is not None) else None
     else:
-        # PE: space to S1
         space = (trig - s1) if (s1 is not None and trig is not None) else None
     if space is None:
         return False, "space n/a"
@@ -190,7 +197,6 @@ async def once() -> int:
     refresh = get_refresh()
     snap = await refresh(p if hasattr(p, "__dict__") else {})  # provider snapshot
 
-    # normalize/validate fields
     needed = ["spot","s1","s2","r1","r2"]
     if any(k not in snap or snap[k] is None for k in needed):
         print("Snapshot incomplete:", {k: snap.get(k) for k in needed})
@@ -248,13 +254,13 @@ async def once() -> int:
         return 1
 
 async def loop_main(interval: int):
+    import asyncio, time
     while True:
         try:
             rc = await once()
         except Exception as e:
             print("[ERR]", e, file=sys.stderr)
             rc = 3
-        # jitter 0–3s
         await asyncio.sleep(max(1, interval) + (time.time_ns() % 4))
 
 def parse_args(argv: List[str]) -> Tuple[bool, int]:
@@ -268,10 +274,10 @@ def parse_args(argv: List[str]) -> Tuple[bool, int]:
         return False, iv
     if once_only:
         return True, 0
-    # default: once
     return True, 0
 
 if __name__ == "__main__":
+    import asyncio
     once_only, iv = parse_args(sys.argv[1:])
     if once_only:
         sys.exit(asyncio.run(once()))
